@@ -1,0 +1,5 @@
+# @package algo
+
+encoder_priv_hidden_dims: [256]
+adapt_module_hidden_dims: [256, 256]
+actor_hidden_dims: [256, 256, 256]

@@ -63,14 +63,14 @@ class cum_body_pos_error(_cum_error_mixin, RobotTrackTermination):
     def __init__(self, env, body_names: str | List[str] = ".*", **kwargs):
         super().__init__(env, **kwargs)
         self.body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_keypoint_names
+            body_names, self.command_manager.tracking_body_names
         )[1]
         self.body_indices_asset = [
             self.command_manager.asset.body_names.index(name)
             for name in self.body_names
         ]
         self.body_indices_motion = [
-            self.command_manager.tracking_keypoint_names.index(name)
+            self.command_manager.tracking_body_names.index(name)
             for name in self.body_names
         ]
 
@@ -91,14 +91,14 @@ class cum_body_z_error(_cum_error_mixin, RobotTrackTermination):
     def __init__(self, env, body_names: str | List[str] = ".*", **kwargs):
         super().__init__(env, **kwargs)
         self.body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_keypoint_names
+            body_names, self.command_manager.tracking_body_names
         )[1]
         self.body_indices_asset = [
             self.command_manager.asset.body_names.index(name)
             for name in self.body_names
         ]
         self.body_indices_motion = [
-            self.command_manager.tracking_keypoint_names.index(name)
+            self.command_manager.tracking_body_names.index(name)
             for name in self.body_names
         ]
 
@@ -119,14 +119,14 @@ class cum_body_ori_error(_cum_error_mixin, RobotTrackTermination):
     def __init__(self, env, body_names: str | List[str] = ".*", **kwargs):
         super().__init__(env, **kwargs)
         self.body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_keypoint_names
+            body_names, self.command_manager.tracking_body_names
         )[1]
         self.body_indices_asset = [
             self.command_manager.asset.body_names.index(name)
             for name in self.body_names
         ]
         self.body_indices_motion = [
-            self.command_manager.tracking_keypoint_names.index(name)
+            self.command_manager.tracking_body_names.index(name)
             for name in self.body_names
         ]
 
@@ -150,14 +150,14 @@ class cum_body_pos_error_local(_cum_error_mixin, RobotTrackTermination):
     def __init__(self, env, body_names: str | List[str] = ".*", **kwargs):
         super().__init__(env, **kwargs)
         self.body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_keypoint_names
+            body_names, self.command_manager.tracking_body_names
         )[1]
         self.body_indices_asset = [
             self.command_manager.asset.body_names.index(name)
             for name in self.body_names
         ]
         self.body_indices_motion = [
-            self.command_manager.tracking_keypoint_names.index(name)
+            self.command_manager.tracking_body_names.index(name)
             for name in self.body_names
         ]
 
@@ -202,14 +202,14 @@ class cum_body_ori_error_local(_cum_error_mixin, RobotTrackTermination):
     def __init__(self, env, body_names: str | List[str] = ".*", **kwargs):
         super().__init__(env, **kwargs)
         self.body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_keypoint_names
+            body_names, self.command_manager.tracking_body_names
         )[1]
         self.body_indices_asset = [
             self.command_manager.asset.body_names.index(name)
             for name in self.body_names
         ]
         self.body_indices_motion = [
-            self.command_manager.tracking_keypoint_names.index(name)
+            self.command_manager.tracking_body_names.index(name)
             for name in self.body_names
         ]
 

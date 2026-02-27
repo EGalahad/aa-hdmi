@@ -1,0 +1,72 @@
+--- .venv/lib/python3.12/site-packages/mjlab/entity/data.py
++++ .venv/lib/python3.12/site-packages/mjlab/entity/data.py
+@@ -53,6 +53,9 @@
+   default_joint_pos_limits: torch.Tensor
+   joint_pos_limits: torch.Tensor
+   soft_joint_pos_limits: torch.Tensor
++  joint_effort_limits: torch.Tensor
++  joint_vel_limits: torch.Tensor
++  soft_joint_vel_limits: torch.Tensor
+ 
+   gravity_vec_w: torch.Tensor
+   forward_vec_b: torch.Tensor
+--- .venv/lib/python3.12/site-packages/mjlab/entity/entity.py
++++ .venv/lib/python3.12/site-packages/mjlab/entity/entity.py
+@@ -92,6 +92,7 @@
+ class EntityArticulationInfoCfg:
+   actuators: tuple[actuator.ActuatorCfg, ...] = field(default_factory=tuple)
+   soft_joint_pos_limit_factor: float = 1.0
++  soft_joint_vel_limit_factor: float | None = None
+ 
+ 
+ class Entity:
+@@ -492,6 +493,29 @@
+         ],
+         dim=-1,
+       )
++
++      joint_effort_limits = torch.full(
++        (nworld, self.num_joints), float("inf"), dtype=torch.float, device=device
++      )
++      joint_vel_limits = torch.full(
++        (nworld, self.num_joints), float("inf"), dtype=torch.float, device=device
++      )
++      soft_joint_vel_limits = joint_vel_limits.clone()
++      if self.is_actuated and self.num_actuators == self.num_joints:
++        effort = model.actuator_forcerange[:, self.indexing.ctrl_ids, 1].abs()
++        joint_effort_limits = effort
++
++      vel_soft_factor = (
++        self.cfg.articulation.soft_joint_vel_limit_factor
++        if self.cfg.articulation
++        else None
++      )
++      if vel_soft_factor is None:
++        vel_soft_factor = soft_limit_factor
++      finite_mask = torch.isfinite(joint_vel_limits)
++      soft_joint_vel_limits[finite_mask] = (
++        joint_vel_limits[finite_mask] * vel_soft_factor
++      )
+     else:
+       empty_shape = (nworld, 0)
+       default_joint_pos = torch.empty(*empty_shape, dtype=torch.float, device=device)
+@@ -503,6 +527,9 @@
+       soft_joint_pos_limits = torch.empty(
+         *empty_shape, 2, dtype=torch.float, device=device
+       )
++      joint_effort_limits = torch.empty(nworld, 0, dtype=torch.float, device=device)
++      joint_vel_limits = torch.empty(nworld, 0, dtype=torch.float, device=device)
++      soft_joint_vel_limits = torch.empty(nworld, 0, dtype=torch.float, device=device)
+ 
+     if self.is_actuated:
+       joint_pos_target = torch.zeros(
+@@ -565,6 +592,9 @@
+       default_joint_pos_limits=default_joint_pos_limits,
+       joint_pos_limits=joint_pos_limits,
+       soft_joint_pos_limits=soft_joint_pos_limits,
++      joint_effort_limits=joint_effort_limits,
++      joint_vel_limits=joint_vel_limits,
++      soft_joint_vel_limits=soft_joint_vel_limits,
+       gravity_vec_w=torch.tensor([0.0, 0.0, -1.0], device=device).repeat(nworld, 1),
+       forward_vec_b=torch.tensor([1.0, 0.0, 0.0], device=device).repeat(nworld, 1),
+       is_fixed_base=self.is_fixed_base,

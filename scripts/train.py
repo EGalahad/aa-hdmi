@@ -17,7 +17,6 @@ from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict import TensorDict
 
 import active_adaptation as aa
-from active_adaptation import CONFIG_PATH
 from active_adaptation.utils.profiling import ScopedTimer
 from active_adaptation.learning.ppo.ppo_base import PPOBase
 
@@ -28,6 +27,7 @@ torch.backends.cudnn.benchmark = False
 
 
 FILE_PATH = Path(__file__).resolve().parent
+CONFIG_PATH = FILE_PATH.parent / "cfg"
 
 
 @hydra.main(config_path=str(CONFIG_PATH), config_name="train", version_base=None)
@@ -40,30 +40,6 @@ def main(cfg: DictConfig):
     print(
         f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}"
     )
-
-    if aa.is_main_process():
-        run = wandb.init(
-            job_type=cfg.wandb.job_type,
-            project=cfg.wandb.project,
-            mode=cfg.wandb.mode,
-            tags=cfg.wandb.tags,
-        )
-        run.config.update(OmegaConf.to_container(cfg))
-        run.config["world_size"] = aa.get_world_size()
-
-        default_run_name = (
-            f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-        )
-        run_idx = run.name.split("-")[-1]
-        run.name = f"{run_idx}-{default_run_name}"
-        setproctitle(run.name)
-
-        run_dir = Path(run.dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        cfg_save_path = run_dir / "cfg.yaml"
-        OmegaConf.save(cfg, cfg_save_path)
-        run.save(str(cfg_save_path), policy="now")
-        run.save(str(run_dir / "config.yaml"), policy="now")
 
     from active_adaptation.helpers import make_env_policy, evaluate
     from active_adaptation.utils.helpers import EpisodeStats
@@ -141,6 +117,30 @@ def main(cfg: DictConfig):
     else:
         stages = ("",)
 
+    if aa.is_main_process():
+        run = wandb.init(
+            job_type=cfg.wandb.job_type,
+            project=cfg.wandb.project,
+            mode=cfg.wandb.mode,
+            tags=cfg.wandb.tags,
+        )
+        run.config.update(OmegaConf.to_container(cfg))
+        run.config["world_size"] = aa.get_world_size()
+
+        default_run_name = (
+            f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+        )
+        run_idx = run.name.split("-")[-1]
+        run.name = f"{run_idx}-{default_run_name}"
+        setproctitle(run.name)
+
+        run_dir = Path(run.dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cfg_save_path = run_dir / "cfg.yaml"
+        OmegaConf.save(cfg, cfg_save_path)
+        run.save(str(cfg_save_path), policy="now")
+        run.save(str(run_dir / "config.yaml"), policy="now")
+
     for stage in stages:
 
         policy.on_stage_start(stage)
@@ -153,10 +153,9 @@ def main(cfg: DictConfig):
 
         data_buf: TensorDict = tmp_td.unsqueeze(-1).expand(env.num_envs, cfg.algo.train_every).clone()
 
+        progress = range(total_iters)
         if aa.is_main_process():
-            progress = tqdm(range(total_iters), desc=stage)
-        else:
-            progress = range(total_iters)
+            progress = tqdm(progress, desc=stage)
 
         start_iter = getattr(env, "current_iter", 0)
         for i in progress:
@@ -218,15 +217,15 @@ def main(cfg: DictConfig):
                 should_upload = i % upload_interval == 0
                 checkpoint_name = f"checkpoint_{i}" if should_upload else "checkpoint_temp"
                 ckpt_path = save(policy, checkpoint_name, upload_to_wandb=should_upload)
+                print(f"Latest checkpoint: {ckpt_path}")
 
             if aa.is_main_process():
-                ScopedTimer.print_summary(clear=True)
+                # ScopedTimer.print_summary(clear=True)
                 # print(
                 #     OmegaConf.to_yaml(
                 #         {k: v for k, v in info.items() if isinstance(v, (float, int))}
                 #     )
                 # )
-                print(f"Latest checkpoint: {ckpt_path}")
                 run.log(info)
 
     if aa.is_main_process():

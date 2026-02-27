@@ -43,6 +43,12 @@ class VizCfg:
 
 
 class RobotTracking(Command):
+    @staticmethod
+    def _sort_by_preferred_order(matched_names: List[str], preferred_names: List[str]) -> List[str]:
+        ordered = [name for name in preferred_names if name in matched_names]
+        assert len(ordered) == len(matched_names)
+        return ordered
+
     def __init__(
         self,
         env,
@@ -91,18 +97,22 @@ class RobotTracking(Command):
             target_fps=int(1 / self.env.step_dt),
         ).to(self.device)
 
-        # Set tracking keypoint and joint names for observation and termination
-        self.tracking_keypoint_names = self.asset.find_bodies(tracking_keypoint_names)[
-            1
-        ]
+        # Set tracking body and joint names for observation and termination
+        self.tracking_body_names = self.asset.find_bodies(tracking_keypoint_names)[1]
+        self.tracking_body_names = self._sort_by_preferred_order(
+            self.tracking_body_names, self.asset.cfg.body_names_simulation
+        )
         self.tracking_body_indices_motion = [
-            self.dataset.body_names.index(name) for name in self.tracking_keypoint_names
+            self.dataset.body_names.index(name) for name in self.tracking_body_names
         ]
         self.tracking_body_indices_asset = [
-            self.asset.body_names.index(name) for name in self.tracking_keypoint_names
+            self.asset.body_names.index(name) for name in self.tracking_body_names
         ]
 
         self.tracking_joint_names = self.asset.find_joints(tracking_joint_names)[1]
+        self.tracking_joint_names = self._sort_by_preferred_order(
+            self.tracking_joint_names, self.asset.cfg.joint_names_simulation
+        )
         self.tracking_joint_indices_motion = [
             self.dataset.joint_names.index(name) for name in self.tracking_joint_names
         ]
@@ -268,6 +278,7 @@ class RobotTracking(Command):
         )
         if not self.env.training:
             rand_samples.fill_(0.0)
+        # TODO: change to com lin velocity
         velocities = (
             torch.cat([init_root_lin_vel, init_root_ang_vel], dim=-1) + rand_samples
         )
@@ -490,7 +501,7 @@ class RobotTracking(Command):
             current_body_quat = self.robot_body_link_quat_w[env_idx]
             current_body_rotm = matrix_from_quat(current_body_quat).cpu().numpy()
 
-            for i, body_name in enumerate(self.tracking_keypoint_names):
+            for i, body_name in enumerate(self.tracking_body_names):
                 visualizer.add_frame(
                     position=desired_body_pos[i],
                     rotation_matrix=desired_body_rotm[i],

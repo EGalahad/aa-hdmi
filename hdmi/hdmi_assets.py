@@ -1,6 +1,7 @@
 from active_adaptation.assets.asset_cfg import (
     ActuatorCfg,
     AssetCfg,
+    ContactSensorCfg,
     InitialStateCfg,
 )
 from active_adaptation.assets.humanoid import G1_WAIST_UNLOCKED_CFG
@@ -13,8 +14,13 @@ registry = Registry.instance()
 # MJCF/USD.
 ##
 
-G1_MJCF = ASSET_DIR / "G1" / "mjcf" / "g1.xml"
-G1_USD = ASSET_DIR / "G1" / "waist_unlocked.usd"
+# G1_MJCF = ASSET_DIR / "G1" / "mjcf" / "g1.xml"
+G1_MJCF = ASSET_DIR / "G1" / "mjcf" / "g1_mjlab.xml"
+
+# G1_USD = ASSET_DIR / "G1" / "waist_unlocked.usd"
+G1_USD = ASSET_DIR / "G1" / "mjcf" / "g1_mjlab" / "g1_mjlab.usd"
+# G1_USD = ASSET_DIR / "G1" / "unitree" / "g1_29dof_rev_1_0.usd"
+# G1_USD = ASSET_DIR / "G1" / "g1_29dof_nohand" / "g1_29dof_nohand.usd"
 
 ##
 # Actuator constants (aligned with mjlab g1_constants style).
@@ -126,7 +132,7 @@ G1_CFG = AssetCfg(
     mjcf_path=G1_MJCF,
     usd_path=G1_USD,
     init_state=KNEES_BENT_KEYFRAME,
-    self_collisions=False,
+    self_collisions=True,
     actuators={
         "g1_5020": G1_ACTUATOR_5020,
         "g1_7520_14": G1_ACTUATOR_7520_14,
@@ -135,12 +141,24 @@ G1_CFG = AssetCfg(
         "g1_waist": G1_ACTUATOR_WAIST,
         "g1_ankle": G1_ACTUATOR_ANKLE,
     },
-    sensors_isaaclab=G1_WAIST_UNLOCKED_CFG.sensors_isaaclab,
+    sensors_isaaclab=[
+        ContactSensorCfg(
+            name="contact_forces",
+            # g1_mjlab.usd nests rigid links under Robot/pelvis/*
+            primary="pelvis/.*",
+            # primary=".*",
+            secondary=[],
+            track_air_time=True,
+            history_length=3,
+        ),
+    ],
     sensors_mjlab=G1_WAIST_UNLOCKED_CFG.sensors_mjlab,
     joint_names_isaac=G1_WAIST_UNLOCKED_CFG.joint_names_isaac,
     joint_names_mjlab=G1_WAIST_UNLOCKED_CFG.joint_names_mjlab,
+    joint_names_simulation=G1_WAIST_UNLOCKED_CFG.joint_names_simulation,
     body_names_isaac=G1_WAIST_UNLOCKED_CFG.body_names_isaac,
     body_names_mjlab=G1_WAIST_UNLOCKED_CFG.body_names_mjlab,
+    body_names_simulation=G1_WAIST_UNLOCKED_CFG.body_names_simulation,
     joint_symmetry_mapping=G1_WAIST_UNLOCKED_CFG.joint_symmetry_mapping,
     spatial_symmetry_mapping=G1_WAIST_UNLOCKED_CFG.spatial_symmetry_mapping,
 )

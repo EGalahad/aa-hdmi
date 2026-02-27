@@ -1,8 +1,7 @@
-import copy
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import numpy as np
 import torch
@@ -38,7 +37,6 @@ from active_adaptation.learning.ppo.common import (
     GAE,
     make_batch,
     make_mlp,
-    soft_copy_,
 )
 from active_adaptation.learning.utils.valuenorm import ValueNorm1, ValueNormFake
 from active_adaptation.learning.ppo.ppo_base import PPOBase
@@ -83,6 +81,10 @@ class PPOConfig:
     value_norm: bool = False
 
     latent_dim: int = 256
+    encoder_priv_hidden_dims: Tuple[int, ...] = (512,)
+    adapt_module_hidden_dims: Tuple[int, ...] = (512, 512)
+    actor_hidden_dims: Tuple[int, ...] = (512, 512, 512)
+    critic_hidden_dims: Tuple[int, ...] = (512, 256, 128)
     max_grad_norm: float = 1.0
 
     phase: str = "train"
@@ -187,7 +189,7 @@ class PPOROA(PPOBase):
             CatTensors(encoder_priv_in_keys, "_encoder_priv_inp", del_keys=False, sort=False),
             Mod(
                 nn.Sequential(
-                    make_mlp([latent_dim], norm=self.cfg.layer_norm),
+                    make_mlp(list(self.cfg.encoder_priv_hidden_dims), norm=self.cfg.layer_norm),
                     nn.LazyLinear(latent_dim),
                 ),
                 "_encoder_priv_inp",
@@ -200,7 +202,7 @@ class PPOROA(PPOBase):
             CatTensors(adapt_module_in_keys, "_adapt_inp", del_keys=False, sort=False),
             Mod(
                 nn.Sequential(
-                    make_mlp([latent_dim, latent_dim], norm=self.cfg.layer_norm),
+                    make_mlp(list(self.cfg.adapt_module_hidden_dims), norm=self.cfg.layer_norm),
                     nn.LazyLinear(latent_dim),
                 ),
                 "_adapt_inp",
@@ -209,13 +211,19 @@ class PPOROA(PPOBase):
             selected_out_keys=[PRIV_PRED_KEY],
         ).to(self.device)
 
-        if self.cfg.phase == "train" and self.cfg.residual_action and REF_JPOS_KEY in observation_spec:
+        if (
+            self.cfg.phase == "train"
+            and self.cfg.residual_action
+            and REF_JPOS_KEY in observation_spec.keys(True, True)
+        ):
 
             class RefJointPos(nn.Module):
                 def forward(self, ref_jpos, action):
                     return (ref_jpos + action,)
 
-            residual_module = Mod(RefJointPos(), [REF_JPOS_KEY, "loc"], ["loc"])
+            residual_module = Mod(
+                RefJointPos(), [REF_JPOS_KEY, "loc"], ["loc"]
+            )
         else:
             residual_module = None
 
@@ -223,7 +231,7 @@ class PPOROA(PPOBase):
             actor_modules = [
                 CatTensors(in_keys, "_actor_inp", del_keys=False, sort=False),
                 Mod(
-                    make_mlp([512, 256, 256], norm=self.cfg.layer_norm),
+                    make_mlp(list(self.cfg.actor_hidden_dims), norm=self.cfg.layer_norm),
                     ["_actor_inp"],
                     ["_actor_feature"],
                 ),
@@ -262,7 +270,7 @@ class PPOROA(PPOBase):
             CatTensors(critic_in_keys, "_critic_input", del_keys=False),
             Mod(
                 nn.Sequential(
-                    make_mlp([512, 256, 128], norm=self.cfg.layer_norm),
+                    make_mlp(list(self.cfg.critic_hidden_dims), norm=self.cfg.layer_norm),
                     nn.LazyLinear(num_reward_groups),
                 ),
                 ["_critic_input"],
@@ -283,7 +291,6 @@ class PPOROA(PPOBase):
                 nn.init.constant_(module.bias, 0.0)
 
         self.apply(init_)
-        self.adapt_ema = copy.deepcopy(self.adapt_module).requires_grad_(False)
 
         if aa.is_distributed():
             self._wrap_ddp(local_rank=aa.get_local_rank())
@@ -296,6 +303,8 @@ class PPOROA(PPOBase):
             ]
         else:
             policy_params = [{"params": self.actor_adapt.parameters()}]
+            if self.cfg.phase == "finetune" and self.cfg.finetune_adapt_module:
+                policy_params.append({"params": self.adapt_module.parameters()})
 
         self.opt_policy = torch.optim.Adam(policy_params, lr=self.lr_policy)
         self.opt_critic = torch.optim.Adam([{"params": self.critic.parameters()}], lr=self.cfg.lr)
@@ -354,8 +363,6 @@ class PPOROA(PPOBase):
         self.encoder_priv = wrap_td_module(self.encoder_priv)
         self.critic = wrap_td_module(self.critic)
         self.adapt_module = wrap_td_module(self.adapt_module)
-        if hasattr(self, "adapt_ema"):
-            self.adapt_ema = self.adapt_ema.to(self.device)
 
     def make_tensordict_primer(self):
         return TensorDictPrimer({}, reset_key="done")
@@ -367,7 +374,18 @@ class PPOROA(PPOBase):
         return int(getattr(self.env, "current_iter", 0))
 
     def get_rollout_policy(self, mode: str = "train"):
-        modules = [self.vecnorm]
+        if mode == "deploy":
+            vecnorms = []
+            in_keys = set(self.adapt_module.in_keys).union(set(self.actor_adapt.in_keys))
+            in_keys = [key for key in in_keys if key in self.norm_map]
+            for key in in_keys:
+                vecnorms.append(Mod(self.vecnorms[key], [key], [key]))
+            vecnorm = Seq(*vecnorms).to(self.device)
+            ood_detector = ObsOODDetector(list(in_keys), sigma=5.0)
+            modules = [vecnorm, ood_detector]
+        else:
+            modules = [self.vecnorm]
+            
 
         if self.cfg.phase == "train":
             modules += [self.encoder_priv, self.adapt_module, self.actor]
@@ -382,8 +400,6 @@ class PPOROA(PPOBase):
             out_keys = [ACTION_KEY]
         else:
             out_keys = ["sample_log_prob", ACTION_KEY] + self.dist_keys
-            if self.cfg.phase == "finetune":
-                out_keys.append(PRIV_PRED_KEY)
 
         return Seq(*modules, selected_out_keys=out_keys)
 
@@ -494,10 +510,16 @@ class PPOROA(PPOBase):
                 self.opt_adapt.step()
 
                 info = {
-                    "adapt/priv_loss": priv_loss,
-                    "adapt/grad_norm": opt_adapt_grad_norm,
-                    "adapt/priv_feature_norm": minibatch[PRIV_FEATURE_KEY].norm(p=2, dim=-1).mean(),
-                    "adapt/priv_pred_norm": minibatch[PRIV_PRED_KEY].norm(p=2, dim=-1).mean(),
+                    "adapt/priv_loss": priv_loss.detach(),
+                    "adapt/grad_norm": opt_adapt_grad_norm.detach(),
+                    "adapt/priv_feature_norm": minibatch[PRIV_FEATURE_KEY]
+                    .norm(p=2, dim=-1)
+                    .mean()
+                    .detach(),
+                    "adapt/priv_pred_norm": minibatch[PRIV_PRED_KEY]
+                    .norm(p=2, dim=-1)
+                    .mean()
+                    .detach(),
                 }
 
                 if self.cfg.phase == "train" and self.cfg.residual_action:
@@ -511,11 +533,10 @@ class PPOROA(PPOBase):
                     self.opt_adapt_actor.zero_grad()
                     adapt_loss.backward()
                     self.opt_adapt_actor.step()
-                    info["adapt/adapt_loss"] = adapt_loss
+                    info["adapt/adapt_loss"] = adapt_loss.detach()
 
                 infos.append(TensorDict(info, []))
 
-        soft_copy_(self.adapt_module, self.adapt_ema, 0.04)
         return {k: v.mean().item() for k, v in sorted(torch.stack(infos).items())}
 
     @torch.no_grad()
@@ -598,6 +619,9 @@ class PPOROA(PPOBase):
         elif self.cfg.phase == "finetune":
             if self.cfg.finetune_adapt_module:
                 self.adapt_module(tensordict)
+            else:
+                with torch.no_grad():
+                    self.adapt_module(tensordict)
             actor = self.actor_adapt
         else:
             raise ValueError(f"Invalid phase: {self.cfg.phase}")
@@ -648,12 +672,12 @@ class PPOROA(PPOBase):
             "actor/policy_loss": policy_loss.detach(),
             "actor/entropy": entropy.detach(),
             "actor/mean_std": tensordict["scale"].detach().mean(),
-            "actor/grad_norm": actor_grad_norm,
-            "actor/clamp_ratio": clipfrac,
-            "actor/kl": kl,
-            "actor/priv_grad_norm": priv_grad_norm,
-            "actor/approx_kl": ((ratio - 1) - log_ratio).mean(),
-            "critic/grad_norm": critic_grad_norm,
+            "actor/grad_norm": actor_grad_norm.detach(),
+            "actor/clamp_ratio": clipfrac.detach(),
+            "actor/kl": kl.detach(),
+            "actor/priv_grad_norm": priv_grad_norm.detach(),
+            "actor/approx_kl": (((ratio - 1) - log_ratio).mean()).detach(),
+            "critic/grad_norm": critic_grad_norm.detach(),
         }
         for i, group_name in enumerate(self.reward_groups):
             info[f"critic/{group_name}.explained_var"] = explained_var[i]
@@ -665,8 +689,6 @@ class PPOROA(PPOBase):
             if not self.cfg.residual_action:
                 for src, dst in zip(self.actor.parameters(), self.actor_adapt.parameters()):
                     dst.data.copy_(src.data)
-        if self.cfg.phase in ["train", "adapt"]:
-            self.adapt_ema.load_state_dict(self.adapt_module.state_dict())
 
         state_dict = OrderedDict()
         for name, module in self.named_children():
@@ -735,6 +757,24 @@ class MeanAction(TensorDictModuleBase):
     def forward(self, td):
         td[ACTION_KEY] = td["loc"]
         return td
+
+class ObsOODDetector(TensorDictModuleBase):
+    def __init__(self, in_keys, sigma: float = 5.0):
+        super().__init__()
+        self.in_keys = in_keys
+        self.out_keys = [("next", f"{k}_ood_ratio") for k in in_keys] + [
+            ("next", k) for k in in_keys
+        ]
+        self.sigma = sigma
+
+    def forward(self, tensordict: TensorDict):
+        for in_key in self.in_keys:
+            obs = tensordict.get(in_key, None)
+            if obs is not None:
+                ood_ratio = (obs.abs() > self.sigma).float().mean().unsqueeze(0)
+                tensordict.set(("next", f"{in_key}_ood_ratio"), ood_ratio)
+                tensordict.set(("next", in_key), obs)
+        return tensordict
 
 
 class ActorROA(nn.Module):

@@ -1,0 +1,27 @@
+hydra:
+  run:
+    dir: ./outputs_play/${now:%Y-%m-%d}/${now:%H-%M-%S}-${task.name}-${algo.name}
+
+headless: false
+
+backend: isaac
+device: cuda
+
+app:
+  headless: ${..headless}
+  enable_cameras: false
+
+seed: 42
+checkpoint_path: null
+export_policy: false
+
+camera_follow: true
+
+
+defaults:
+  - task: Velocity
+  - algo: ppo
+  - _self_
+
+task:
+  num_envs: 4

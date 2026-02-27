@@ -1,0 +1,10 @@
+# @package task
+
+reward:
+  tracking:
+    tracking_root_pos:
+      _target_: keypoint_pos_tracking_aligned
+
+termination:
+  cum_body_pos_error:
+    enabled: false
