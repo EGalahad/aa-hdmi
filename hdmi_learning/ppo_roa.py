@@ -1,12 +1,13 @@
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Mapping
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributions as D
+import torch.nn.functional as F
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from hydra.core.config_store import ConfigStore
@@ -67,6 +68,7 @@ class PPOConfig:
 
     lr: float = 3e-4
     desired_kl: float | None = 0.01
+    reg_coef: float = 0.0
 
     entropy_coef_start: float = 0.004
     entropy_coef_end: float = 0.004
@@ -305,22 +307,21 @@ class PPOROA(PPOBase):
             policy_params = [{"params": self.actor_adapt.parameters()}]
             if self.cfg.phase == "finetune" and self.cfg.finetune_adapt_module:
                 policy_params.append({"params": self.adapt_module.parameters()})
+        
+        adapt_parameters = [{"params": self.adapt_module.parameters()}]
+        if self.cfg.residual_action:
+            adapt_parameters += [{"params": self.actor_adapt.parameters()}]
 
         self.opt_policy = torch.optim.Adam(policy_params, lr=self.lr_policy)
+        self.opt_adapt = torch.optim.Adam(adapt_parameters, lr=self.cfg.lr)
         self.opt_critic = torch.optim.Adam([{"params": self.critic.parameters()}], lr=self.cfg.lr)
-        self.opt_adapt = torch.optim.Adam([{"params": self.adapt_module.parameters()}], lr=self.cfg.lr)
-
-        if self.cfg.phase == "train" and self.cfg.residual_action:
-            self.opt_adapt_actor = torch.optim.Adam(
-                [{"params": self.actor_adapt.parameters()}], lr=self.cfg.lr
-            )
 
         self.num_updates = 0
 
     def _build_vecnorm_modules(self, observation_spec: CompositeSpec):
         modules = []
         self.norm_map = {}
-        self.vecnorms = nn.ModuleDict()
+        self.vecnorms: Mapping[str, VecNorm] = nn.ModuleDict()
 
         keys_to_norm = [self.cmd_key, OBS_KEY, OBS_PRIV_KEY]
         for key in keys_to_norm:
@@ -388,7 +389,7 @@ class PPOROA(PPOBase):
             
 
         if self.cfg.phase == "train":
-            modules += [self.encoder_priv, self.adapt_module, self.actor]
+            modules += [self.encoder_priv, self.actor]
         elif self.cfg.phase == "adapt":
             modules += [self.adapt_module, self.actor_adapt]
         elif self.cfg.phase == "finetune":
@@ -432,13 +433,18 @@ class PPOROA(PPOBase):
                     info[f"vecnorm/{name}/scale_diff_max"] = max(scale_diffs)
                     info[f"vecnorm/{name}/loc_diff_mean"] = sum(loc_diffs) / len(loc_diffs)
                     info[f"vecnorm/{name}/scale_diff_mean"] = sum(scale_diffs) / len(scale_diffs)
-                vecnorm.synchronize(mode="broadcast")
+                vecnorm.synchronize(mode="aggregate")
 
         action_std = self._get_actor_std(self.actor if self.cfg.phase == "train" else self.actor_adapt)
         if action_std is not None:
             for joint_name, std in zip(self.joint_names, action_std):
                 info[f"actor_std/{joint_name}"] = std
             info["actor_std/mean"] = action_std.mean()
+
+        if PRIV_FEATURE_KEY in tensordict.keys():
+            info["adapt/priv_feature_norm"] = tensordict[PRIV_FEATURE_KEY].norm(p=2, dim=-1).mean().detach()
+        if PRIV_PRED_KEY in tensordict.keys():
+            info["adapt/priv_pred_norm"] = tensordict[PRIV_PRED_KEY].norm(p=2, dim=-1).mean().detach()
 
         return info
 
@@ -466,8 +472,8 @@ class PPOROA(PPOBase):
 
                 if self.desired_kl is not None:
                     kl = info["actor/kl"]
-                    if aa.is_distributed():
-                        dist.all_reduce(kl, op=dist.ReduceOp.AVG)
+                    # if aa.is_distributed():
+                    #     dist.all_reduce(kl, op=dist.ReduceOp.AVG)
                     if kl > self.desired_kl * 2.0:
                         self.lr_policy = max(1e-5, self.lr_policy / 1.5)
                     elif kl < self.desired_kl / 2.0 and kl > 0.0:
@@ -499,41 +505,30 @@ class PPOROA(PPOBase):
 
         for _ in range(2):
             for minibatch in make_batch(tensordict, self.cfg.num_minibatches, self.cfg.train_every):
+                info = {}
+                valid = ~minibatch["is_init"].squeeze(-1)
+
                 self.adapt_module(minibatch)
-                priv_loss = self.adapt_loss_fn(minibatch[PRIV_PRED_KEY], minibatch[PRIV_FEATURE_KEY])
-                priv_loss = (priv_loss * (~minibatch["is_init"])).mean()
-                self.opt_adapt.zero_grad()
-                priv_loss.backward()
-                opt_adapt_grad_norm = nn.utils.clip_grad_norm_(
-                    self.adapt_module.parameters(), self.cfg.max_grad_norm
-                )
-                self.opt_adapt.step()
+                priv_loss = F.mse_loss(minibatch[PRIV_PRED_KEY], minibatch[PRIV_FEATURE_KEY], reduction="none")
+                priv_loss = priv_loss[valid].mean()
+                info["adapt/priv_loss"] = priv_loss.detach()
 
-                info = {
-                    "adapt/priv_loss": priv_loss.detach(),
-                    "adapt/grad_norm": opt_adapt_grad_norm.detach(),
-                    "adapt/priv_feature_norm": minibatch[PRIV_FEATURE_KEY]
-                    .norm(p=2, dim=-1)
-                    .mean()
-                    .detach(),
-                    "adapt/priv_pred_norm": minibatch[PRIV_PRED_KEY]
-                    .norm(p=2, dim=-1)
-                    .mean()
-                    .detach(),
-                }
+                adapt_loss = priv_loss
 
-                if self.cfg.phase == "train" and self.cfg.residual_action:
+                if self.cfg.residual_action:
                     with torch.no_grad():
                         dist_teacher = self.actor.get_dist(minibatch)
 
-                    minibatch[PRIV_PRED_KEY] = minibatch[PRIV_FEATURE_KEY].detach()
                     dist_student = self.actor_adapt.get_dist(minibatch)
+                    actor_loss = F.mse_loss(dist_teacher.mean, dist_student.mean, reduction="none")
+                    actor_loss = actor_loss[valid].mean()
+                    info["adapt/actor_loss"] = actor_loss.detach()
 
-                    adapt_loss = (dist_teacher.mean - dist_student.mean).square().mean()
-                    self.opt_adapt_actor.zero_grad()
-                    adapt_loss.backward()
-                    self.opt_adapt_actor.step()
-                    info["adapt/adapt_loss"] = adapt_loss.detach()
+                    adapt_loss += actor_loss
+
+                self.opt_adapt.zero_grad()
+                adapt_loss.backward()
+                self.opt_adapt.step()
 
                 infos.append(TensorDict(info, []))
 
@@ -629,9 +624,10 @@ class PPOROA(PPOBase):
         dist_now: D.Independent = actor.get_dist(tensordict)
         with set_composite_lp_aggregate(True):
             log_probs = dist_now.log_prob(tensordict[ACTION_KEY])
-        entropy = dist_now.entropy().mean()
 
-        valid = (tensordict["step_count"] > (1 if self.cfg.phase == "train" else 5)).squeeze(-1)
+        valid = ~tensordict["is_init"].squeeze(-1)
+        entropy_all = dist_now.entropy()
+        entropy = entropy_all[valid].mean() if valid.any() else entropy_all.mean()
 
         adv = tensordict["adv"]
         log_ratio = (log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
@@ -646,7 +642,16 @@ class PPOROA(PPOBase):
         value_loss = self.critic_loss_fn(b_returns, values)
         value_loss = value_loss[valid].mean(dim=0)
 
-        loss = policy_loss + entropy_loss + value_loss.mean()
+        if self.cfg.phase == "train":
+            if "priv_pred" not in tensordict.keys():
+                with torch.no_grad():
+                    self.adapt_module(tensordict)
+            reg_loss = F.mse_loss(tensordict["priv_pred"], tensordict["priv_feature"], reduction="none")
+            reg_loss = torch.mean(reg_loss[valid])
+        else:
+            reg_loss = torch.zeros((), device=self.device)
+        
+        loss = policy_loss + entropy_loss + value_loss.mean() + self.cfg.reg_coef * reg_loss
 
         self.opt_policy.zero_grad()
         self.opt_critic.zero_grad()
@@ -669,6 +674,7 @@ class PPOROA(PPOBase):
             kl = D.kl_divergence(dist_old, dist_now).mean()
 
         info = {
+            "adapt/reg_loss": reg_loss.detach(),
             "actor/policy_loss": policy_loss.detach(),
             "actor/entropy": entropy.detach(),
             "actor/mean_std": tensordict["scale"].detach().mean(),
@@ -689,6 +695,13 @@ class PPOROA(PPOBase):
             if not self.cfg.residual_action:
                 for src, dst in zip(self.actor.parameters(), self.actor_adapt.parameters()):
                     dst.data.copy_(src.data)
+            else:
+                # copy actor_std
+                for name, param in self.actor.named_parameters():
+                    if "actor_std" in name:
+                        for adapt_name, adapt_param in self.actor_adapt.named_parameters():
+                            if "actor_std" in adapt_name:
+                                adapt_param.data.copy_(param.data)
 
         state_dict = OrderedDict()
         for name, module in self.named_children():

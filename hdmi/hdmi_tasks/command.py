@@ -42,7 +42,7 @@ class VizCfg:
     ghost_color: tuple[float, float, float, float] = (0.5, 0.7, 0.5, 0.5)
 
 
-class RobotTracking(Command):
+class RobotTracking(Command, namespace="hdmi"):
     @staticmethod
     def _sort_by_preferred_order(matched_names: List[str], preferred_names: List[str]) -> List[str]:
         ordered = [name for name in preferred_names if name in matched_names]
@@ -227,7 +227,7 @@ class RobotTracking(Command):
         start_t = torch.where(rewind_mask, rewind_t, start_t)
 
         if not self.env.training or self.record_motion:
-            start_t.fill_(0)
+            start_t.fill_(200)
 
         if self.replay_motion:
             self.replay_motion_t[env_ids] = (

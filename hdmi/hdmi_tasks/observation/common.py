@@ -8,6 +8,12 @@ from active_adaptation.assets import (
     get_output_joint_indexing,
     get_output_body_indexing,
 )
+from active_adaptation.envs.mdp.observations.common import (
+    root_linvel_b as _base_root_linvel_b,
+)
+from active_adaptation.envs.mdp.observations.obs_body import (
+    body_height as _base_body_height,
+)
 from hdmi.hdmi_tasks.actions import HDMIJointPosition
 from active_adaptation.utils.math import quat_rotate_inverse, yaw_quat
 
@@ -21,7 +27,7 @@ def random_noise(x: torch.Tensor, std: float):
     return x + torch.randn_like(x).clamp(-3.0, 3.0) * std
 
 
-class root_ang_vel_history(BaseObservation):
+class root_ang_vel_history(BaseObservation, namespace="hdmi"):
     def __init__(self, env, noise_std: float = 0.0, history_steps: list[int] = [1]):
         super().__init__(env)
         self.asset = self.env.scene.articulations["robot"]
@@ -49,7 +55,7 @@ class root_ang_vel_history(BaseObservation):
         return self.buffer[:, self.history_steps].reshape(self.num_envs, -1)
 
 
-class projected_gravity_history(BaseObservation):
+class projected_gravity_history(BaseObservation, namespace="hdmi"):
     def __init__(self, env, noise_std: float = 0.0, history_steps: list[int] = [1]):
         super().__init__(env)
         self.asset = self.env.scene.articulations["robot"]
@@ -79,7 +85,7 @@ class projected_gravity_history(BaseObservation):
         return self.buffer[:, self.history_steps].reshape(self.num_envs, -1)
 
 
-class joint_pos_history(BaseObservation):
+class joint_pos_history(BaseObservation, namespace="hdmi"):
     def __init__(
         self,
         env,
@@ -129,18 +135,66 @@ class joint_pos_history(BaseObservation):
         joint_pos_selected = joint_pos[:, self.history_steps][:, :, self.output_indexing]
         return joint_pos_selected.reshape(self.num_envs, -1)
 
+class joint_vel_history(BaseObservation, namespace="hdmi"):
+    def __init__(
+        self,
+        env,
+        joint_names: str = ".*",
+        history_steps: list[int] = [0],
+        noise_std: float = 0.0,
+    ):
+        super().__init__(env)
+        self.history_steps = history_steps
+        self.buffer_size = max(history_steps) + 1
+        self.noise_std = max(noise_std, 0.0)
+        self.asset = self.env.scene.articulations["robot"]
+        self.joint_ids, self.joint_names = self.asset.find_joints(joint_names)
+        self.joint_ids = torch.as_tensor(self.joint_ids, device=self.device)
+        self.output_indexing, _ = get_output_joint_indexing(
+            "simulation",
+            self.asset.cfg,
+            self.joint_names,
+            self.device,
+        )
+        self.num_joints = len(self.joint_ids)
+        self.buffer = torch.zeros(
+            (self.num_envs, self.buffer_size, self.num_joints), device=self.device
+        )
+        self.action_manager = cast(HDMIJointPosition, self.env.input_managers["action"])
 
-# class applied_action(BaseObservation):
-#     def __init__(self, env, **kwargs):
-#         super().__init__(env, **kwargs)
-#         self.action_manager = cast(HDMIJointPosition, self.env.input_managers["action"])
+    def reset(self, env_ids):
+        value = self.asset.data.joint_vel[
+            env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)
+        ]
+        self.buffer[env_ids] = value.unsqueeze(1)
 
-#     def compute(self):
-#         applied_action = self.action_manager.applied_action
-#         return applied_action[:, self.action_manager._target_to_input_indexing]
+    def update(self):
+        self.buffer = self.buffer.roll(1, 1)
+        value = self.asset.data.joint_vel[:, self.joint_ids]
+        if self.noise_std > 0:
+            value = random_noise(value, self.noise_std)
+        self.buffer[:, 0] = value
+
+    def compute(self):
+        # joint_pos = self.buffer - self.asset.data.encoder_bias[
+        #     :, self.joint_ids
+        # ].unsqueeze(1)
+        joint_vel = self.buffer - self.action_manager.offset[
+            :, self.joint_ids
+        ].unsqueeze(1)
+        joint_vel_selected = joint_vel[:, self.history_steps][:, :, self.output_indexing]
+        return joint_vel_selected.reshape(self.num_envs, -1)
+
+class applied_action(BaseObservation, namespace="hdmi"):
+    def __init__(self, env, key: str = "action"):
+        super().__init__(env)
+        self.action_manager = cast(HDMIJointPosition, self.env.input_managers[key])
+
+    def compute(self):
+        return self.action_manager.applied_action
 
 
-class prev_actions(BaseObservation):
+class prev_actions(BaseObservation, namespace="hdmi"):
     def __init__(self, env, key: str = "action", steps: int = 1):
         super().__init__(env)
         self.steps = steps
@@ -151,7 +205,7 @@ class prev_actions(BaseObservation):
         return action_buf.reshape(self.num_envs, -1)
 
 
-class body_pos_b(BaseObservation):
+class body_pos_b(BaseObservation, namespace="hdmi"):
     def __init__(self, env, body_names: str):
         super().__init__(env)
         self.asset = self.env.scene.articulations["robot"]
@@ -180,7 +234,7 @@ class body_pos_b(BaseObservation):
         return body_pos_b.reshape(self.num_envs, -1)
 
 
-class body_vel_b(BaseObservation):
+class body_vel_b(BaseObservation, namespace="hdmi"):
     def __init__(self, env, body_names: str, yaw_only: bool = False):
         super().__init__(env)
         self.asset = self.env.scene.articulations["robot"]
@@ -205,7 +259,7 @@ class body_vel_b(BaseObservation):
         return body_lin_vel_b.reshape(self.num_envs, -1)
 
 
-class applied_torque(BaseObservation):
+class applied_torque(BaseObservation, namespace="hdmi"):
     def __init__(self, env, joint_names: str = ".*"):
         super().__init__(env)
         self.asset = self.env.scene.articulations["robot"]

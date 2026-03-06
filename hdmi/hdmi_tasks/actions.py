@@ -14,7 +14,7 @@ except ModuleNotFoundError:
     from mjlab.utils.lab_api import string as string_utils
 
 
-class HDMIJointPosition(ActionManager):
+class HDMIJointPosition(ActionManager, namespace="hdmi"):
     """HDMI-style joint position controller with delay + smoothing."""
 
     def __init__(

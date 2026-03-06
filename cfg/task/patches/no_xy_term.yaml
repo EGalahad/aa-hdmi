@@ -1,0 +1,5 @@
+# @package task
+
+termination:
+  cum_body_pos_error:
+    enabled: false

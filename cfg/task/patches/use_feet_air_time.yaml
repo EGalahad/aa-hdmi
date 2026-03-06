@@ -1,0 +1,6 @@
+# @package task
+
+reward:
+  loco:
+    feet_air_time:
+      enabled: true

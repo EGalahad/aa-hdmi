@@ -20,17 +20,17 @@ RobotTrackObservation = BaseObservation[RobotTracking]
 
 
 
-class ref_joint_pos_future(RobotTrackObservation):
+class ref_joint_pos_future(RobotTrackObservation, namespace="hdmi"):
     def compute(self):
         return self.command_manager.ref_joint_pos_future_.view(self.num_envs, -1)
 
 
-class ref_joint_vel_future(RobotTrackObservation):
+class ref_joint_vel_future(RobotTrackObservation, namespace="hdmi"):
     def compute(self):
         return self.command_manager.ref_joint_vel_future_.view(self.num_envs, -1)
 
 
-class ref_joint_pos_action(RobotTrackObservation):
+class ref_joint_pos_action(RobotTrackObservation, namespace="hdmi"):
     def __init__(self, env, **kwargs):
         super().__init__(env, **kwargs)
         action_manager = self.env.action_manager
@@ -47,7 +47,7 @@ class ref_joint_pos_action(RobotTrackObservation):
         return ref_joint_pos
 
 
-class ref_joint_pos_action_policy(RobotTrackObservation):
+class ref_joint_pos_action_policy(RobotTrackObservation, namespace="hdmi"):
     def __init__(self, env, **kwargs):
         super().__init__(env, **kwargs)
         action_manager = cast(HDMIJointPosition, self.env.action_manager)
@@ -73,7 +73,7 @@ class ref_joint_pos_action_policy(RobotTrackObservation):
         return ref_joint_action
 
 
-class ref_root_pos_future_b(RobotTrackObservation):
+class ref_root_pos_future_b(RobotTrackObservation, namespace="hdmi"):
     """
     Reference root position in robot root frame
     """
@@ -105,17 +105,18 @@ class ref_root_pos_future_b(RobotTrackObservation):
         return self.ref_root_pos_future_b.view(self.num_envs, -1)
 
 
-class ref_root_ori_future_b(RobotTrackObservation):
+class ref_root_ori_future_b(RobotTrackObservation, namespace="hdmi"):
     """
     Reference root orientation in robot root frame
     """
 
-    def __init__(self, env, **kwargs):
+    def __init__(self, env, noise_std=0.0, **kwargs):
         super().__init__(env, **kwargs)
         num_future_steps = self.command_manager.num_future_steps
         self.ref_root_ori_future_b = torch.zeros(
             self.num_envs, num_future_steps, 2, 3, device=self.device
         )
+        self.noise_std = noise_std
 
     def update(self):
         ref_root_quat_future_w = (
@@ -130,13 +131,15 @@ class ref_root_ori_future_b(RobotTrackObservation):
             ref_root_quat_future_w,
         )
         ref_root_ori_future_b = matrix_from_quat(ref_root_quat_future_b)
+        if self.noise_std > 0.0:
+            ref_root_ori_future_b += torch.randn_like(ref_root_ori_future_b).clamp(-3.0, 3.0) * self.noise_std
         self.ref_root_ori_future_b = ref_root_ori_future_b[:, :, :2, :]
 
     def compute(self):
         return self.ref_root_ori_future_b.reshape(self.num_envs, -1)
 
 
-class ref_body_pos_future_local(RobotTrackObservation):
+class ref_body_pos_future_local(RobotTrackObservation, namespace="hdmi"):
     """
     Reference body position in motion anchor frame
     """
@@ -173,7 +176,7 @@ class ref_body_pos_future_local(RobotTrackObservation):
         return self.ref_body_pos_future_local.view(self.num_envs, -1)
 
 
-class ref_body_ori_future_local(RobotTrackObservation):
+class ref_body_ori_future_local(RobotTrackObservation, namespace="hdmi"):
     """
     Reference body orientation in motion anchor frame
     """
@@ -208,7 +211,7 @@ class ref_body_ori_future_local(RobotTrackObservation):
         return self.ref_body_ori_future_local[:, :, :, :2, :].reshape(self.num_envs, -1)
 
 
-class diff_body_pos_future_local(RobotTrackObservation):
+class diff_body_pos_future_local(RobotTrackObservation, namespace="hdmi"):
     """
     Reference body position in each motion anchor frame - Robot body position in robot anchor frame.
     """
@@ -264,7 +267,7 @@ class diff_body_pos_future_local(RobotTrackObservation):
         return self.diff_body_pos_future_local.view(self.num_envs, -1)
 
 
-class diff_body_lin_vel_future_local(RobotTrackObservation):
+class diff_body_lin_vel_future_local(RobotTrackObservation, namespace="hdmi"):
     """
     Reference body linear velocity in motion anchor frame - Robot body linear velocity in robot anchor frame.
     """
@@ -311,7 +314,7 @@ class diff_body_lin_vel_future_local(RobotTrackObservation):
         return self.diff_body_lin_vel_future_local.view(self.num_envs, -1)
 
 
-class diff_body_ori_future_local(RobotTrackObservation):
+class diff_body_ori_future_local(RobotTrackObservation, namespace="hdmi"):
     """
     Reference body orientation in motion anchor frame - Robot body orientation in robot anchor frame.
     """
@@ -364,7 +367,7 @@ class diff_body_ori_future_local(RobotTrackObservation):
         )
 
 
-class diff_body_ang_vel_future_local(RobotTrackObservation):
+class diff_body_ang_vel_future_local(RobotTrackObservation, namespace="hdmi"):
     """
     Reference body linear velocity in motion anchor frame - Robot body linear velocity in robot anchor frame.
     """
@@ -411,6 +414,6 @@ class diff_body_ang_vel_future_local(RobotTrackObservation):
         return self.diff_body_ang_vel_future_local.view(self.num_envs, -1)
 
 
-class ref_motion_phase(RobotTrackObservation):
+class ref_motion_phase(RobotTrackObservation, namespace="hdmi"):
     def compute(self):
         return (self.command_manager.t / self.command_manager.motion_len).unsqueeze(1)

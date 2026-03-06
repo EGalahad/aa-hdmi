@@ -17,11 +17,12 @@ sim:
   isaac_physics_dt: 0.005
 
 robot:
-  name: g1-hdmi
+  # name: g1-hdmi-mode_5
+  name: g1-hdmi-mode_15
 
 input:
   action:
-    _target_: HDMIJointPosition
+    _target_: hdmi.HDMIJointPosition
     action_scaling:
       .*_hip_yaw_joint: 0.55
       .*_hip_roll_joint: 0.35
@@ -44,7 +45,7 @@ input:
     alpha_range: [0.8, 1.0]
 
 command:
-  _target_: RobotTracking
+  _target_: hdmi.RobotTracking
   data_path: ???
   tracking_keypoint_names: [
     ".*_hip_(pitch|yaw)_link",
@@ -83,126 +84,212 @@ command:
     yaw: [-0.1, 0.1]
   init_joint_pos_noise: 0.1
   init_joint_vel_noise: 0.1
-  rewind_prob: 0.0
+  rewind_prob: 0.6
   rewind_steps_range: [25, 125]
   future_steps: [1, 16, 32, 48]
 
 observation:
   command:
-    ref_body_pos_future_local: {}
-    ref_joint_pos_future: {}
-    ref_root_ori_future_b: {}
+    ref_body_pos_future_local:
+      _target_: hdmi.ref_body_pos_future_local
+    ref_joint_pos_future:
+      _target_: hdmi.ref_joint_pos_future
+    ref_root_ori_future_b:
+      _target_: hdmi.ref_root_ori_future_b
+      noise_std: 0.05
   policy:
-    root_ang_vel_history: {history_steps: [0], noise_std: 0.05}
-    projected_gravity_history: {history_steps: [0], noise_std: 0.01}
-    joint_pos_history: {history_steps: [0, 1, 2, 3], noise_std: 0.02}
-    prev_actions: {steps: 3}
+    root_ang_vel_history:
+      _target_: hdmi.root_ang_vel_history
+      history_steps: [0, 1, 2, 4, 8]
+      noise_std: 0.1
+    projected_gravity_history:
+      _target_: hdmi.projected_gravity_history
+      history_steps: [0, 1, 2, 4, 8]
+      noise_std: 0.01
+    joint_pos_history:
+      _target_: hdmi.joint_pos_history
+      history_steps: [0, 1, 2, 4, 8]
+      noise_std: 0.02
+    joint_vel_history:
+      _target_: hdmi.joint_vel_history
+      history_steps: [0, 1, 2, 4, 8]
+      noise_std: 0.5
+    prev_actions:
+      _target_: hdmi.prev_actions
+      steps: 3
   priv:
-    root_ang_vel_history: {history_steps: [0, 1, 2, 4, 8], noise_std: 0.0}
-    projected_gravity_history: {history_steps: [0, 1, 2, 4, 8], noise_std: 0.0}
-    joint_pos_history: {history_steps: [0, 1, 2, 4, 8], noise_std: 0.0}
+    root_ang_vel_history:
+      _target_: hdmi.root_ang_vel_history
+      history_steps: [0, 1, 2, 4, 8]
+      noise_std: 0.0
+    projected_gravity_history:
+      _target_: hdmi.projected_gravity_history
+      history_steps: [0, 1, 2, 4, 8]
+      noise_std: 0.0
+    joint_pos_history:
+      _target_: hdmi.joint_pos_history
+      history_steps: [0, 1, 2, 4, 8]
+      noise_std: 0.0
 
-    ref_root_pos_future_b: {}
-    ref_root_ori_future_b: {}
+    ref_root_pos_future_b:
+      _target_: hdmi.ref_root_pos_future_b
+    ref_root_ori_future_b:
+      _target_: hdmi.ref_root_ori_future_b
 
-    diff_body_pos_future_local: {}
-    diff_body_ori_future_local: {}
-    diff_body_lin_vel_future_local: {}
-    diff_body_ang_vel_future_local: {}
+    diff_body_pos_future_local:
+      _target_: hdmi.diff_body_pos_future_local
+    diff_body_ori_future_local:
+      _target_: hdmi.diff_body_ori_future_local
+    diff_body_lin_vel_future_local:
+      _target_: hdmi.diff_body_lin_vel_future_local
+    diff_body_ang_vel_future_local:
+      _target_: hdmi.diff_body_ang_vel_future_local
 
-    body_pos_b:       {body_names: ".*ankle_roll_link"}
-    body_vel_b:       {body_names: ".*ankle_roll_link"}
+    body_pos_b:
+      _target_: hdmi.body_pos_b
+      body_names: ".*"
+    body_vel_b:
+      _target_: hdmi.body_vel_b
+      body_names: ".*"
 
-    # applied_action:   {}
-    applied_torque:   {}
+    applied_action:
+      _target_: hdmi.applied_action
+    applied_torque:
+      _target_: hdmi.applied_torque
   ref_joint_pos_:
-    ref_joint_pos_action_policy: {}
+    ref_joint_pos_action_policy:
+      _target_: hdmi.ref_joint_pos_action_policy
 
 reward:
   tracking:
     tracking_root_pos:
-      _target_: keypoint_pos_tracking_product
+      _target_: hdmi.keypoint_pos_tracking_product
       body_names: ["torso_link"]
       weight: 0.5
       sigma: 0.3
     tracking_root_ori:
-      _target_: keypoint_ori_tracking_product
+      _target_: hdmi.keypoint_ori_tracking_product
       body_names: ["torso_link"]
       weight: 0.5
       sigma: 0.4
 
     tracking_body_pos:
-      _target_: keypoint_pos_tracking_local_product
+      _target_: hdmi.keypoint_pos_tracking_local_product
       body_names: [".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link", ".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link"]
       weight: 1.0
       sigma: 0.3
     tracking_body_ori:
-      _target_: keypoint_ori_tracking_local_product
+      _target_: hdmi.keypoint_ori_tracking_local_product
       body_names: [".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link", ".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link"]
       weight: 1.0
       sigma: 0.4
 
     tracking_body_linvel:
-      _target_: keypoint_lin_vel_tracking_product
+      _target_: hdmi.keypoint_lin_vel_tracking_product
       body_names: ["pelvis", ".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", "torso_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 0.5
       sigma: 1.0
     tracking_body_angvel:
-      _target_: keypoint_ang_vel_tracking_product
+      _target_: hdmi.keypoint_ang_vel_tracking_product
       body_names: ["pelvis", ".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", "torso_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 0.5
       sigma: 2.5
 
 
     joint_pos_tracking_product:
+      _target_: hdmi.joint_pos_tracking_product
       joint_names: ["waist_.*_joint", ".*_hip_.*_joint", ".*_knee_joint", ".*_shoulder_.*_joint", ".*_elbow_joint", ".*_wrist_.*_joint"]
       weight: 0.5
       sigma: 0.25
     joint_vel_tracking_product:
+      _target_: hdmi.joint_vel_tracking_product
       joint_names: ["waist_.*_joint", ".*_hip_.*_joint", ".*_knee_joint", ".*_shoulder_.*_joint", ".*_elbow_joint", ".*_wrist_.*_joint"]
       weight: 0.5
       sigma: 2.5
 
   loco:
     action_rate_l2:     {weight: 0.1, enabled: true}
-    joint_pos_limits:   {weight: 10.0, joint_names: ".*", soft_factor: 0.9, enabled: true}
-    joint_torque_limits: {weight: 0.01, enabled: true, soft_factor: 0.6}
+    joint_pos_limits:  
+      _target_: hdmi.joint_pos_limits
+      weight: 10.0
+      joint_names: ".*"
+      soft_factor: 0.9
+      enabled: true
+    joint_torque_limits: 
+      _target_: hdmi.joint_torque_limits
+      weight: 0.01
+      enabled: true
+      soft_factor: 0.6
 
-    # feet_slip:          {weight: 0.5, tolerance: 0.0, enabled: false, body_names: .*ankle_roll_link}
-    # feet_air_time:
-    #   _target_: hdmi.feet_air_time
-    #   weight: 8.0
-    #   enabled: false
-    #   body_names: .*ankle_roll_link
-    #   thres: 0.8
+    feet_slip:          
+      _target_: hdmi.feet_slip
+      weight: 0.5
+      tolerance: 0.0
+      enabled: false
+      body_names: .*ankle_roll_link
+
+    feet_air_time:
+      _target_: hdmi.feet_air_time
+      weight: 8.0
+      enabled: false
+      body_names: .*ankle_roll_link
+      thres: 0.8
+
+    self_collisions:
+      _target_: hdmi.self_collisions
+      weight: -10.0
+      enabled: true
+      sensor_name: self_collision
+      force_threshold: 10.0
+
     survival:           {weight: 4.0, enabled: true}
   debug:
     root_pos_error:
-      _target_: keypoint_pos_error
+      _target_: hdmi.keypoint_pos_error
       body_names: ["pelvis"]
       weight: 1.0
       enabled: false
     root_ori_error:
-      _target_: keypoint_ori_error
+      _target_: hdmi.keypoint_ori_error
       body_names: ["pelvis"]
       weight: 1.0
       enabled: false
     body_pos_error_local:
-      _target_: keypoint_pos_error_local
+      _target_: hdmi.keypoint_pos_error_local
       body_names: [".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 1.0
       enabled: false
     body_ori_error_local:
-      _target_: keypoint_ori_error_local
+      _target_: hdmi.keypoint_ori_error_local
       body_names: [".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 1.0
       enabled: false
-    joint_pos_error:             {joint_names: ["waist_.*_joint", ".*_hip_.*_joint", ".*_knee_joint", ".*_shoulder_.*_joint", ".*_elbow_joint"], weight: 1.0, enabled: false}
+    joint_pos_error:
+      _target_: hdmi.joint_pos_error
+      joint_names: ["waist_.*_joint", ".*_hip_.*_joint", ".*_knee_joint", ".*_shoulder_.*_joint", ".*_elbow_joint"]
+      weight: 1.0
+      enabled: false
   debug_loco:
-    joint_pos_limits:   {weight: 1.0, enabled: false, soft_factor: 0.9, joint_names: .*}
-    feet_contact_count: {weight: 1.0, enabled: false, body_names: .*ankle_roll_link}
+    joint_pos_limits:   
+      _target_: hdmi.joint_pos_limits
+      weight: 1.0
+      joint_names: ".*"
+      soft_factor: 0.9
+      enabled: false
+    
+    feet_contact_count:
+      _target_: hdmi.feet_contact_count
+      weight: 1.0
+      enabled: false
+      body_names: .*ankle_roll_link
 
+    feet_contact_duration:
+      _target_: hdmi.feet_contact_duration
+      weight: 1.0
+      enabled: false
+      body_names: .*ankle_roll_link
 
+# randomization: {}
 randomization:
   perturb_body_materials:
     body_names: [".*ankle_roll_link", ".*_wrist_yaw_link"]
@@ -211,6 +298,7 @@ randomization:
     restitution_range: [0.0, 0.5]
     solref_time_constant_range: [0.015, 0.03]
     solref_dampratio_range: [0.5, 2.0]
+    homogeneous: true
 
   perturb_body_mass:
     .*: [0.9, 1.1]

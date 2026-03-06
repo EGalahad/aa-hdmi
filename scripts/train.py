@@ -234,7 +234,7 @@ def main(cfg: DictConfig):
         info, trajs, stats = evaluate(
             env, policy_eval, render=cfg.eval_render, seed=cfg.seed
         )
-        info["env_frames"] = env_frames
+        info["env_frames"] = env_frames * aa.get_world_size()
         run.log(info)
         wandb.finish()
         print(f"Final checkpoint: {ckpt_path}")

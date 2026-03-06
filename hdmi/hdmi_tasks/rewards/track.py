@@ -96,7 +96,7 @@ def align_quat_between_roots(
     return aligned
 
 
-class _tracking_keypoint(TrackReward):
+class _tracking_keypoint(TrackReward, namespace="hdmi"):
     def __init__(
         self,
         env,
@@ -156,7 +156,7 @@ class _tracking_keypoint(TrackReward):
         raise NotImplementedError
 
 
-class keypoint_pos_tracking_product(_tracking_keypoint):
+class keypoint_pos_tracking_product(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_pos_asset = self.command_manager.asset.data.body_link_pos_w[
             :, self.body_indices_asset
@@ -171,7 +171,7 @@ class keypoint_pos_tracking_product(_tracking_keypoint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_pos_tracking_local_product(_tracking_keypoint):
+class keypoint_pos_tracking_local_product(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_pos_asset = self.command_manager.asset.data.body_link_pos_w[
             :, self.body_indices_asset
@@ -273,7 +273,7 @@ class keypoint_pos_tracking_local_product(_tracking_keypoint):
         # )
 
 
-class keypoint_pos_error(_tracking_keypoint):
+class keypoint_pos_error(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_pos_asset = self.command_manager.asset.data.body_link_pos_w[
             :, self.body_indices_asset
@@ -288,7 +288,7 @@ class keypoint_pos_error(_tracking_keypoint):
         return error.mean(dim=1).unsqueeze(1)
 
 
-class keypoint_pos_error_local(_tracking_keypoint):
+class keypoint_pos_error_local(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_pos_asset = self.command_manager.asset.data.body_link_pos_w[
             :, self.body_indices_asset
@@ -332,7 +332,7 @@ class keypoint_pos_error_local(_tracking_keypoint):
         return error.mean(dim=1).unsqueeze(1)
 
 
-class keypoint_ori_tracking_product(_tracking_keypoint):
+class keypoint_ori_tracking_product(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_ori_asset = self.command_manager.asset.data.body_link_quat_w[
             :, self.body_indices_asset
@@ -348,7 +348,7 @@ class keypoint_ori_tracking_product(_tracking_keypoint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_ori_tracking_local_product(_tracking_keypoint):
+class keypoint_ori_tracking_local_product(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_ori_asset = self.command_manager.asset.data.body_link_quat_w[
             :, self.body_indices_asset
@@ -387,7 +387,7 @@ class keypoint_ori_tracking_local_product(_tracking_keypoint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_ori_error(_tracking_keypoint):
+class keypoint_ori_error(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_ori_asset = self.command_manager.asset.data.body_link_quat_w[
             :, self.body_indices_asset
@@ -403,7 +403,7 @@ class keypoint_ori_error(_tracking_keypoint):
         return error.mean(dim=1).unsqueeze(1)
 
 
-class keypoint_ori_error_local(_tracking_keypoint):
+class keypoint_ori_error_local(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_ori_asset = self.command_manager.asset.data.body_link_quat_w[
             :, self.body_indices_asset
@@ -442,7 +442,7 @@ class keypoint_ori_error_local(_tracking_keypoint):
         return error.mean(dim=1).unsqueeze(1)
 
 
-class keypoint_lin_vel_tracking_product(_tracking_keypoint):
+class keypoint_lin_vel_tracking_product(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_lin_vel_asset = self.command_manager.asset.data.body_com_lin_vel_w[
             :, self.body_indices_asset
@@ -457,7 +457,7 @@ class keypoint_lin_vel_tracking_product(_tracking_keypoint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_ang_vel_tracking_product(_tracking_keypoint):
+class keypoint_ang_vel_tracking_product(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_ang_vel_asset = self.command_manager.asset.data.body_com_ang_vel_w[
             :, self.body_indices_asset
@@ -472,7 +472,7 @@ class keypoint_ang_vel_tracking_product(_tracking_keypoint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_lin_vel_tracking_local_product(_tracking_keypoint):
+class keypoint_lin_vel_tracking_local_product(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_lin_vel_asset = self.command_manager.asset.data.body_com_lin_vel_w[
             :, self.body_indices_asset
@@ -497,7 +497,7 @@ class keypoint_lin_vel_tracking_local_product(_tracking_keypoint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_ang_vel_tracking_local_product(_tracking_keypoint):
+class keypoint_ang_vel_tracking_local_product(_tracking_keypoint, namespace="hdmi"):
     def compute(self):
         body_ang_vel_asset = self.command_manager.asset.data.body_com_ang_vel_w[
             :, self.body_indices_asset
@@ -522,7 +522,7 @@ class keypoint_ang_vel_tracking_local_product(_tracking_keypoint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class _tracking_joint(TrackReward):
+class _tracking_joint(TrackReward, namespace="hdmi"):
     def __init__(
         self,
         env,
@@ -578,7 +578,7 @@ class _tracking_joint(TrackReward):
             raise ValueError(f"Invalid tolerance type: {type(tolerance)}")
 
 
-class joint_pos_tracking_product(_tracking_joint):
+class joint_pos_tracking_product(_tracking_joint, namespace="hdmi"):
     def compute(self):
         joint_pos_asset = self.command_manager.asset.data.joint_pos[
             :, self.joint_indices_asset
@@ -592,7 +592,7 @@ class joint_pos_tracking_product(_tracking_joint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class joint_pos_error(_tracking_joint):
+class joint_pos_error(_tracking_joint, namespace="hdmi"):
     def compute(self):
         joint_pos_asset = self.command_manager.asset.data.joint_pos[
             :, self.joint_indices_asset
@@ -605,7 +605,7 @@ class joint_pos_error(_tracking_joint):
         return error.mean(dim=1).unsqueeze(1)
 
 
-class joint_vel_tracking_product(_tracking_joint):
+class joint_vel_tracking_product(_tracking_joint, namespace="hdmi"):
     def compute(self):
         joint_vel_asset = self.command_manager.asset.data.joint_vel[
             :, self.joint_indices_asset
@@ -619,7 +619,7 @@ class joint_vel_tracking_product(_tracking_joint):
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class feet_air_time_ref(TrackReward):
+class feet_air_time_ref(TrackReward, namespace="hdmi"):
     def __init__(self, env, body_names: List[str] | str, thres: float, **kwargs):
         super().__init__(env, **kwargs)
         self.thres = thres
@@ -701,7 +701,7 @@ class feet_air_time_ref(TrackReward):
 # --------------------------------------------------------------------------- #
 # Keypoint position tracking with root alignment & look-ahead buffer
 # --------------------------------------------------------------------------- #
-class keypoint_pos_tracking_aligned(TrackReward):
+class keypoint_pos_tracking_aligned(TrackReward, namespace="hdmi"):
     """
     Align the reference motion root with the current robot root in xy + yaw and
     maintain a look-ahead buffer. Aligned future roots are pushed into the buffer,
@@ -888,7 +888,7 @@ class keypoint_pos_tracking_aligned(TrackReward):
             )
 
 
-class keypoint_ori_tracking_aligned(TrackReward):
+class keypoint_ori_tracking_aligned(TrackReward, namespace="hdmi"):
     """
     Same root alignment and look-ahead mechanism as keypoint_pos_tracking_aligned,
     but compares orientations (quaternions) of key bodies and uses axis-angle norm
@@ -1021,7 +1021,7 @@ class keypoint_ori_tracking_aligned(TrackReward):
         error = diff.norm(dim=-1)
         return torch.exp(-error.mean(dim=1, keepdim=True) / self.sigma)
 
-class keypoint_pos_tracking_pos_aligned(TrackReward):
+class keypoint_pos_tracking_pos_aligned(TrackReward, namespace="hdmi"):
     """
     Align the reference motion root with the current robot root in xy + yaw and
     maintain a look-ahead buffer. Aligned future roots are pushed into the buffer,
@@ -1141,4 +1141,3 @@ class keypoint_pos_tracking_pos_aligned(TrackReward):
 
         error = (aligned_body_pos_w - robot_body_pos_w).norm(dim=-1)
         return torch.exp(-error.mean(dim=1, keepdim=True) / self.sigma)
-
