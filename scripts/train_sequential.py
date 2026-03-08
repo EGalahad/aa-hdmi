@@ -1,20 +1,22 @@
-import torch
-import hydra
-import numpy as np
-import wandb
-import logging
-import time
+from __future__ import annotations
+
 import datetime
+import logging
+import multiprocessing
+import sys
+import time
+from collections import OrderedDict
 from pathlib import Path
 
-from omegaconf import OmegaConf, DictConfig
-
-from collections import OrderedDict
-from tqdm import tqdm
+import hydra
+import torch
+import wandb
+from hydra import compose
+from omegaconf import DictConfig, OmegaConf
 from setproctitle import setproctitle
-
-from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict import TensorDict
+from torchrl.envs.utils import ExplorationType, set_exploration_type
+from tqdm import tqdm
 
 import active_adaptation as aa
 from active_adaptation.utils.profiling import ScopedTimer
@@ -25,13 +27,13 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
-
 FILE_PATH = Path(__file__).resolve().parent
 CONFIG_PATH = FILE_PATH.parent / "cfg"
 
 
-@hydra.main(config_path=str(CONFIG_PATH), config_name="train", version_base=None)
-def main(cfg: DictConfig):
+def run_training_stage(
+    cfg: DictConfig, return_queue: multiprocessing.Queue | None = None
+) -> None:
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
@@ -67,56 +69,7 @@ def main(cfg: DictConfig):
     ]
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
-    def save(policy, checkpoint_name: str, *, upload_to_wandb: bool = True):
-        run_dir = Path(run.dir)
-        ckpt_path = run_dir / f"{checkpoint_name}.pt"
-        state_dict = OrderedDict()
-        state_dict["wandb"] = {"name": run.name, "id": run.id}
-        state_dict["policy"] = policy.state_dict()
-        
-        torch.save(state_dict, ckpt_path)
-        if upload_to_wandb:
-            run.save(str(ckpt_path), policy="now", base_path=run.dir)
-        
-        latest_link = run_dir / "checkpoint_latest.pt"
-        if latest_link.exists() or latest_link.is_symlink():
-            latest_link.unlink()
-        latest_link.symlink_to(ckpt_path.name)
-        logging.info(f"Saved checkpoint to {ckpt_path}" + (" (wandb)" if upload_to_wandb else ""))
-        return str(ckpt_path)
-
-    assert env.training
-
-    def should_save(i):
-        if not aa.is_main_process():
-            return False
-        return i % checkpoint_interval == 0 or i % upload_interval == 0
-
-    ckpt_path = None
-    carry = env.reset()
-    next_saved_keys = [
-        # "command",
-        # "command_",
-        # "policy",
-        # "priv",
-        "done",
-        "terminated",
-        "truncated",
-        "discount",
-        "reward",
-        "stats",
-        "is_init",
-        "adapt_hx",
-        "episode_id",
-    ]
-
-    env_frames = 0
-
-    if hasattr(policy.cfg, "stages"):
-        stages = policy.cfg.stages
-    else:
-        stages = ("",)
-
+    run = None
     if aa.is_main_process():
         run = wandb.init(
             job_type=cfg.wandb.job_type,
@@ -141,8 +94,62 @@ def main(cfg: DictConfig):
         run.save(str(cfg_save_path), policy="now")
         run.save(str(run_dir / "config.yaml"), policy="now")
 
-    for stage in stages:
+    def save(policy, checkpoint_name: str, *, upload_to_wandb: bool = True):
+        if not aa.is_main_process():
+            return None
+        assert run is not None
+        run_dir = Path(run.dir)
+        ckpt_path = run_dir / f"{checkpoint_name}.pt"
+        state_dict = OrderedDict()
+        state_dict["wandb"] = {"name": run.name, "id": run.id}
+        state_dict["policy"] = policy.state_dict()
 
+        torch.save(state_dict, ckpt_path)
+        if upload_to_wandb:
+            run.save(str(ckpt_path), policy="now", base_path=run.dir)
+
+        latest_link = run_dir / "checkpoint_latest.pt"
+        if latest_link.exists() or latest_link.is_symlink():
+            latest_link.unlink()
+        latest_link.symlink_to(ckpt_path.name)
+        logging.info(
+            f"Saved checkpoint to {ckpt_path}"
+            + (" (wandb)" if upload_to_wandb else "")
+        )
+        return str(ckpt_path)
+
+    assert env.training
+
+    def should_save(i):
+        if not aa.is_main_process():
+            return False
+        return i % checkpoint_interval == 0 or i % upload_interval == 0
+
+    carry = env.reset()
+    next_saved_keys = [
+        # "command",
+        # "command_",
+        # "policy",
+        # "priv",
+        "done",
+        "terminated",
+        "truncated",
+        "discount",
+        "reward",
+        "stats",
+        "is_init",
+        "adapt_hx",
+        "episode_id",
+    ]
+
+    env_frames = 0
+
+    if hasattr(policy.cfg, "stages"):
+        stages = policy.cfg.stages
+    else:
+        stages = ("",)
+
+    for stage in stages:
         policy.on_stage_start(stage)
         rollout_policy = policy.get_rollout_policy("train")
 
@@ -151,11 +158,13 @@ def main(cfg: DictConfig):
             tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
             tmp_td["next"] = tmp_td["next"].select(*next_saved_keys, strict=False)
 
-        data_buf: TensorDict = tmp_td.unsqueeze(-1).expand(env.num_envs, cfg.algo.train_every).clone()
+        data_buf: TensorDict = tmp_td.unsqueeze(-1).expand(
+            env.num_envs, cfg.algo.train_every
+        ).clone()
 
         progress = range(total_iters)
         if aa.is_main_process():
-            progress = tqdm(progress, desc=stage)
+            progress = tqdm(progress, desc=stage_name(stage, cfg.algo.name))
 
         start_iter = getattr(env, "current_iter", 0)
         for i in progress:
@@ -200,7 +209,7 @@ def main(cfg: DictConfig):
             training_time = training_timer.last_time
 
             info.update(env.extra)
-            info.update(env.stats_ema)  # step-wise exponential moving average of stats
+            info.update(env.stats_ema)
 
             if hasattr(policy, "step_schedule"):
                 policy.step_schedule(i / total_iters)
@@ -215,30 +224,134 @@ def main(cfg: DictConfig):
 
             if should_save(i):
                 should_upload = i % upload_interval == 0
-                checkpoint_name = f"checkpoint_{i}" if should_upload else "checkpoint_temp"
-                ckpt_path = save(policy, checkpoint_name, upload_to_wandb=should_upload)
-                print(f"Latest checkpoint: {ckpt_path}")
+                checkpoint_name = (
+                    f"checkpoint_{i}" if should_upload else "checkpoint_temp"
+                )
+                ckpt_path = save(
+                    policy, checkpoint_name, upload_to_wandb=should_upload
+                )
+                if ckpt_path is not None:
+                    print(f"Latest checkpoint: {ckpt_path}")
 
-            if aa.is_main_process():
-                # ScopedTimer.print_summary(clear=True)
-                # print(
-                #     OmegaConf.to_yaml(
-                #         {k: v for k, v in info.items() if isinstance(v, (float, int))}
-                #     )
-                # )
+            if aa.is_main_process() and run is not None:
                 run.log(info)
 
-    if aa.is_main_process():
-        ckpt_path = save(policy, "checkpoint_final")
+    run_path = None
+    if aa.is_main_process() and run is not None:
+        final_ckpt = save(policy, "checkpoint_final")
         policy_eval = policy.get_rollout_policy("eval")
-        info, trajs, stats = evaluate(
-            env, policy_eval, render=cfg.eval_render, seed=cfg.seed
-        )
-        info["env_frames"] = env_frames * aa.get_world_size()
+        info, _, _ = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
+        info["env_frames"] = env_frames
         run.log(info)
+
+        run_path = f"{run.entity}/{run.project}/{run.id}"
+        print(f"Final checkpoint: {final_ckpt}")
+        print(f"Run path: {run_path}")
         wandb.finish()
-        print(f"Final checkpoint: {ckpt_path}")
-    exit(0)
+
+    if return_queue is not None:
+        return_queue.put(run_path)
+        return_queue.close()
+        return_queue.join_thread()
+    return
+
+
+def stage_name(stage: str, fallback: str) -> str:
+    if stage:
+        return stage
+    return fallback
+
+
+@hydra.main(
+    config_path=str(CONFIG_PATH), config_name="train_sequential", version_base=None
+)
+def main(cfg: DictConfig):
+    cli_overrides = []
+    script_name = Path(__file__).name
+    for arg in sys.argv[1:]:
+        if arg.startswith("hydra.") or script_name in arg:
+            continue
+        if not arg.startswith("stages="):
+            cli_overrides.append(arg)
+
+    print("=" * 80)
+    print("Detected command-line overrides applied to all stages:")
+    if cli_overrides:
+        for ov in cli_overrides:
+            print(f"  - {ov}")
+    else:
+        print("  - None")
+    print("=" * 80)
+
+    previous_run_path = None
+
+    for i, stage in enumerate(cfg.stages):
+        if isinstance(stage, DictConfig):
+            stage_name_value = stage.get("name", f"stage-{i + 1}")
+            stage_specific_overrides = list(stage.get("overrides", []))
+            load_from_previous = bool(stage.get("load_checkpoint_from_previous", i > 0))
+        else:
+            # Backward compatibility: plain string stage means algo override.
+            stage_name_value = str(stage)
+            stage_specific_overrides = [f"algo={stage_name_value}"]
+            load_from_previous = i > 0
+
+        print("\n" + "=" * 80)
+        print(f"Preparing stage {i + 1}/{len(cfg.stages)}: {stage_name_value}")
+        print("=" * 80)
+
+        stage_overrides = cli_overrides.copy()
+        stage_overrides.extend(stage_specific_overrides)
+        if previous_run_path and load_from_previous:
+            stage_overrides.append(f"checkpoint_path=run:{previous_run_path}")
+            print(f"Loading checkpoint from previous run: {previous_run_path}")
+
+        stage_cfg = compose(config_name="train", overrides=stage_overrides)
+        OmegaConf.resolve(stage_cfg)
+
+        return_queue = multiprocessing.Queue(1)
+        process = multiprocessing.Process(
+            target=run_training_stage,
+            kwargs={"cfg": stage_cfg, "return_queue": return_queue},
+        )
+
+        print(f"Starting child process for stage '{stage_name_value}'")
+        process.start()
+        process.join()
+        print(f"Child process for stage '{stage_name_value}' finished")
+
+        if process.exitcode != 0:
+            print(
+                f"ERROR: Child process for stage '{stage_name_value}' exited with code {process.exitcode}"
+            )
+            break
+
+        try:
+            current_run_path = return_queue.get(timeout=10)
+        except Exception as exc:
+            print(
+                f"ERROR: Failed to retrieve run path for stage '{stage_name_value}': {exc}"
+            )
+            return_queue.close()
+            return_queue.join_thread()
+            break
+
+        if not current_run_path:
+            print(
+                f"ERROR: Empty run path returned from stage '{stage_name_value}'. Stop remaining stages."
+            )
+            return_queue.close()
+            return_queue.join_thread()
+            break
+
+        return_queue.close()
+        return_queue.join_thread()
+        previous_run_path = current_run_path
+        print(f"Completed stage {i + 1}/{len(cfg.stages)}: {stage_name_value}")
+        print(f"Run path: {current_run_path}")
+        print("=" * 80)
+
+    print("\nAll training stages finished")
 
 
 if __name__ == "__main__":

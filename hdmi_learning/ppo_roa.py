@@ -2,6 +2,7 @@ import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Tuple, Union, Mapping
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -511,23 +512,24 @@ class PPOROA(PPOBase):
                 self.adapt_module(minibatch)
                 priv_loss = F.mse_loss(minibatch[PRIV_PRED_KEY], minibatch[PRIV_FEATURE_KEY], reduction="none")
                 priv_loss = priv_loss[valid].mean()
-                info["adapt/priv_loss"] = priv_loss.detach()
-
-                adapt_loss = priv_loss
 
                 if self.cfg.residual_action:
                     with torch.no_grad():
                         dist_teacher = self.actor.get_dist(minibatch)
 
+                    # TODO: check if should detach
+                    minibatch[PRIV_PRED_KEY] = minibatch[PRIV_PRED_KEY].detach()
                     dist_student = self.actor_adapt.get_dist(minibatch)
                     actor_loss = F.mse_loss(dist_teacher.mean, dist_student.mean, reduction="none")
                     actor_loss = actor_loss[valid].mean()
-                    info["adapt/actor_loss"] = actor_loss.detach()
+                else:
+                    actor_loss = torch.zeros((), device=self.device)
 
-                    adapt_loss += actor_loss
+                info["adapt/priv_loss"] = priv_loss.detach()
+                info["adapt/actor_loss"] = actor_loss.detach()
 
                 self.opt_adapt.zero_grad()
-                adapt_loss.backward()
+                (priv_loss + actor_loss).backward()
                 self.opt_adapt.step()
 
                 infos.append(TensorDict(info, []))
@@ -579,8 +581,14 @@ class PPOROA(PPOBase):
                 var = (global_sum_sq / global_count) - (mean * mean)
                 std = var.clamp_min(0.0).sqrt()
             else:
-                mean = x.mean(dim=(0, 1))
-                std = x.std(dim=(0, 1))
+                local_count = mask.sum()
+                local_sum = (x * mask.unsqueeze(-1)).sum(dim=(0, 1))
+                local_sum_sq = (x * x * mask.unsqueeze(-1)).sum(dim=(0, 1))
+                count = local_count.float().expand_as(local_sum).clamp_min_(1)
+
+                mean = local_sum / count
+                var = (local_sum_sq / count) - (mean * mean)
+                std = var.clamp_min(0.0).sqrt()
             return mean, std
 
         mask = ~tensordict["is_init"].squeeze(-1)
@@ -612,11 +620,9 @@ class PPOROA(PPOBase):
             self.encoder_priv(tensordict)
             actor = self.actor
         elif self.cfg.phase == "finetune":
-            if self.cfg.finetune_adapt_module:
-                self.adapt_module(tensordict)
-            else:
-                with torch.no_grad():
-                    self.adapt_module(tensordict)
+            context = nullcontext() if self.cfg.finetune_adapt_module else torch.no_grad()
+            with context:
+                 self.adapt_module(tensordict)
             actor = self.actor_adapt
         else:
             raise ValueError(f"Invalid phase: {self.cfg.phase}")
@@ -643,10 +649,10 @@ class PPOROA(PPOBase):
         value_loss = value_loss[valid].mean(dim=0)
 
         if self.cfg.phase == "train":
-            if "priv_pred" not in tensordict.keys():
+            if PRIV_PRED_KEY not in tensordict.keys():
                 with torch.no_grad():
                     self.adapt_module(tensordict)
-            reg_loss = F.mse_loss(tensordict["priv_pred"], tensordict["priv_feature"], reduction="none")
+            reg_loss = F.mse_loss(tensordict[PRIV_PRED_KEY], tensordict[PRIV_FEATURE_KEY], reduction="none")
             reg_loss = torch.mean(reg_loss[valid])
         else:
             reg_loss = torch.zeros((), device=self.device)
@@ -674,20 +680,22 @@ class PPOROA(PPOBase):
             kl = D.kl_divergence(dist_old, dist_now).mean()
 
         info = {
-            "adapt/reg_loss": reg_loss.detach(),
             "actor/policy_loss": policy_loss.detach(),
+            "actor/reg_loss": reg_loss.detach(),
+            "actor/clamp_ratio": clipfrac.detach(),
+
             "actor/entropy": entropy.detach(),
             "actor/mean_std": tensordict["scale"].detach().mean(),
-            "actor/grad_norm": actor_grad_norm.detach(),
-            "actor/clamp_ratio": clipfrac.detach(),
             "actor/kl": kl.detach(),
-            "actor/priv_grad_norm": priv_grad_norm.detach(),
-            "actor/approx_kl": (((ratio - 1) - log_ratio).mean()).detach(),
-            "critic/grad_norm": critic_grad_norm.detach(),
         }
+
         for i, group_name in enumerate(self.reward_groups):
             info[f"critic/{group_name}.explained_var"] = explained_var[i]
             info[f"critic/{group_name}.value_loss"] = value_loss[i].detach()
+
+        info["opt/grad_norm.critic"] = critic_grad_norm.detach()
+        info["opt/grad_norm.encoder_priv"] = priv_grad_norm.detach()
+        info["opt/grad_norm.actor"] = actor_grad_norm.detach()
         return info
 
     def state_dict(self):

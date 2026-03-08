@@ -84,7 +84,7 @@ command:
     yaw: [-0.1, 0.1]
   init_joint_pos_noise: 0.1
   init_joint_vel_noise: 0.1
-  rewind_prob: 0.6
+  rewind_prob: 0.0
   rewind_steps_range: [25, 125]
   future_steps: [1, 16, 32, 48]
 
@@ -101,7 +101,7 @@ observation:
     root_ang_vel_history:
       _target_: hdmi.root_ang_vel_history
       history_steps: [0, 1, 2, 4, 8]
-      noise_std: 0.1
+      noise_std: 0.2
     projected_gravity_history:
       _target_: hdmi.projected_gravity_history
       history_steps: [0, 1, 2, 4, 8]
@@ -300,11 +300,12 @@ randomization:
     solref_dampratio_range: [0.5, 2.0]
     homogeneous: true
 
-  perturb_body_mass:
-    .*: [0.9, 1.1]
-  perturb_body_com:
-    body_names: ["pelvis", "torso_link"]
-    pos_range: [-0.03, 0.03]
+  # perturb_body_mass:
+  #   .*: [0.9, 1.1]
+  # perturb_body_com:
+  #   body_names: ["pelvis", "torso_link"]
+  #   pos_range: [-0.03, 0.03]
+
   random_joint_offset:
     .*: [-0.01, 0.01]
 

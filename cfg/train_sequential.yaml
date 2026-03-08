@@ -1,0 +1,48 @@
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-${task.name}-${algo.name}
+  job:
+    chdir: true
+
+headless: true
+exp_name: ${oc.select:task.name,test}-${oc.select:algo.name,none}
+
+backend: isaac
+device: cuda
+
+app:
+  headless: ${..headless}
+  enable_cameras: ${..eval_render}
+
+total_frames: null
+total_iters: 4000
+eval_render: false
+checkpoint_interval: 1000
+upload_interval: 1000
+seed: 42
+checkpoint_path: null
+export_policy: false
+
+camera_follow: true
+
+wandb:
+  name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
+  job_type: train
+  project: ${oc.select:task.project,active_adaptation}
+  mode: online
+  tags: []
+
+defaults:
+  - task: Velocity
+  - algo: ppo_roa_train
+  - _self_
+
+stages:
+  - name: train-single
+    overrides:
+      - +exp=train-single
+    load_checkpoint_from_previous: false
+  - name: finetune-single
+    overrides:
+      - +exp=finetune-single
+    load_checkpoint_from_previous: true

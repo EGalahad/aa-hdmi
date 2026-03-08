@@ -203,6 +203,8 @@ def export_policy(cfg: DictConfig, env, policy) -> None:
         group = policy_config["observation"].get(obs_group_key, None)
         if isinstance(group, dict) and "joint_pos_history" in group:
             group["joint_pos_history"]["joint_names"] = sim_joint_order
+        if isinstance(group, dict) and "joint_vel_history" in group:
+            group["joint_vel_history"]["joint_names"] = sim_joint_order
 
     action_manager = env.action_manager
     policy_config["policy_joint_names"] = list(
@@ -294,6 +296,7 @@ def main(cfg: DictConfig):
 
     timer = Timer(env.step_dt)
 
+    # with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
     with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
         for i in itertools.count():
             carry = rollout_policy(carry)
