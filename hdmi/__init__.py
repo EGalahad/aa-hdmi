@@ -1,2 +1,2 @@
-from . import hdmi_tasks
-from . import hdmi_assets
+from . import tasks
+from . import assets

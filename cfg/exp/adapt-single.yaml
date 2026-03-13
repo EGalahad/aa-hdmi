@@ -1,0 +1,6 @@
+# @package _global_
+
+defaults:
+  - override /algo: ppo_roa_adapt
+
+total_iters: 2000

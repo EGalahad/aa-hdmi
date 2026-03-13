@@ -32,9 +32,13 @@ from active_adaptation.utils.timerfd import Timer
 from active_adaptation.utils.torchrl import ObsNorm
 from active_adaptation.utils.wandb import parse_checkpoint_path
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from active_adaptation.envs.env_base import _EnvBase
+
 FILE_PATH = Path(__file__).resolve().parent
 CONFIG_PATH = FILE_PATH.parent / "cfg"
-
 
 
 def _find_vecnorm(env) -> TorchRLVecNorm | None:
@@ -111,62 +115,22 @@ def _checkpoint_tags(checkpoint_path: str | None) -> tuple[str, str]:
     return wandb_run_id, checkpoint_num
 
 
-def _prepare_fake_input(env, policy_module: ModBase):
-    fake_input = env.observation_spec[0].rand().cpu()
-
-    for key in policy_module.in_keys:
-        if fake_input.get(key, None) is not None:
-            continue
-
-        if key == "is_init":
-            fake_input[key] = torch.tensor(1, dtype=torch.bool)
-            continue
-
-        if isinstance(key, str) and key.endswith("hx"):
-            fake_input[key] = torch.zeros(128)
-            continue
-
-    return fake_input.unsqueeze(0)
-
-
-def _avg_inference_time(module: ModBase, x: TensorDictBase, iters: int = 1000) -> float:
-    start = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
-    end = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
-
-    if start is not None and end is not None:
-        start.record()
-        for _ in range(iters):
-            module(x)
-        end.record()
-        torch.cuda.synchronize()
-        return (start.elapsed_time(end) / 1000.0) / iters
-
-    import time
-
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        module(x)
-    return (time.perf_counter() - t0) / iters
-
 
 @VecNorm.freeze()
-def export_policy(cfg: DictConfig, env, policy) -> None:
+def export_policy(cfg: DictConfig, env: "_EnvBase", policy) -> None:
     checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path)
     wandb_run_id, checkpoint_num = _checkpoint_tags(checkpoint_path)
 
-    deploy_policy = copy.deepcopy(policy.get_rollout_policy("deploy"))
+    deploy_policy: ModBase = copy.deepcopy(policy.get_rollout_policy("deploy"))
 
     vecnorm = _find_vecnorm(env)
     if vecnorm is not None:
         obs_norm = ObsNorm.from_vecnorm(vecnorm, deploy_policy.in_keys)
-        export_module = TensorDictSequential(
-            obs_norm, deploy_policy
-        ).cpu()
+        export_module = TensorDictSequential(obs_norm, deploy_policy).cpu()
     else:
         export_module = deploy_policy.cpu()
 
-    fake_input = _prepare_fake_input(env, export_module)
-    print(f"Inference time of policy: {_avg_inference_time(export_module, fake_input)}")
+    fake_input = env.observation_spec[0].rand().cpu()
 
     export_dir = FILE_PATH / "exports" / str(cfg.task.name)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -182,30 +146,21 @@ def export_policy(cfg: DictConfig, env, policy) -> None:
     policy_config = {}
 
     obs_cfg = {}
-    task_obs_cfg = dict_cfg.get("task", {}).get("observation", {})
+    task_obs_cfg = dict_cfg["task"]["observation"]
     for k in deploy_policy.in_keys:
         if k in task_obs_cfg:
             obs_cfg[k] = task_obs_cfg[k]
     policy_config["observation"] = obs_cfg
 
-    asset = env.scene["robot"]
+    asset = env.scene.articulations["robot"]
     asset_meta = _get_asset_meta(asset)
-    policy_config["asset_joint_names"] = asset_meta["joint_names"]
+    policy_config["joint_names_simulation"] = asset.cfg.joint_names_simulation
+    policy_config["body_names_simulation"] = asset.cfg.body_names_simulation
     policy_config["joint_kp"] = asset_meta["joint_kp"]
     policy_config["joint_kd"] = asset_meta["joint_kd"]
     policy_config["default_joint_pos"] = asset_meta["default_joint_pos"]
 
     # Make joint observation order explicit for sim2real consumers.
-    sim_joint_order = list(getattr(asset.cfg, "joint_names_simulation", []) or [])
-    if not sim_joint_order:
-        sim_joint_order = list(policy_config["asset_joint_names"])
-    for obs_group_key in ("policy", "priv"):
-        group = policy_config["observation"].get(obs_group_key, None)
-        if isinstance(group, dict) and "joint_pos_history" in group:
-            group["joint_pos_history"]["joint_names"] = sim_joint_order
-        if isinstance(group, dict) and "joint_vel_history" in group:
-            group["joint_vel_history"]["joint_names"] = sim_joint_order
-
     action_manager = env.action_manager
     policy_config["policy_joint_names"] = list(
         getattr(action_manager, "joint_names", [])
@@ -221,21 +176,10 @@ def export_policy(cfg: DictConfig, env, policy) -> None:
     command_obs = policy_config["observation"].get(cmd_key)
 
     if isinstance(command_obs, dict) and command is not None:
-        motion_duration_second = None
-        if hasattr(command, "dataset") and hasattr(command.dataset, "lengths"):
-            motion_duration_second = command.dataset.lengths[0].item() * env.step_dt
+        from hdmi.tasks.command import RobotTracking
 
-        future_steps = (
-            command.future_steps.tolist() if hasattr(command, "future_steps") else None
-        )
-        tracking_keypoint_names = getattr(command, "tracking_body_names", None)
-        tracking_joint_names = getattr(command, "tracking_joint_names", None)
-        root_body_name = getattr(command, "root_body_name", None)
-        anchor_body_name = getattr(command, "anchor_body_name", None)
-
+        command: RobotTracking
         for obs_key in command_obs:
-            if motion_duration_second is not None:
-                command_obs[obs_key]["motion_duration_second"] = motion_duration_second
             if (
                 "task" in dict_cfg
                 and "command" in dict_cfg["task"]
@@ -244,16 +188,11 @@ def export_policy(cfg: DictConfig, env, policy) -> None:
                 command_obs[obs_key]["motion_path"] = dict_cfg["task"]["command"][
                     "data_path"
                 ]
-            if future_steps is not None:
-                command_obs[obs_key]["future_steps"] = future_steps
-            if tracking_keypoint_names is not None:
-                command_obs[obs_key]["body_names"] = tracking_keypoint_names
-            if tracking_joint_names is not None:
-                command_obs[obs_key]["joint_names"] = tracking_joint_names
-            if root_body_name is not None:
-                command_obs[obs_key]["root_body_name"] = root_body_name
-            if anchor_body_name is not None:
-                command_obs[obs_key]["anchor_body_name"] = anchor_body_name
+            command_obs[obs_key]["future_steps"] = command.future_steps.tolist()
+            command_obs[obs_key]["body_names"] = command.tracking_body_names
+            command_obs[obs_key]["joint_names"] = command.tracking_joint_names
+            command_obs[obs_key]["root_body_name"] = command.root_body_name
+            command_obs[obs_key]["anchor_body_name"] = command.anchor_body_name
 
     import yaml
 

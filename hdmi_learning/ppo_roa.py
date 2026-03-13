@@ -64,12 +64,12 @@ class PPOConfig:
     gamma: float = 0.99
     lmbda: float = 0.95
 
-    residual_action: bool = True
+    residual_action: bool = False
     finetune_adapt_module: bool = True
 
     lr: float = 3e-4
     desired_kl: float | None = 0.01
-    reg_coef: float = 0.0
+    reg_coef: float = 0.2
 
     entropy_coef_start: float = 0.004
     entropy_coef_end: float = 0.004

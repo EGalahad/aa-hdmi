@@ -73,7 +73,9 @@ def main(cfg: DictConfig):
         state_dict = OrderedDict()
         state_dict["wandb"] = {"name": run.name, "id": run.id}
         state_dict["policy"] = policy.state_dict()
-        
+        state_dict["env"] = env.state_dict()
+        state_dict["cfg"] = cfg
+
         torch.save(state_dict, ckpt_path)
         if upload_to_wandb:
             run.save(str(ckpt_path), policy="now", base_path=run.dir)
@@ -220,7 +222,7 @@ def main(cfg: DictConfig):
                 print(f"Latest checkpoint: {ckpt_path}")
 
             if aa.is_main_process():
-                # ScopedTimer.print_summary(clear=True)
+                ScopedTimer.print_summary(clear=True)
                 # print(
                 #     OmegaConf.to_yaml(
                 #         {k: v for k, v in info.items() if isinstance(v, (float, int))}

@@ -3,9 +3,9 @@
 defaults:
   - override /algo: ppo_roa_finetune
 
-total_iters: 2000
+total_iters: 5000
 
 algo:
   entropy_coef_start: 0.002
   entropy_coef_end: 0.0001
-  entropy_decay_iters: 1000
+  entropy_decay_iters: 2500

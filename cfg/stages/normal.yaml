@@ -1,0 +1,11 @@
+# @package _global_
+
+stages:
+  - name: train-single
+    overrides:
+      - +exp=train-single
+    load_checkpoint_from_previous: false
+  - name: finetune-single
+    overrides:
+      - +exp=finetune-single
+    load_checkpoint_from_previous: true
