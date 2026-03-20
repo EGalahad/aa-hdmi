@@ -13,6 +13,7 @@ import copy
 import itertools
 import os
 import re
+import time
 from pathlib import Path
 
 import hydra
@@ -23,6 +24,7 @@ from tensordict.nn import TensorDictModuleBase as ModBase
 from tensordict.nn import TensorDictSequential
 from torchrl.envs.transforms import VecNorm as TorchRLVecNorm
 from torchrl.envs.utils import ExplorationType, set_exploration_type
+from active_adaptation.utils.profiling import ScopedTimer
 
 import active_adaptation as aa
 from active_adaptation.learning.modules.vecnorm import VecNorm
@@ -234,18 +236,33 @@ def main(cfg: DictConfig):
     assert not env.base_env.training
 
     timer = Timer(env.step_dt)
+    fps_window_start = time.perf_counter()
+    fps_window_frames = 0
 
     # with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
     with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
         for i in itertools.count():
-            carry = rollout_policy(carry)
-            td, carry = env.step_and_maybe_reset(carry)
+            with ScopedTimer("inference", sync=False):
+                carry = rollout_policy(carry)
+            with ScopedTimer("env_step", sync=False):
+                td, carry = env.step_and_maybe_reset(carry)
             episode_stats.add(td)
 
             if len(episode_stats) >= env.num_envs:
                 print("Step", i)
                 for k, v in sorted(episode_stats.pop().items(True, True)):
                     print(k, torch.mean(v).item())
+
+            fps_window_frames += 1
+            window_elapsed = time.perf_counter() - fps_window_start
+            if window_elapsed >= 1.0:
+                print(
+                    f"Loop FPS: {fps_window_frames} frames in "
+                    f"{window_elapsed:.2f}s"
+                )
+                # ScopedTimer.print_summary(clear=True)
+                fps_window_start = time.perf_counter()
+                fps_window_frames = 0
 
             timer.sleep()
 

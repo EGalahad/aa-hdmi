@@ -3,9 +3,10 @@
 defaults:
   - override /algo: ppo_roa_train
 
-total_iters: 5000
+total_iters: 2000
 
 algo:
   entropy_coef_start: 0.008
   entropy_coef_end: 0.0001
-  entropy_decay_iters: 2500
+  entropy_decay_start: 0
+  entropy_decay_end: 1000

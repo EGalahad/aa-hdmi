@@ -1,11 +1,16 @@
 # @package _global_
 
 stages:
-  - name: train-single
+  - name: train
     overrides:
-      - +exp=train-single
+      - +exp=train
     load_checkpoint_from_previous: false
-  - name: finetune-single
+  - name: adapt
     overrides:
-      - +exp=finetune-single
+      - +exp=adapt
+    load_checkpoint_from_previous: true
+  - name: finetune
+    overrides:
+      - +exp=finetune
+      - +task/patches=temporal_align
     load_checkpoint_from_previous: true

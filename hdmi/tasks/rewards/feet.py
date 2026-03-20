@@ -243,9 +243,6 @@ class ref_contact(TrackReward, namespace="hdmi"):
         debug_draw_enabled: bool = True,
         debug_target_color: tuple[float, float, float, float] = (1.0, 0.9, 0.1, 1.0),
         debug_current_color: tuple[float, float, float, float] = (0.1, 0.9, 1.0, 1.0),
-        debug_target_z_offset: float = 0.02,
-        debug_current_z_offset: float = 0.0,
-        debug_point_size: float = 50.0,
         weight: float = 1.0,
         **kwargs,
     ):
@@ -271,6 +268,7 @@ class ref_contact(TrackReward, namespace="hdmi"):
             dtype=torch.long,
             device=self.device,
         )
+        self.num_bodies = len(matched_names)
 
         sensor_ids, sensor_names = _find_sensor_bodies_by_names(self.contact_sensor, matched_names)
         if not sensor_ids:
@@ -316,9 +314,7 @@ class ref_contact(TrackReward, namespace="hdmi"):
         self.debug_draw_enabled = bool(debug_draw_enabled)
         self.debug_target_color = debug_target_color
         self.debug_current_color = debug_current_color
-        self.debug_target_z_offset = float(debug_target_z_offset)
-        self.debug_current_z_offset = float(debug_current_z_offset)
-        self.debug_point_size = float(debug_point_size)
+        self.debug_point_size = 1.5
 
     def reset(self, env_ids):
         self.current_contact[env_ids] = False
@@ -386,6 +382,51 @@ class ref_contact(TrackReward, namespace="hdmi"):
         if not self.debug_draw_enabled:
             return
 
+        target_positions = self.command_manager.ref_body_pos_w[
+            :, self.body_indices_motion
+        ].clone()
+        current_positions = self.asset.data.body_link_pos_w[
+            :, self.body_indices_asset
+        ].clone()
+
+        target_contact = self.target_contact
+        current_contact = self.current_contact
+        mismatch = target_contact ^ current_contact
+
+        if aa.get_backend() == "isaac":
+            debug_draw = getattr(self.env, "debug_draw", None)
+            if debug_draw is None:
+                return
+
+            target_positions = target_positions.detach().cpu()
+            current_positions = current_positions.detach().cpu()
+            target_contact = target_contact.detach().cpu()
+            current_contact = current_contact.detach().cpu()
+            mismatch = mismatch.detach().cpu()
+
+            target_points = target_positions[target_contact]
+            current_points = current_positions[current_contact]
+            if target_points.numel() > 0:
+                debug_draw.point(
+                    target_points,
+                    color=self.debug_target_color,
+                    size=self.debug_point_size,
+                )
+            if current_points.numel() > 0:
+                debug_draw.point(
+                    current_points,
+                    color=self.debug_current_color,
+                    size=self.debug_point_size,
+                )
+            if mismatch.any().item():
+                debug_draw.vector(
+                    current_positions[mismatch],
+                    target_positions[mismatch] - current_positions[mismatch],
+                    color=(1.0, 0.4, 0.2, 1.0),
+                    size=max(self.debug_point_size * 0.04, 1.0),
+                )
+            return
+
         viewer = getattr(self.env.sim, "viewer", None)
         if viewer is None:
             return
@@ -393,47 +434,36 @@ class ref_contact(TrackReward, namespace="hdmi"):
         if scene is None:
             return
 
-        point_radius = scene.meansize * 0.001 * self.debug_point_size
-        target_contact = self.target_contact
-        current_contact = self.current_contact
-        target_points = self.command_manager.ref_body_pos_w[
-            :, self.body_indices_motion
-        ].clone()
-        target_points[..., 2] += self.debug_target_z_offset
-        if target_contact.any():
-            target_env_ids, target_point_ids = target_contact.nonzero(as_tuple=True)
-            target_points_np = target_points[target_contact].detach().cpu().numpy()
-            target_labels = [
-                f"target_contact_env_{env_idx}_{point_idx}"
-                for env_idx, point_idx in zip(
-                    target_env_ids.tolist(), target_point_ids.tolist()
-                )
-            ]
-            for label, point in zip(target_labels, target_points_np):
-                scene.add_sphere(
-                    point,
-                    radius=point_radius,
-                    color=self.debug_target_color,
-                    label=label,
-                )
+        point_radius = scene.meansize * self.debug_point_size
+        target_positions = target_positions.detach().cpu()
+        current_positions = current_positions.detach().cpu()
+        target_contact = target_contact.detach().cpu()
+        current_contact = current_contact.detach().cpu()
+        mismatch = mismatch.detach().cpu()
 
-        current_points = self.asset.data.body_link_pos_w[
-            :, self.body_indices_asset
-        ].clone()
-        current_points[..., 2] += self.debug_current_z_offset
-        if current_contact.any():
-            current_env_ids, current_point_ids = current_contact.nonzero(as_tuple=True)
-            current_points_np = current_points[current_contact].detach().cpu().numpy()
-            current_labels = [
-                f"current_contact_env_{env_idx}_{point_idx}"
-                for env_idx, point_idx in zip(
-                    current_env_ids.tolist(), current_point_ids.tolist()
-                )
-            ]
-            for label, point in zip(current_labels, current_points_np):
-                scene.add_sphere(
-                    point,
-                    radius=point_radius,
-                    color=self.debug_current_color,
-                    label=label,
-                )
+        if scene.show_all_envs or self.num_envs == 1:
+            env_ids = range(self.num_envs)
+        else:
+            env_ids = [int(scene.env_idx)]
+
+        for env_idx in env_ids:
+            for body_idx in range(self.num_bodies):
+                if target_contact[env_idx, body_idx]:
+                    scene.add_sphere(
+                        target_positions[env_idx, body_idx],
+                        point_radius,
+                        self.debug_target_color,
+                    )
+                if current_contact[env_idx, body_idx]:
+                    scene.add_sphere(
+                        current_positions[env_idx, body_idx],
+                        point_radius,
+                        self.debug_current_color,
+                    )
+                if mismatch[env_idx, body_idx]:
+                    scene.add_arrow(
+                        current_positions[env_idx, body_idx],
+                        target_positions[env_idx, body_idx],
+                        (1.0, 0.4, 0.2, 1.0),
+                        width=max(point_radius * 0.15, 0.003),
+                    )

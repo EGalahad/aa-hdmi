@@ -5,8 +5,12 @@ stages:
     overrides:
       - +exp=train-single
     load_checkpoint_from_previous: false
+  - name: adapt-single
+    overrides:
+      - +exp=adapt-single
+    load_checkpoint_from_previous: true
   - name: finetune-single
     overrides:
       - +exp=finetune-single
-      - +task/patches=[no_xy_term,look_ahead_xy]
+      - +task/patches=temporal_align
     load_checkpoint_from_previous: true

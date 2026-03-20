@@ -3,3 +3,4 @@
 encoder_priv_hidden_dims: [512]
 adapt_module_hidden_dims: [512, 512]
 actor_hidden_dims: [512, 512, 512]
+latent_dim: 512

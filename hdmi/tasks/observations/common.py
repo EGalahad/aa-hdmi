@@ -47,13 +47,15 @@ class root_ang_vel_history(BaseObservation, namespace="hdmi"):
         self.asset = self.env.scene.articulations["robot"]
         self.noise_std = noise_std
         self.history_steps = history_steps
-        buffer_size = max(history_steps) + 1
-        self.buffer = torch.zeros((self.num_envs, buffer_size, 3), device=self.device)
-        self.update()
+        self.buffer_size = max(history_steps) + 1
+        self.history_offsets = torch.as_tensor(history_steps, device=self.device)
+        self.head = 0
+        self.buffer = torch.zeros((self.num_envs, self.buffer_size, 3), device=self.device)
+        self.reset(torch.arange(self.num_envs, device=self.device))
 
     def reset(self, env_ids):
         value = self.asset.data.root_com_ang_vel_b[env_ids]
-        value = value.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
+        value = value.unsqueeze(1).expand(-1, self.buffer_size, -1)
         if self.noise_std > 0:
             value = random_noise(value, self.noise_std)
         self.buffer[env_ids] = value
@@ -62,11 +64,12 @@ class root_ang_vel_history(BaseObservation, namespace="hdmi"):
         value = self.asset.data.root_com_ang_vel_b
         if self.noise_std > 0:
             value = random_noise(value, self.noise_std)
-        self.buffer = self.buffer.roll(1, dims=1)
-        self.buffer[:, 0] = value
+        self.head = (self.head - 1) % self.buffer_size
+        self.buffer[:, self.head] = value
 
     def compute(self) -> torch.Tensor:
-        return self.buffer[:, self.history_steps].reshape(self.num_envs, -1)
+        indices = (self.history_offsets + self.head) % self.buffer_size
+        return self.buffer[:, indices].reshape(self.num_envs, -1)
 
 
 class projected_gravity_history(BaseObservation, namespace="hdmi"):
@@ -75,13 +78,15 @@ class projected_gravity_history(BaseObservation, namespace="hdmi"):
         self.asset = self.env.scene.articulations["robot"]
         self.noise_std = noise_std
         self.history_steps = history_steps
-        buffer_size = max(history_steps) + 1
-        self.buffer = torch.zeros((self.num_envs, buffer_size, 3), device=self.device)
-        self.update()
+        self.buffer_size = max(history_steps) + 1
+        self.history_offsets = torch.as_tensor(history_steps, device=self.device)
+        self.head = 0
+        self.buffer = torch.zeros((self.num_envs, self.buffer_size, 3), device=self.device)
+        self.reset(torch.arange(self.num_envs, device=self.device))
 
     def reset(self, env_ids):
         value = self.asset.data.projected_gravity_b[env_ids]
-        value = value.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
+        value = value.unsqueeze(1).expand(-1, self.buffer_size, -1)
         if self.noise_std > 0:
             value = random_noise(value, self.noise_std)
             value = value / value.norm(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -92,11 +97,12 @@ class projected_gravity_history(BaseObservation, namespace="hdmi"):
         if self.noise_std > 0:
             value = random_noise(value, self.noise_std)
             value = value / value.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        self.buffer = self.buffer.roll(1, dims=1)
-        self.buffer[:, 0] = value
+        self.head = (self.head - 1) % self.buffer_size
+        self.buffer[:, self.head] = value
 
     def compute(self):
-        return self.buffer[:, self.history_steps].reshape(self.num_envs, -1)
+        indices = (self.history_offsets + self.head) % self.buffer_size
+        return self.buffer[:, indices].reshape(self.num_envs, -1)
 
 
 class joint_pos_history(BaseObservation, namespace="hdmi"):
@@ -110,6 +116,8 @@ class joint_pos_history(BaseObservation, namespace="hdmi"):
         super().__init__(env)
         self.history_steps = history_steps
         self.buffer_size = max(history_steps) + 1
+        self.history_offsets = torch.as_tensor(history_steps, device=self.device)
+        self.head = 0
         self.noise_std = max(noise_std, 0.0)
 
         self.asset = self.env.scene.articulations["robot"]
@@ -132,11 +140,11 @@ class joint_pos_history(BaseObservation, namespace="hdmi"):
         self.buffer[env_ids] = value.unsqueeze(1)
 
     def update(self):
-        self.buffer = self.buffer.roll(1, 1)
+        self.head = (self.head - 1) % self.buffer_size
         value = self.asset.data.joint_pos[:, self.joint_ids]
         if self.noise_std > 0:
             value = random_noise(value, self.noise_std)
-        self.buffer[:, 0] = value
+        self.buffer[:, self.head] = value
 
     def compute(self):
         # joint_pos = self.buffer - self.asset.data.encoder_bias[
@@ -145,7 +153,8 @@ class joint_pos_history(BaseObservation, namespace="hdmi"):
         joint_pos = self.buffer - self.action_manager.offset[
             :, self.joint_ids
         ].unsqueeze(1)
-        joint_pos_selected = joint_pos[:, self.history_steps]
+        indices = (self.history_offsets + self.head) % self.buffer_size
+        joint_pos_selected = joint_pos[:, indices]
         return joint_pos_selected.reshape(self.num_envs, -1)
 
 class joint_vel_history(BaseObservation, namespace="hdmi"):
@@ -159,6 +168,8 @@ class joint_vel_history(BaseObservation, namespace="hdmi"):
         super().__init__(env)
         self.history_steps = history_steps
         self.buffer_size = max(history_steps) + 1
+        self.history_offsets = torch.as_tensor(history_steps, device=self.device)
+        self.head = 0
         self.noise_std = max(noise_std, 0.0)
         self.asset = self.env.scene.articulations["robot"]
         self.joint_ids, self.joint_names = _get_simulation_joint_selection(
@@ -179,15 +190,16 @@ class joint_vel_history(BaseObservation, namespace="hdmi"):
         self.buffer[env_ids] = value.unsqueeze(1)
 
     def update(self):
-        self.buffer = self.buffer.roll(1, 1)
+        self.head = (self.head - 1) % self.buffer_size
         value = self.asset.data.joint_vel[:, self.joint_ids]
         if self.noise_std > 0:
             value = random_noise(value, self.noise_std)
-        self.buffer[:, 0] = value
+        self.buffer[:, self.head] = value
 
     def compute(self):
         joint_vel = self.buffer
-        joint_vel_selected = joint_vel[:, self.history_steps]
+        indices = (self.history_offsets + self.head) % self.buffer_size
+        joint_vel_selected = joint_vel[:, indices]
         return joint_vel_selected.reshape(self.num_envs, -1)
 
 class applied_action(BaseObservation, namespace="hdmi"):

@@ -97,7 +97,6 @@ def slerp(ts_target, ts_source, quat):
 
     batch_size = int(np.prod(batch_shape, initial=1))
     out = np.empty((steps_target, batch_size, quat_dim))
-    ts_target = np.clip(ts_target, ts_source[0], ts_source[-1])
     for i in range(batch_size):
         s = Slerp(
             ts_source, sRot.from_quat(quat[:, i, [1, 2, 3, 0]])
@@ -125,12 +124,8 @@ def interpolate(motion, source_fps: int, target_fps: int):
                 f"interpolation is not fully implemented for keys: {extra_keys}"
             )
         T = motion["joint_pos"].shape[0]
-
-        end_t = T / source_fps
-        ts_source = np.arange(0, end_t, 1 / source_fps)
-        ts_target = np.arange(0, end_t, 1 / target_fps)
-        if ts_target[-1] > ts_source[-1]:
-            ts_target = ts_target[:-1]
+        ts_source = np.arange(0, (T - 1) * target_fps + 1, target_fps)
+        ts_target = np.arange(0, (T - 1) * target_fps + 1, source_fps)
         motion["body_pos_w"] = lerp(
             ts_target, ts_source, motion["body_pos_w"].reshape(T, -1)
         ).reshape(len(ts_target), -1, 3)

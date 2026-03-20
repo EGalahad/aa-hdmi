@@ -8,6 +8,7 @@ viewer:
   eye: [4.0, 4.0, 4.0]
 
 terrain: plane
+enable_cameras: false
 
 num_envs: 8192
 max_episode_length: 4000
@@ -22,7 +23,7 @@ robot:
 
 input:
   action:
-    _target_: hdmi.HDMIJointPosition
+    _target_: hdmi.JointPosition
     action_scaling:
       .*_hip_yaw_joint: 0.55
       .*_hip_roll_joint: 0.35
@@ -48,7 +49,7 @@ command:
   _target_: hdmi.RobotTracking
   data_path: ???
   tracking_keypoint_names: [
-    ".*_hip_(pitch|yaw)_link",
+    ".*_hip_yaw_link",
     ".*_knee_link",
     ".*_ankle_roll_link",
     "pelvis",
@@ -68,6 +69,10 @@ command:
   ]
   root_body_name: "pelvis"
   anchor_body_name: "torso_link"
+
+  sample_motion: false
+
+  # TODO: put this into randomization reset callbacks
   pose_range:
     x: [-0.05, 0.05]
     y: [-0.05, 0.05]
@@ -76,17 +81,19 @@ command:
     pitch: [-0.1, 0.1]
     yaw: [-0.1, 0.1]
   velocity_range:
-    x: [-0.1, 0.1]
-    y: [-0.1, 0.1]
-    z: [-0.1, 0.1]
-    roll: [-0.1, 0.1]
-    pitch: [-0.1, 0.1]
-    yaw: [-0.1, 0.1]
+    x: [-0.2, 0.2]
+    y: [-0.2, 0.2]
+    z: [-0.2, 0.2]
+    roll: [-0.5, 0.5]
+    pitch: [-0.5, 0.5]
+    yaw: [-0.5, 0.5]
+
   init_joint_pos_noise: 0.1
   init_joint_vel_noise: 0.1
-  rewind_prob: 0.0
+
+  rewind_prob: 0.6
   rewind_steps_range: [25, 125]
-  future_steps: [1, 16, 32, 48]
+  future_steps: [-4, -2, 0, 1, 2, 3, 4, 8, 16]
 
 observation:
   command:
@@ -147,24 +154,33 @@ observation:
 
     body_pos_b:
       _target_: hdmi.body_pos_b
-      body_names: ".*"
+      body_names: ^(?!.*(_mimic|_toe)$).+$
     body_vel_b:
       _target_: hdmi.body_vel_b
-      body_names: ".*"
+      body_names: ^(?!.*(_mimic|_toe)$).+$
 
     applied_action:
       _target_: hdmi.applied_action
     applied_torque:
       _target_: hdmi.applied_torque
   ref_joint_pos_:
-    ref_joint_pos_action_policy:
-      _target_: hdmi.ref_joint_pos_action_policy
+    ref_joint_action:
+      _target_: hdmi.ref_joint_action
 
 reward:
   tracking:
+    tracking_root_pos_aligned:
+      _target_: hdmi.keypoint_pos_tracking_aligned
+      body_names: ["torso_link"]
+      enabled: false
+      look_ahead: 100
+      weight: 0.5
+      sigma: 0.3
+
     tracking_root_pos:
       _target_: hdmi.keypoint_pos_tracking_product
       body_names: ["torso_link"]
+      enabled: true
       weight: 0.5
       sigma: 0.3
     tracking_root_ori:
@@ -172,15 +188,25 @@ reward:
       body_names: ["torso_link"]
       weight: 0.5
       sigma: 0.4
+    tracking_root_linvel:
+      _target_: hdmi.keypoint_lin_vel_tracking_product
+      body_names: ["torso_link"]
+      weight: 0.5
+      sigma: 1.0
+    tracking_root_angvel:
+      _target_: hdmi.keypoint_ang_vel_tracking_product
+      body_names: ["torso_link"]
+      weight: 0.5
+      sigma: 2.5
 
     tracking_body_pos:
       _target_: hdmi.keypoint_pos_tracking_local_product
-      body_names: [".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link", ".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link"]
+      body_names: ["pelvis", ".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 1.0
       sigma: 0.3
     tracking_body_ori:
       _target_: hdmi.keypoint_ori_tracking_local_product
-      body_names: [".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link", ".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link"]
+      body_names: ["pelvis", ".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 1.0
       sigma: 0.4
 
@@ -215,13 +241,19 @@ reward:
       joint_names: ".*"
       soft_factor: 0.9
       enabled: true
-    joint_torque_limits: 
-      _target_: hdmi.joint_torque_limits
-      weight: 0.01
+    # joint_torque_limits: 
+    #   _target_: hdmi.joint_torque_limits
+    #   weight: 0.01
+    #   enabled: true
+    #   soft_factor: 0.6
+    self_collisions:
+      _target_: hdmi.self_collisions
+      weight: -1.0
       enabled: true
-      soft_factor: 0.6
+      sensor_name: self_collision
+      force_threshold: 1.0
 
-    feet_slip:          
+    feet_slip:
       _target_: hdmi.feet_slip
       weight: 0.5
       tolerance: 0.0
@@ -230,38 +262,50 @@ reward:
 
     feet_air_time:
       _target_: hdmi.feet_air_time
-      weight: 8.0
-      enabled: false
-      body_names: .*ankle_roll_link
-      thres: 0.8
-
-    self_collisions:
-      _target_: hdmi.self_collisions
-      weight: -10.0
+      weight: 5.0
       enabled: true
-      sensor_name: self_collision
-      force_threshold: 10.0
+      body_names: .*ankle_roll_link
+      thres: 0.5
+
+    ref_contact:
+      _target_: hdmi.ref_contact
+      weight: 0.5
+      enabled: false
+      body_names: [left_ankle_roll_link, right_ankle_roll_link]
+      body2_names: [left_ankle_roll_link_toe, right_ankle_roll_link_toe]
+      air_h_low: 0.035
+      air_h_high: 0.155
+      contact_h_low: 0.035
+      contact_h_high: 0.125
+      feet_standing_z_enter: 0.18
+      feet_standing_z_exit: 0.25
+      feet_standing_vxy_enter: 0.2
+      feet_standing_vxy_exit: 0.3
+      feet_standing_vz_enter: 0.15
+      feet_standing_vz_exit: 0.25
+
 
     survival:           {weight: 4.0, enabled: true}
-  debug:
+  tracking_metrics:
+    _enabled_: false
     root_pos_error:
       _target_: hdmi.keypoint_pos_error
-      body_names: ["pelvis"]
+      body_names: ["torso_link"]
       weight: 1.0
       enabled: false
     root_ori_error:
       _target_: hdmi.keypoint_ori_error
-      body_names: ["pelvis"]
+      body_names: ["torso_link"]
       weight: 1.0
       enabled: false
     body_pos_error_local:
       _target_: hdmi.keypoint_pos_error_local
-      body_names: [".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
+      body_names: [".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 1.0
       enabled: false
     body_ori_error_local:
       _target_: hdmi.keypoint_ori_error_local
-      body_names: [".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
+      body_names: [".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 1.0
       enabled: false
     joint_pos_error:
@@ -269,7 +313,8 @@ reward:
       joint_names: ["waist_.*_joint", ".*_hip_.*_joint", ".*_knee_joint", ".*_shoulder_.*_joint", ".*_elbow_joint"]
       weight: 1.0
       enabled: false
-  debug_loco:
+  loco_metrics:
+    _enabled_: false
     joint_pos_limits:   
       _target_: hdmi.joint_pos_limits
       weight: 1.0
@@ -289,31 +334,89 @@ reward:
       enabled: false
       body_names: .*ankle_roll_link
 
-# randomization: {}
 randomization:
   perturb_body_materials:
     body_names: [".*ankle_roll_link", ".*_wrist_yaw_link"]
-    static_friction_range: [0.6, 1.6]
-    dynamic_friction_range: [0.3, 1.6]
+    static_friction_range: [0.3, 1.6]
+    dynamic_friction_range: [0.3, 1.2]
     restitution_range: [0.0, 0.5]
     solref_time_constant_range: [0.015, 0.03]
     solref_dampratio_range: [0.5, 2.0]
     homogeneous: true
 
-  # perturb_body_mass:
-  #   .*: [0.9, 1.1]
-  # perturb_body_com:
-  #   body_names: ["pelvis", "torso_link"]
-  #   pos_range: [-0.03, 0.03]
+  perturb_body_mass:
+    pelvis: [0.9, 1.1]
+    torso_link: [0.9, 1.1]
+  perturb_body_com:
+    "pelvis|torso_link": [-0.03, 0.03]
+
+  motor_params_implicit:
+    stiffness_range:
+      ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
+      ".*(waist|hip|knee|ankle).*": [0.8, 1.2]
+    damping_range:
+      ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
+      ".*(waist|hip|knee|ankle).*": [0.8, 1.2]
+    armature_range:
+      .*: [0.75, 1.25]
+    friction_range:
+      .*: [0.05, 0.25]
+
 
   random_joint_offset:
     .*: [-0.01, 0.01]
 
+  perturb_root_vel:
+    min_s: 4.0
+    max_s: 6.0
+
+    x: [-0.2, 0.2]
+    y: [-0.2, 0.2]
+    z: [-0.1, 0.1]
+    roll: [-0.2, 0.2]
+    pitch: [-0.2, 0.2]
+    yaw: [-0.4, 0.4]
+
 termination:
   motion_timeout:           {is_timeout: true}
 
-  cum_body_pos_error:       {body_names: "torso_link", min_steps: 25, threshold: 0.8}
-  cum_body_ori_error:       {body_names: "torso_link", min_steps: 25, threshold: 1.6}
+  root_pos_error_aligned:
+    _target_: cum_body_pos_error_aligned
+    body_names: "torso_link"
+    min_steps: 25
+    threshold: 0.4
+    enabled: false
 
-  cum_body_pos_error_local: {body_names: ".*", min_steps: 25, threshold: 0.8}
-  cum_body_ori_error_local: {body_names: ".*", min_steps: 25, threshold: 1.6}
+  root_pos_error:
+    _target_: cum_body_pos_error
+    body_names: "torso_link"
+    min_steps: 25
+    threshold: 0.4
+    enabled: true
+  root_ori_error:
+    _target_: cum_body_ori_error
+    body_names: "torso_link"
+    min_steps: 25
+    threshold: 1.2
+  root_linvel_error:
+    _target_: cum_body_lin_vel_error
+    body_names: "torso_link"
+    min_steps: 50
+    threshold: 1.0
+  root_angvel_error:
+    _target_: cum_body_ang_vel_error
+    body_names: "torso_link"
+    min_steps: 50
+    threshold: 2.5
+  
+  body_pos_error:
+    _target_: cum_body_pos_error_local
+    body_names: [".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
+    min_steps: 50
+    threshold: 0.4
+  body_ori_error:
+    _target_: cum_body_ori_error_local
+    body_names: [".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
+    min_steps: 50
+    threshold: 1.2
+  

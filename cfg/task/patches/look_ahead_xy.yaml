@@ -1,7 +1,0 @@
-# @package task
-
-reward:
-  tracking:
-    tracking_root_pos:
-      _target_: hdmi.keypoint_pos_tracking_aligned
-      look_ahead: 100

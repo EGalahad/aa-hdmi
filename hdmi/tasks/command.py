@@ -18,11 +18,19 @@ import numpy as np
 from active_adaptation.utils.math import (
     sample_uniform as _sample_uniform,
     quat_from_euler_xyz as _quat_from_euler_xyz,
+    quat_rotate_inverse as quat_apply_inverse,
     quat_mul,
+    quat_conjugate,
+    quat_angle_magnitude,
     matrix_from_quat,
     quat_rotate,
+    yaw_quat,
+    batchify,
 )
 from tensordict import TensorDict
+
+
+quat_apply_inverse = batchify(quat_apply_inverse)
 
 
 _DESIRED_FRAME_COLORS = (
@@ -38,6 +46,227 @@ def sample_uniform(low, high, size, device):
 
 def quat_from_euler_xyz(roll, pitch, yaw):
     return _quat_from_euler_xyz(torch.stack([roll, pitch, yaw], dim=-1))
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def _compute_root_diff_obs(
+    robot_root_pos_w: torch.Tensor,
+    robot_root_quat_w: torch.Tensor,
+    ref_root_pos_future_w: torch.Tensor,
+    ref_root_quat_future_w: torch.Tensor,
+):
+    robot_root_pos_w_expand = robot_root_pos_w[:, None, :]
+    robot_root_quat_w_expand = robot_root_quat_w[:, None, :]
+    robot_root_quat_w_expand_inv = quat_conjugate(robot_root_quat_w_expand)
+    ref_root_pos_future_b = quat_apply_inverse(
+        robot_root_quat_w_expand,
+        ref_root_pos_future_w - robot_root_pos_w_expand,
+    )
+    ref_root_quat_future_b = quat_mul(
+        robot_root_quat_w_expand_inv.expand_as(ref_root_quat_future_w),
+        ref_root_quat_future_w,
+    )
+    ref_root_mat_future_b = matrix_from_quat(ref_root_quat_future_b)
+    return ref_root_pos_future_b, ref_root_mat_future_b
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def _compute_current_tracking_state(
+    ref_anchor_pos_w: torch.Tensor,
+    ref_anchor_quat_w: torch.Tensor,
+    robot_anchor_pos_w: torch.Tensor,
+    robot_anchor_quat_w: torch.Tensor,
+    ref_body_pos_w: torch.Tensor,
+    ref_body_quat_w: torch.Tensor,
+    robot_body_link_pos_w: torch.Tensor,
+    robot_body_link_quat_w: torch.Tensor,
+):
+    ref_anchor_pos_w_z0 = ref_anchor_pos_w.clone()
+    ref_anchor_pos_w_z0[..., 2] = 0.0
+    robot_anchor_pos_w_z0 = robot_anchor_pos_w.clone()
+    robot_anchor_pos_w_z0[..., 2] = 0.0
+
+    ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
+    robot_anchor_yaw_quat_w = yaw_quat(robot_anchor_quat_w)
+    ref_anchor_yaw_quat_conj_w = quat_conjugate(ref_anchor_yaw_quat_w)
+    robot_anchor_yaw_quat_conj_w = quat_conjugate(robot_anchor_yaw_quat_w)
+
+    ref_body_pos_local = quat_apply_inverse(
+        ref_anchor_yaw_quat_w[:, None],
+        ref_body_pos_w - ref_anchor_pos_w_z0[:, None],
+    )
+    ref_body_quat_local = quat_mul(
+        ref_anchor_yaw_quat_conj_w[:, None].expand_as(ref_body_quat_w),
+        ref_body_quat_w,
+    )
+
+    robot_body_pos_local = quat_apply_inverse(
+        robot_anchor_yaw_quat_w[:, None],
+        robot_body_link_pos_w - robot_anchor_pos_w_z0[:, None],
+    )
+    robot_body_quat_local = quat_mul(
+        robot_anchor_yaw_quat_conj_w[:, None].expand_as(robot_body_link_quat_w),
+        robot_body_link_quat_w,
+    )
+    return ref_body_pos_local, ref_body_quat_local, robot_body_pos_local, robot_body_quat_local
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def _compute_tracking_errors(
+    ref_body_pos_w: torch.Tensor,
+    ref_body_quat_w: torch.Tensor,
+    ref_body_lin_vel_w: torch.Tensor,
+    ref_body_ang_vel_w: torch.Tensor,
+    ref_body_pos_local: torch.Tensor,
+    ref_body_quat_local: torch.Tensor,
+    robot_body_link_pos_w: torch.Tensor,
+    robot_body_link_quat_w: torch.Tensor,
+    robot_body_lin_vel_w: torch.Tensor,
+    robot_body_ang_vel_w: torch.Tensor,
+    robot_body_pos_local: torch.Tensor,
+    robot_body_quat_local: torch.Tensor,
+    ref_joint_pos: torch.Tensor,
+    ref_joint_vel: torch.Tensor,
+    robot_joint_pos: torch.Tensor,
+    robot_joint_vel: torch.Tensor,
+):
+    body_pos_error = (ref_body_pos_w - robot_body_link_pos_w).norm(dim=-1)
+    body_pos_error_local = (ref_body_pos_local - robot_body_pos_local).norm(dim=-1)
+
+    body_quat_diff = quat_mul(
+        quat_conjugate(ref_body_quat_w),
+        robot_body_link_quat_w,
+    )
+    body_ori_error = quat_angle_magnitude(body_quat_diff)
+
+    body_quat_local_diff = quat_mul(
+        quat_conjugate(ref_body_quat_local),
+        robot_body_quat_local,
+    )
+    body_ori_error_local = quat_angle_magnitude(body_quat_local_diff)
+
+    body_lin_vel_error = (ref_body_lin_vel_w - robot_body_lin_vel_w).norm(dim=-1)
+    body_ang_vel_error = (ref_body_ang_vel_w - robot_body_ang_vel_w).norm(dim=-1)
+
+    joint_pos_error = (ref_joint_pos - robot_joint_pos).abs()
+    joint_vel_error = (ref_joint_vel - robot_joint_vel).abs()
+
+    return (
+        body_pos_error,
+        body_pos_error_local,
+        body_ori_error,
+        body_ori_error_local,
+        body_lin_vel_error,
+        body_ang_vel_error,
+        joint_pos_error,
+        joint_vel_error,
+    )
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def _compute_motion_local_obs(
+    ref_anchor_pos_w: torch.Tensor,
+    ref_anchor_quat_w: torch.Tensor,
+    ref_body_pos_future_w: torch.Tensor,
+    ref_body_quat_future_w: torch.Tensor,
+):
+    ref_anchor_pos_w_z0 = ref_anchor_pos_w.clone()
+    ref_anchor_pos_w_z0[..., 2] = 0.0
+    ref_anchor_pos_w_z0_future = ref_anchor_pos_w_z0[:, None, None, :]
+
+    ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
+    ref_anchor_yaw_quat_w_future = ref_anchor_yaw_quat_w[:, None, None, :]
+    ref_anchor_yaw_quat_conj_w_future = quat_conjugate(ref_anchor_yaw_quat_w_future)
+
+    ref_body_pos_future_local = quat_apply_inverse(
+        ref_anchor_yaw_quat_w_future,
+        ref_body_pos_future_w - ref_anchor_pos_w_z0_future,
+    )
+    ref_body_quat_future_local = quat_mul(
+        ref_anchor_yaw_quat_conj_w_future.expand_as(ref_body_quat_future_w),
+        ref_body_quat_future_w,
+    )
+    ref_body_ori_future_local_matrix = matrix_from_quat(ref_body_quat_future_local)
+
+    return ref_body_pos_future_local, ref_body_ori_future_local_matrix
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def _compute_body_local_diff_obs(
+    ref_anchor_pos_w: torch.Tensor,
+    ref_anchor_quat_w: torch.Tensor,
+    robot_anchor_pos_w: torch.Tensor,
+    robot_anchor_quat_w: torch.Tensor,
+    ref_body_pos_future_w: torch.Tensor,
+    ref_body_lin_vel_future_w: torch.Tensor,
+    ref_body_ang_vel_future_w: torch.Tensor,
+    ref_body_quat_future_w: torch.Tensor,
+    robot_body_link_pos_w: torch.Tensor,
+    robot_body_lin_vel_w: torch.Tensor,
+    robot_body_ang_vel_w: torch.Tensor,
+    robot_body_link_quat_w: torch.Tensor,
+):
+    ref_anchor_pos_w_z0 = ref_anchor_pos_w.clone()
+    ref_anchor_pos_w_z0[..., 2] = 0.0
+    robot_anchor_pos_w_z0 = robot_anchor_pos_w.clone()
+    robot_anchor_pos_w_z0[..., 2] = 0.0
+    ref_anchor_pos_w_z0_future = ref_anchor_pos_w_z0[:, None, None, :]
+    robot_anchor_pos_w_z0_body = robot_anchor_pos_w_z0[:, None, :]
+
+    ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
+    robot_anchor_yaw_quat_w = yaw_quat(robot_anchor_quat_w)
+    ref_anchor_yaw_quat_w_future = ref_anchor_yaw_quat_w[:, None, None, :]
+    robot_anchor_yaw_quat_w_body = robot_anchor_yaw_quat_w[:, None, :]
+    ref_anchor_yaw_quat_conj_w_future = quat_conjugate(ref_anchor_yaw_quat_w_future)
+    robot_anchor_yaw_quat_conj_w_body = quat_conjugate(robot_anchor_yaw_quat_w_body)
+
+    ref_body_pos_future_local = quat_apply_inverse(
+        ref_anchor_yaw_quat_w_future,
+        ref_body_pos_future_w - ref_anchor_pos_w_z0_future,
+    )
+    ref_body_lin_vel_future_local = quat_apply_inverse(
+        ref_anchor_yaw_quat_w_future,
+        ref_body_lin_vel_future_w,
+    )
+    ref_body_ang_vel_future_local = quat_apply_inverse(
+        ref_anchor_yaw_quat_w_future,
+        ref_body_ang_vel_future_w,
+    )
+    ref_body_quat_future_local = quat_mul(
+        ref_anchor_yaw_quat_conj_w_future.expand_as(ref_body_quat_future_w),
+        ref_body_quat_future_w,
+    )
+
+    robot_body_pos_local = quat_apply_inverse(
+        robot_anchor_yaw_quat_w_body,
+        robot_body_link_pos_w - robot_anchor_pos_w_z0_body,
+    )
+    robot_body_lin_vel_local = quat_apply_inverse(
+        robot_anchor_yaw_quat_w_body,
+        robot_body_lin_vel_w,
+    )
+    robot_body_ang_vel_local = quat_apply_inverse(
+        robot_anchor_yaw_quat_w_body,
+        robot_body_ang_vel_w,
+    )
+    robot_body_quat_local = quat_mul(
+        robot_anchor_yaw_quat_conj_w_body.expand_as(robot_body_link_quat_w),
+        robot_body_link_quat_w,
+    )
+    robot_body_quat_local_conj = quat_conjugate(robot_body_quat_local)
+
+    diff_body_quat_future = quat_mul(
+        robot_body_quat_local_conj.unsqueeze(1).expand_as(ref_body_quat_future_local),
+        ref_body_quat_future_local,
+    )
+    diff_body_ori_future_local_matrix = matrix_from_quat(diff_body_quat_future)
+
+    return (
+        ref_body_pos_future_local - robot_body_pos_local.unsqueeze(1),
+        ref_body_lin_vel_future_local - robot_body_lin_vel_local.unsqueeze(1),
+        diff_body_ori_future_local_matrix,
+        ref_body_ang_vel_future_local - robot_body_ang_vel_local.unsqueeze(1),
+    )
 
 
 @dataclass
@@ -127,10 +356,10 @@ class RobotTracking(Command, namespace="hdmi"):
         self.num_future_steps = len(future_steps)
 
         future_steps = sorted(future_steps)
-        assert (
-            1 in future_steps
-        ), "future_steps must include 1 to compute current observation and reward"
-        self.current_step_index = future_steps.index(1)
+        assert 0 in future_steps, "future_steps must include 0 to compute current observation"
+        assert 1 in future_steps, "future_steps must include 1 to compute current reward"
+        self.obs_current_step_index = future_steps.index(0)
+        self.reward_current_step_index = future_steps.index(1)
 
         self.anchor_body_name = anchor_body_name
         self.anchor_body_idx_motion = self.dataset.body_names.index(anchor_body_name)
@@ -193,6 +422,8 @@ class RobotTracking(Command, namespace="hdmi"):
             self.init_joint_vel_noise = 0.0
 
         if call_update:
+            self._read_current_robot_state()
+            self._refresh_future_buffers()
             self.update()
             if self.record_motion:
                 self.motion_frames = []
@@ -205,7 +436,7 @@ class RobotTracking(Command, namespace="hdmi"):
 
     def _sample_motions(self, env_ids: torch.Tensor) -> None:
         if self.sample_motion or self.first_sample_motion:
-            # sample motion id and start time for each env
+            # sample motion id for each env
             motion_ids = torch.randint(
                 0, self.dataset.num_motions, size=(len(env_ids),), device=self.device
             )
@@ -229,7 +460,7 @@ class RobotTracking(Command, namespace="hdmi"):
         rewind_steps = torch.randint(
             *self.rewind_steps_range, (len(env_ids),), device=self.device
         )
-        rewind_t = torch.clamp(terminated_t - rewind_steps, min=0)  # , max=max_len - 1)
+        rewind_t = torch.clamp(terminated_t - rewind_steps, min=0)
         start_t = torch.where(rewind_mask, rewind_t, start_t)
 
         if not (self.env.training or self.record_motion):
@@ -268,7 +499,9 @@ class RobotTracking(Command, namespace="hdmi"):
         if not self.env.training:
             pose_rand_samples.fill_(0.0)
         positions = (
-            init_root_pos + self.env.scene.env_origins[env_ids] + pose_rand_samples[:, 0:3]
+            init_root_pos
+            + self.env.scene.env_origins.to(self.device)[env_ids]
+            + pose_rand_samples[:, 0:3]
         )
         orientations_delta = quat_from_euler_xyz(
             pose_rand_samples[:, 3], pose_rand_samples[:, 4], pose_rand_samples[:, 5]
@@ -292,7 +525,7 @@ class RobotTracking(Command, namespace="hdmi"):
             torch.cat([positions, orientations], dim=-1), env_ids=env_ids
         )
         self._write_root_com_velocity(velocities, env_ids)
-        # self.asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+        # self.asset.write_root_com_velocity_to_sim(velocities, env_ids=env_ids)
 
         init_joint_pos = motion.joint_pos[:, self.asset_joint_idx_motion]
         init_joint_vel = motion.joint_vel[:, self.asset_joint_idx_motion]
@@ -366,75 +599,17 @@ class RobotTracking(Command, namespace="hdmi"):
         print(f"Saved recorded motion to {motion_data_path} and {motion_meta_path}")
         breakpoint()
 
-    def update(self):
-        if self.replay_motion:
-            self.sample_init(self.all_env_ids)
-
-        if hasattr(self, "motion_frames"):
-            motion_frame = {}
-            motion_frame["body_pos_w"] = self.asset.data.body_link_pos_w.cpu()
-            motion_frame["body_quat_w"] = self.asset.data.body_link_quat_w.cpu()
-            motion_frame["body_lin_vel_w"] = self.asset.data.body_com_lin_vel_w.cpu()
-            motion_frame["body_ang_vel_w"] = self.asset.data.body_com_ang_vel_w.cpu()
-            motion_frame["joint_pos"] = self.asset.data.joint_pos.cpu()
-            motion_frame["joint_vel"] = self.asset.data.joint_vel.cpu()
-            self.motion_frames.append(TensorDict(motion_frame, batch_size=[1]))
-
-        # future ref motion for actor observation
-        self.future_ref_motion = self.dataset.get_slice(
-            self.motion_ids, self.t, steps=self.future_steps
-        )
-        # shape: [num_envs, len(future_steps), num_bodies/num_joints, 3/4/...]
-
-        # Observations: future ref body and joint states
-        self.ref_body_pos_future_w = (
-            self.future_ref_motion.body_pos_w[..., self.tracking_body_indices_motion, :]
-            + self.env.scene.env_origins[:, None, None, :]
-        )
-        self.ref_body_lin_vel_future_w = self.future_ref_motion.body_lin_vel_w[
-            ..., self.tracking_body_indices_motion, :
-        ]
-        self.ref_body_quat_future_w = self.future_ref_motion.body_quat_w[
-            ..., self.tracking_body_indices_motion, :
-        ]
-        self.ref_body_ang_vel_future_w = self.future_ref_motion.body_ang_vel_w[
-            ..., self.tracking_body_indices_motion, :
-        ]
-
-        self.ref_joint_pos_future_ = self.future_ref_motion.joint_pos[
-            ..., self.tracking_joint_indices_motion
-        ]
-        self.ref_joint_vel_future_ = self.future_ref_motion.joint_vel[
-            ..., self.tracking_joint_indices_motion
-        ]
-
-        self.ref_root_pos_future_w = (
-            self.future_ref_motion.body_pos_w[..., self.root_body_idx_motion, :]
-            + self.env.scene.env_origins[:, None, :]
-        )
-        self.ref_root_quat_future_w = self.future_ref_motion.body_quat_w[
-            ..., self.root_body_idx_motion, :
-        ]
-
-        self.ref_anchor_pos_future_w = (
-            self.future_ref_motion.body_pos_w[..., self.anchor_body_idx_motion, :]
-            + self.env.scene.env_origins[:, None, :]
-        )
-        self.ref_anchor_quat_future_w = self.future_ref_motion.body_quat_w[
-            ..., self.anchor_body_idx_motion, :
-        ]
-
-        # Reward: current robot body and joint states
+    def _read_current_robot_state(self):
         self.robot_body_link_pos_w = self.asset.data.body_link_pos_w[
             :, self.tracking_body_indices_asset
         ]
-        self.robot_body_com_lin_vel_w = self.asset.data.body_com_lin_vel_w[
+        self.robot_body_lin_vel_w = self.asset.data.body_com_lin_vel_w[
             :, self.tracking_body_indices_asset
         ]
         self.robot_body_link_quat_w = self.asset.data.body_link_quat_w[
             :, self.tracking_body_indices_asset
         ]
-        self.robot_body_com_ang_vel_w = self.asset.data.body_com_ang_vel_w[
+        self.robot_body_ang_vel_w = self.asset.data.body_com_ang_vel_w[
             :, self.tracking_body_indices_asset
         ]
 
@@ -455,39 +630,180 @@ class RobotTracking(Command, namespace="hdmi"):
             :, self.anchor_body_idx_asset
         ]
 
-        # Reward: current ref body and joint states
-        self.current_ref_motion: MotionData = self.future_ref_motion[
-            :, self.current_step_index
-        ]
-        self.ref_body_pos_w = self.ref_body_pos_future_w[
-            :, self.current_step_index
-        ]
-        self.ref_body_lin_vel_w = self.ref_body_lin_vel_future_w[
-            :, self.current_step_index
-        ]
-        self.ref_body_quat_w = self.ref_body_quat_future_w[
-            :, self.current_step_index
-        ]
-        self.ref_body_ang_vel_w = self.ref_body_ang_vel_future_w[
-            :, self.current_step_index
-        ]
-        self.ref_joint_pos = self.ref_joint_pos_future_[:, self.current_step_index]
-        self.ref_joint_vel = self.ref_joint_vel_future_[:, self.current_step_index]
-        self.ref_root_pos_w = self.ref_root_pos_future_w[
-            :, self.current_step_index
-        ]
-        self.ref_root_quat_w = self.ref_root_quat_future_w[
-            :, self.current_step_index
-        ]
-        self.ref_anchor_pos_w = self.ref_anchor_pos_future_w[
-            :, self.current_step_index
-        ]
-        self.ref_anchor_quat_w = self.ref_anchor_quat_future_w[
-            :, self.current_step_index
-        ]
-        # shape: [num_envs, num_future_steps, num_tracking_bodies, xxx]
+    def _refresh_future_buffers(self):
+        # `self.t` anchors the future-motion buffer used by observations.
+        self.obs_motion_t = self.t.clone()
+        self.future_ref_motion = self.dataset.get_slice(
+            self.motion_ids, self.t, steps=self.future_steps
+        )
+        env_origins = self.env.scene.env_origins
 
+        self.ref_body_pos_future_w = (
+            self.future_ref_motion.body_pos_w[..., self.tracking_body_indices_motion, :]
+            + env_origins[:, None, None, :]
+        )
+        self.ref_body_lin_vel_future_w = self.future_ref_motion.body_lin_vel_w[
+            ..., self.tracking_body_indices_motion, :
+        ]
+        self.ref_body_quat_future_w = self.future_ref_motion.body_quat_w[
+            ..., self.tracking_body_indices_motion, :
+        ]
+        self.ref_body_ang_vel_future_w = self.future_ref_motion.body_ang_vel_w[
+            ..., self.tracking_body_indices_motion, :
+        ]
+
+        self.ref_joint_pos_future_ = self.future_ref_motion.joint_pos[
+            ..., self.tracking_joint_indices_motion
+        ]
+        self.ref_joint_vel_future_ = self.future_ref_motion.joint_vel[
+            ..., self.tracking_joint_indices_motion
+        ]
+
+        self.ref_root_pos_future_w = (
+            self.future_ref_motion.body_pos_w[..., self.root_body_idx_motion, :]
+            + env_origins[:, None, :]
+        )
+        self.ref_root_quat_future_w = self.future_ref_motion.body_quat_w[
+            ..., self.root_body_idx_motion, :
+        ]
+
+        self.ref_anchor_pos_future_w = (
+            self.future_ref_motion.body_pos_w[..., self.anchor_body_idx_motion, :]
+            + env_origins[:, None, :]
+        )
+        self.ref_anchor_quat_future_w = self.future_ref_motion.body_quat_w[
+            ..., self.anchor_body_idx_motion, :
+        ]
+
+        # root_diff_obs
+        (
+            self.ref_root_pos_future_b,
+            self.ref_root_ori_future_b_matrix,
+        ) = _compute_root_diff_obs(
+            self.robot_root_pos_w,
+            self.robot_root_quat_w,
+            self.ref_root_pos_future_w,
+            self.ref_root_quat_future_w,
+        )
+
+        # motion_local_obs
+        (
+            self.ref_body_pos_future_local,
+            self.ref_body_ori_future_local_matrix,
+        ) = _compute_motion_local_obs(
+            self.ref_anchor_pos_future_w[:, self.obs_current_step_index],
+            self.ref_anchor_quat_future_w[:, self.obs_current_step_index],
+            self.ref_body_pos_future_w,
+            self.ref_body_quat_future_w,
+        )
+
+        # body_local_diff_obs
+        (
+            self.diff_body_pos_future_local,
+            self.diff_body_lin_vel_future_local,
+            self.diff_body_ori_future_local_matrix,
+            self.diff_body_ang_vel_future_local,
+        ) = _compute_body_local_diff_obs(
+            self.ref_anchor_pos_future_w[:, self.obs_current_step_index],
+            self.ref_anchor_quat_future_w[:, self.obs_current_step_index],
+            self.robot_anchor_pos_w,
+            self.robot_anchor_quat_w,
+            self.ref_body_pos_future_w,
+            self.ref_body_lin_vel_future_w,
+            self.ref_body_ang_vel_future_w,
+            self.ref_body_quat_future_w,
+            self.robot_body_link_pos_w,
+            self.robot_body_lin_vel_w,
+            self.robot_body_ang_vel_w,
+            self.robot_body_link_quat_w,
+        )
+
+    def step(self):
+        self._refresh_future_buffers()
         self.t += 1
+
+    def update(self):
+        refresh_future_buffers = not hasattr(self, "future_ref_motion")
+        if self.replay_motion:
+            self.sample_init(self.all_env_ids)
+            refresh_future_buffers = True
+
+        if hasattr(self, "motion_frames"):
+            motion_frame = {}
+            motion_frame["body_pos_w"] = self.asset.data.body_link_pos_w.cpu()
+            motion_frame["body_quat_w"] = self.asset.data.body_link_quat_w.cpu()
+            motion_frame["body_lin_vel_w"] = self.asset.data.body_com_lin_vel_w.cpu()
+            motion_frame["body_ang_vel_w"] = self.asset.data.body_com_ang_vel_w.cpu()
+            motion_frame["joint_pos"] = self.asset.data.joint_pos.cpu()
+            motion_frame["joint_vel"] = self.asset.data.joint_vel.cpu()
+            self.motion_frames.append(TensorDict(motion_frame, batch_size=[1]))
+
+        self._read_current_robot_state()
+        if refresh_future_buffers:
+            self._refresh_future_buffers()
+
+        # Reward / termination: consume the current frame from the previously
+        # prepared future-motion buffer.
+        self.current_ref_motion = self.future_ref_motion[:, self.reward_current_step_index]
+        self.ref_body_pos_w = self.ref_body_pos_future_w[:, self.reward_current_step_index]
+        self.ref_body_lin_vel_w = self.ref_body_lin_vel_future_w[:, self.reward_current_step_index]
+        self.ref_body_quat_w = self.ref_body_quat_future_w[:, self.reward_current_step_index]
+        self.ref_body_ang_vel_w = self.ref_body_ang_vel_future_w[:, self.reward_current_step_index]
+        self.ref_joint_pos = self.ref_joint_pos_future_[:, self.reward_current_step_index]
+        self.ref_joint_vel = self.ref_joint_vel_future_[:, self.reward_current_step_index]
+        self.ref_anchor_pos_w = self.ref_anchor_pos_future_w[:, self.reward_current_step_index]
+        self.ref_anchor_quat_w = self.ref_anchor_quat_future_w[:, self.reward_current_step_index]
+
+        (
+            ref_body_pos_local,
+            ref_body_quat_local,
+            robot_body_pos_local,
+            robot_body_quat_local,
+        ) = _compute_current_tracking_state(
+            self.ref_anchor_pos_w,
+            self.ref_anchor_quat_w,
+            self.robot_anchor_pos_w,
+            self.robot_anchor_quat_w,
+            self.ref_body_pos_w,
+            self.ref_body_quat_w,
+            self.robot_body_link_pos_w,
+            self.robot_body_link_quat_w,
+        )
+
+        (
+            self.body_pos_error,
+            self.body_pos_error_local,
+            self.body_ori_error,
+            self.body_ori_error_local,
+            self.body_lin_vel_error,
+            self.body_ang_vel_error,
+            self.joint_pos_error,
+            self.joint_vel_error,
+        ) = _compute_tracking_errors(
+            self.ref_body_pos_w,
+            self.ref_body_quat_w,
+            self.ref_body_lin_vel_w,
+            self.ref_body_ang_vel_w,
+            ref_body_pos_local,
+            ref_body_quat_local,
+            self.robot_body_link_pos_w,
+            self.robot_body_link_quat_w,
+            self.robot_body_lin_vel_w,
+            self.robot_body_ang_vel_w,
+            robot_body_pos_local,
+            robot_body_quat_local,
+            self.ref_joint_pos,
+            self.ref_joint_vel,
+            self.robot_joint_pos,
+            self.robot_joint_vel,
+        )
+
+        # print(
+        #     f"body lin vel error: {self.body_lin_vel_error.norm(dim=-1)}"
+        # )
+        # print(
+        #     f"body ang vel error: {self.body_ang_vel_error.norm(dim=-1)}"
+        # )
 
     def debug_draw(self):
         if not hasattr(self, "current_ref_motion"):
@@ -509,27 +825,34 @@ class RobotTracking(Command, namespace="hdmi"):
             free_joint_q_adr = indexing.free_joint_q_adr.cpu().numpy()
             joint_q_adr = indexing.joint_q_adr.cpu().numpy()
 
-            for env_idx in range(self.num_envs):
-                qpos = np.zeros(self.env.sim.mj_model.nq)
-                qpos[free_joint_q_adr[0:3]] = (
-                    self.ref_root_pos_future_w[env_idx, 0].cpu().numpy()
-                )
-                qpos[free_joint_q_adr[3:7]] = (
-                    self.ref_root_quat_future_w[env_idx, 0].cpu().numpy()
-                )
-                qpos[joint_q_adr] = (
-                    self.current_ref_motion.joint_pos[
-                        env_idx, self.asset_joint_idx_motion
-                    ]
-                    .cpu()
-                    .numpy()
-                )
+            if scene.show_all_envs or self.num_envs == 1:
+                env_ids = range(self.num_envs)
+            else:
+                env_ids = [int(scene.env_idx)]
 
-                scene.add_ghost_mesh(
-                    qpos,
-                    model=self._ghost_model,
-                    label=f"env_{env_idx}",
-                )
+            for env_idx in env_ids:
+                qpos = np.zeros(self.env.sim.mj_model.nq)
+                # for time_index in [self.obs_current_step_index, -1]:
+                for time_index in [self.obs_current_step_index]:
+                    qpos[free_joint_q_adr[0:3]] = (
+                        self.ref_root_pos_future_w[env_idx, time_index].cpu().numpy()
+                    )
+                    qpos[free_joint_q_adr[3:7]] = (
+                        self.ref_root_quat_future_w[env_idx, time_index].cpu().numpy()
+                    )
+                    qpos[joint_q_adr] = (
+                        self.future_ref_motion.joint_pos[
+                            env_idx, time_index, self.asset_joint_idx_motion
+                        ]
+                        .cpu()
+                        .numpy()
+                    )
+
+                    scene.add_ghost_mesh(
+                        qpos,
+                        model=self._ghost_model,
+                        label=f"env_{env_idx}",
+                    )
         elif self.viz.mode == "frames":
             for env_idx in range(self.num_envs):
                 desired_body_pos = self.ref_body_pos_w[env_idx].cpu().numpy()

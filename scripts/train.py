@@ -1,6 +1,5 @@
 import torch
 import hydra
-import numpy as np
 import wandb
 import logging
 import time
@@ -19,6 +18,7 @@ from tensordict import TensorDict
 import active_adaptation as aa
 from active_adaptation.utils.profiling import ScopedTimer
 from active_adaptation.learning.ppo.ppo_base import PPOBase
+from active_adaptation.learning.modules.vecnorm import VecNorm
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -68,6 +68,7 @@ def main(cfg: DictConfig):
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
     def save(policy, checkpoint_name: str, *, upload_to_wandb: bool = True):
+        assert run is not None
         run_dir = Path(run.dir)
         ckpt_path = run_dir / f"{checkpoint_name}.pt"
         state_dict = OrderedDict()
@@ -84,7 +85,10 @@ def main(cfg: DictConfig):
         if latest_link.exists() or latest_link.is_symlink():
             latest_link.unlink()
         latest_link.symlink_to(ckpt_path.name)
-        logging.info(f"Saved checkpoint to {ckpt_path}" + (" (wandb)" if upload_to_wandb else ""))
+        logging.info(
+            f"Saved checkpoint to {ckpt_path}"
+            + (" (wandb)" if upload_to_wandb else "")
+        )
         return str(ckpt_path)
 
     assert env.training
@@ -94,7 +98,6 @@ def main(cfg: DictConfig):
             return False
         return i % checkpoint_interval == 0 or i % upload_interval == 0
 
-    ckpt_path = None
     carry = env.reset()
     next_saved_keys = [
         # "command",
@@ -144,16 +147,17 @@ def main(cfg: DictConfig):
         run.save(str(run_dir / "config.yaml"), policy="now")
 
     for stage in stages:
-
         policy.on_stage_start(stage)
         rollout_policy = policy.get_rollout_policy("train")
 
-        with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
-            tmp_carry = rollout_policy(carry.clone(False))
+        with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM), VecNorm.freeze():
+            tmp_carry = rollout_policy(carry.clone(True))
             tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
             tmp_td["next"] = tmp_td["next"].select(*next_saved_keys, strict=False)
 
-        data_buf: TensorDict = tmp_td.unsqueeze(-1).expand(env.num_envs, cfg.algo.train_every).clone()
+        data_buf: TensorDict = tmp_td.unsqueeze(-1).expand(
+            env.num_envs, cfg.algo.train_every
+        ).clone()
 
         progress = range(total_iters)
         if aa.is_main_process():
@@ -202,7 +206,7 @@ def main(cfg: DictConfig):
             training_time = training_timer.last_time
 
             info.update(env.extra)
-            info.update(env.stats_ema)  # step-wise exponential moving average of stats
+            info.update(env.stats_ema)
 
             if hasattr(policy, "step_schedule"):
                 policy.step_schedule(i / total_iters)
@@ -217,12 +221,17 @@ def main(cfg: DictConfig):
 
             if should_save(i):
                 should_upload = i % upload_interval == 0
-                checkpoint_name = f"checkpoint_{i}" if should_upload else "checkpoint_temp"
-                ckpt_path = save(policy, checkpoint_name, upload_to_wandb=should_upload)
-                print(f"Latest checkpoint: {ckpt_path}")
+                checkpoint_name = (
+                    f"checkpoint_{i}" if should_upload else "checkpoint_temp"
+                )
+                ckpt_path = save(
+                    policy, checkpoint_name, upload_to_wandb=should_upload
+                )
+                if ckpt_path is not None:
+                    print(f"Latest checkpoint: {ckpt_path}")
 
-            if aa.is_main_process():
-                ScopedTimer.print_summary(clear=True)
+            if aa.is_main_process() and run is not None:
+                # ScopedTimer.print_summary(clear=True)
                 # print(
                 #     OmegaConf.to_yaml(
                 #         {k: v for k, v in info.items() if isinstance(v, (float, int))}
@@ -232,12 +241,11 @@ def main(cfg: DictConfig):
 
     if aa.is_main_process():
         ckpt_path = save(policy, "checkpoint_final")
-        policy_eval = policy.get_rollout_policy("eval")
-        info, trajs, stats = evaluate(
-            env, policy_eval, render=cfg.eval_render, seed=cfg.seed
-        )
-        info["env_frames"] = env_frames * aa.get_world_size()
-        run.log(info)
+        # policy_eval = policy.get_rollout_policy("eval")
+        # info, trajs, stats = evaluate(
+        #     env, policy_eval, render=cfg.eval_render, seed=cfg.seed
+        # )
+        # run.log(info)
         wandb.finish()
         print(f"Final checkpoint: {ckpt_path}")
     exit(0)

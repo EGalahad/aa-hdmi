@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import List, Tuple, Union, Mapping
 from contextlib import nullcontext
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributions as D
@@ -44,13 +43,28 @@ from active_adaptation.learning.utils.valuenorm import ValueNorm1, ValueNormFake
 from active_adaptation.learning.ppo.ppo_base import PPOBase
 
 
-
 torch.set_float32_matmul_precision("high")
 
-OBJECT_KEY = "object"
 REF_JPOS_KEY = "ref_joint_pos_"
-PRIV_FEATURE_KEY = "priv_feature"
-PRIV_PRED_KEY = "priv_pred"
+PRIV_TEACHER_KEY = "priv_teacher"
+PRIV_STUDENT_KEY = "priv_student"
+
+
+class NullVecNorm(VecNorm):
+    """Identity VecNorm that keeps the module/state interface intact."""
+
+    def forward(self, input_vector: torch.Tensor):
+        return input_vector
+
+    def _update(self, input_vector: torch.Tensor):
+        raise RuntimeError("NullVecNorm does not support updating statistics.")
+
+    def _compute(self):
+        raise RuntimeError("NullVecNorm does not compute normalization.")
+
+    def synchronize(self, mode: str = "broadcast"):
+        del mode
+        return None
 
 
 @dataclass
@@ -73,7 +87,8 @@ class PPOConfig:
 
     entropy_coef_start: float = 0.004
     entropy_coef_end: float = 0.004
-    entropy_decay_iters: int = 3000
+    entropy_decay_start: int = 0
+    entropy_decay_end: int = 0
     init_noise_scale: float = 1.0
     load_noise_scale: float | None = None
 
@@ -91,51 +106,34 @@ class PPOConfig:
     max_grad_norm: float = 1.0
 
     phase: str = "train"
-    vecnorm: Union[str, None] = None
+    vecnorm: bool = True
     checkpoint_path: Union[str, None] = None
-    in_keys: List[str] = (CMD_KEY, OBS_KEY, OBJECT_KEY, OBS_PRIV_KEY)
+    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, OBS_PRIV_KEY)
+
+    # TODO: ddp sync mode has some bugs
+    grad_sync_mode: str | None = "manual" # Options: "ddp", "manual", None
+    manual_construct_dist_now: bool = True
+
+    def __post_init__(self):
+        if isinstance(self.grad_sync_mode, str):
+            self.grad_sync_mode = self.grad_sync_mode.lower()
+            if self.grad_sync_mode in {"none", "null"}:
+                self.grad_sync_mode = None
+
+        if self.grad_sync_mode not in {"ddp", "manual", None}:
+            raise ValueError(
+                "grad_sync_mode must be one of {'ddp', 'manual', None}, "
+                f"got {self.grad_sync_mode!r}"
+            )
 
 
 cs = ConfigStore.instance()
-cs.store(
-    "ppo_roa_train",
-    node=PPOConfig(
-        phase="train", vecnorm="train", entropy_coef_start=0.004, entropy_coef_end=0.001
-    ),
-    group="algo",
-)
-cs.store(
-    "ppo_roa_adapt",
-    node=PPOConfig(
-        phase="adapt", vecnorm="eval", entropy_coef_start=0.0, entropy_coef_end=0.0
-    ),
-    group="algo",
-)
-cs.store(
-    "ppo_roa_finetune",
-    node=PPOConfig(
-        phase="finetune",
-        vecnorm="eval",
-        entropy_coef_start=0.002,
-        entropy_coef_end=0.0001,
-    ),
-    group="algo",
-)
+cs.store("ppo_roa_train", node=PPOConfig(phase="train"), group="algo")
+cs.store("ppo_roa_adapt", node=PPOConfig(phase="adapt"), group="algo")
+cs.store("ppo_roa_finetune", node=PPOConfig(phase="finetune"), group="algo")
 
 
 class PPOROA(PPOBase):
-    train_in_keys = [
-        CMD_KEY,
-        OBS_KEY,
-        OBS_PRIV_KEY,
-        ACTION_KEY,
-        "adv",
-        "ret",
-        "is_init",
-        "sample_log_prob",
-        "step_count",
-    ]
-
     def __init__(
         self,
         cfg: PPOConfig,
@@ -153,11 +151,12 @@ class PPOROA(PPOBase):
 
         self.desired_kl = self.cfg.desired_kl
         self.clip_param = self.cfg.clip_param
-
-        self.critic_loss_fn = nn.MSELoss(reduction="none")
-        self.adapt_loss_fn = nn.MSELoss(reduction="none")
         self.gae = GAE(gamma=self.cfg.gamma, lmbda=self.cfg.lmbda)
-        self.reward_groups = list(env.cfg.reward.keys())
+
+        self.reward_groups = []
+        for group_name, group_cfg in env.cfg.reward.items():
+            if group_cfg.get("_enabled_", True):
+                self.reward_groups.append(group_name)
         num_reward_groups = len(self.reward_groups)
         self.reward_scales = torch.ones(num_reward_groups, device=self.device)
         self.reward_scales /= self.reward_scales.sum()
@@ -169,72 +168,81 @@ class PPOROA(PPOBase):
         self.action_dim = env.action_manager.action_dim
         self.joint_names = env.action_manager.joint_names
 
-        self.cmd_key = CMD_KEY if CMD_KEY in observation_spec.keys(True, True) else "command_"
-
         self._build_vecnorm_modules(observation_spec)
 
-        fake_input = observation_spec.zero()
-
-        encoder_priv_in_keys = [self.norm_map[OBS_PRIV_KEY]]
-        adapt_module_in_keys = [self.norm_map[OBS_KEY], self.norm_map[self.cmd_key]]
+        encoder_teacher_in_keys = [OBS_PRIV_KEY]
+        encoder_student_in_keys = [OBS_KEY, CMD_KEY]
         critic_in_keys = [
-            self.norm_map[OBS_PRIV_KEY],
-            self.norm_map[OBS_KEY],
-            self.norm_map[self.cmd_key],
+            OBS_PRIV_KEY,
+            OBS_KEY,
+            CMD_KEY,
         ]
-        if OBJECT_KEY in observation_spec.keys(True, True):
-            encoder_priv_in_keys.append(OBJECT_KEY)
-            adapt_module_in_keys.append(OBJECT_KEY)
-            critic_in_keys.append(OBJECT_KEY)
 
         latent_dim = self.cfg.latent_dim
-        self.encoder_priv = Seq(
-            CatTensors(encoder_priv_in_keys, "_encoder_priv_inp", del_keys=False, sort=False),
+        self.encoder_teacher = Seq(
+            CatTensors(
+                encoder_teacher_in_keys,
+                "_encoder_teacher_inp",
+                del_keys=False,
+                sort=False,
+            ),
             Mod(
                 nn.Sequential(
-                    make_mlp(list(self.cfg.encoder_priv_hidden_dims), norm=self.cfg.layer_norm),
+                    make_mlp(
+                        list(self.cfg.encoder_priv_hidden_dims),
+                        norm=self.cfg.layer_norm,
+                    ),
                     nn.LazyLinear(latent_dim),
                 ),
-                "_encoder_priv_inp",
-                PRIV_FEATURE_KEY,
+                "_encoder_teacher_inp",
+                PRIV_TEACHER_KEY,
             ),
-            selected_out_keys=[PRIV_FEATURE_KEY],
+            selected_out_keys=[PRIV_TEACHER_KEY],
         ).to(self.device)
 
-        self.adapt_module = Seq(
-            CatTensors(adapt_module_in_keys, "_adapt_inp", del_keys=False, sort=False),
+        self.encoder_student = Seq(
+            CatTensors(
+                encoder_student_in_keys,
+                "_encoder_student_inp",
+                del_keys=False,
+                sort=False,
+            ),
             Mod(
                 nn.Sequential(
-                    make_mlp(list(self.cfg.adapt_module_hidden_dims), norm=self.cfg.layer_norm),
+                    make_mlp(
+                        list(self.cfg.adapt_module_hidden_dims),
+                        norm=self.cfg.layer_norm,
+                    ),
                     nn.LazyLinear(latent_dim),
                 ),
-                "_adapt_inp",
-                [PRIV_PRED_KEY],
+                "_encoder_student_inp",
+                PRIV_STUDENT_KEY,
             ),
-            selected_out_keys=[PRIV_PRED_KEY],
+            selected_out_keys=[PRIV_STUDENT_KEY],
         ).to(self.device)
 
-        if (
-            self.cfg.phase == "train"
-            and self.cfg.residual_action
-            and REF_JPOS_KEY in observation_spec.keys(True, True)
-        ):
+        if self.cfg.residual_action:
+            assert REF_JPOS_KEY in observation_spec.keys(
+                True, True
+            ), f"Residual action requires {REF_JPOS_KEY} observation"
 
             class RefJointPos(nn.Module):
                 def forward(self, ref_jpos, action):
                     return (ref_jpos + action,)
 
-            residual_module = Mod(
-                RefJointPos(), [REF_JPOS_KEY, "loc"], ["loc"]
-            )
+            residual_module = Mod(RefJointPos(), [REF_JPOS_KEY, "loc"], ["loc"])
         else:
             residual_module = None
 
-        def build_actor(in_keys: List[str], residual: Mod | None = None) -> ProbabilisticActor:
+        def build_actor(
+            in_keys: List[str], residual: Mod | None = None
+        ) -> ProbabilisticActor:
             actor_modules = [
                 CatTensors(in_keys, "_actor_inp", del_keys=False, sort=False),
                 Mod(
-                    make_mlp(list(self.cfg.actor_hidden_dims), norm=self.cfg.layer_norm),
+                    make_mlp(
+                        list(self.cfg.actor_hidden_dims), norm=self.cfg.layer_norm
+                    ),
                     ["_actor_inp"],
                     ["_actor_feature"],
                 ),
@@ -261,32 +269,35 @@ class PPOROA(PPOBase):
         self.dist_cls = IndependentNormal
         self.dist_keys = ["loc", "scale"]
 
-        self.actor = build_actor(
-            [self.norm_map[self.cmd_key], self.norm_map[OBS_KEY], PRIV_FEATURE_KEY],
+        self.actor_teacher = build_actor(
+            [CMD_KEY, OBS_KEY, PRIV_TEACHER_KEY],
             residual=residual_module,
         )
-        self.actor_adapt = build_actor(
-            [self.norm_map[self.cmd_key], self.norm_map[OBS_KEY], PRIV_PRED_KEY]
-        )
+        self.actor_student = build_actor([CMD_KEY, OBS_KEY, PRIV_STUDENT_KEY])
 
         self.critic = Seq(
             CatTensors(critic_in_keys, "_critic_input", del_keys=False),
             Mod(
                 nn.Sequential(
-                    make_mlp(list(self.cfg.critic_hidden_dims), norm=self.cfg.layer_norm),
+                    make_mlp(
+                        list(self.cfg.critic_hidden_dims), norm=self.cfg.layer_norm
+                    ),
                     nn.LazyLinear(num_reward_groups),
                 ),
                 ["_critic_input"],
                 ["state_value"],
             ),
+            selected_out_keys=["state_value"],
         ).to(self.device)
 
-        self.vecnorm(fake_input)
-        self.encoder_priv(fake_input)
-        self.actor(fake_input)
+        fake_input = observation_spec.zero()
+        with VecNorm.freeze():
+            self.vecnorm(fake_input)
+        self.encoder_teacher(fake_input)
+        self.actor_teacher(fake_input)
+        self.encoder_student(fake_input)
+        self.actor_student(fake_input)
         self.critic(fake_input)
-        self.adapt_module(fake_input)
-        self.actor_adapt(fake_input)
 
         def init_(module):
             if isinstance(module, nn.Linear):
@@ -296,46 +307,56 @@ class PPOROA(PPOBase):
         self.apply(init_)
 
         if aa.is_distributed():
-            self._wrap_ddp(local_rank=aa.get_local_rank())
+            self.world_size = aa.get_world_size()
+            if self.cfg.grad_sync_mode == "ddp":
+                self._wrap_ddp(local_rank=aa.get_local_rank())
+            self._broadcast_parameters()
 
-        self.lr_policy = self.cfg.lr
-        if self.cfg.phase == "train":
+        if self.cfg.phase in {"train", "finetune"}:
+            # PPO related optimizers
+            policy_modules: List[nn.Module] = []
+            if self.cfg.phase == "train":
+                policy_modules += [self.actor_teacher, self.encoder_teacher]
+            else:
+                policy_modules += [self.actor_student]
+                if self.cfg.finetune_adapt_module:
+                    policy_modules += [self.encoder_student]
+
+            self.lr_policy = self.cfg.lr
             policy_params = [
-                {"params": self.actor.parameters()},
-                {"params": self.encoder_priv.parameters()},
+                {"params": module.parameters()} for module in policy_modules
             ]
-        else:
-            policy_params = [{"params": self.actor_adapt.parameters()}]
-            if self.cfg.phase == "finetune" and self.cfg.finetune_adapt_module:
-                policy_params.append({"params": self.adapt_module.parameters()})
-        
-        adapt_parameters = [{"params": self.adapt_module.parameters()}]
-        if self.cfg.residual_action:
-            adapt_parameters += [{"params": self.actor_adapt.parameters()}]
+            self.opt_policy = torch.optim.Adam(policy_params, lr=self.lr_policy)
+            self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=self.cfg.lr)
 
-        self.opt_policy = torch.optim.Adam(policy_params, lr=self.lr_policy)
-        self.opt_adapt = torch.optim.Adam(adapt_parameters, lr=self.cfg.lr)
-        self.opt_critic = torch.optim.Adam([{"params": self.critic.parameters()}], lr=self.cfg.lr)
+        if self.cfg.phase in {"train", "adapt"}:
+            adapt_modules: List[nn.Module] = [self.encoder_student]
+            if self.cfg.residual_action:
+                adapt_modules.append(self.actor_student)
+            adapt_parameters = [
+                {"params": module.parameters()} for module in adapt_modules
+            ]
+            self.opt_adapt = torch.optim.Adam(adapt_parameters, lr=self.cfg.lr)
 
         self.num_updates = 0
 
     def _build_vecnorm_modules(self, observation_spec: CompositeSpec):
         modules = []
-        self.norm_map = {}
         self.vecnorms: Mapping[str, VecNorm] = nn.ModuleDict()
+        vecnorm_cls = NullVecNorm if self.cfg.vecnorm is None else VecNorm
 
-        keys_to_norm = [self.cmd_key, OBS_KEY, OBS_PRIV_KEY]
+        keys_to_norm = [CMD_KEY, OBS_KEY, OBS_PRIV_KEY]
         for key in keys_to_norm:
             if key not in observation_spec.keys(True, True):
                 continue
             shape = observation_spec[key].shape[-1:]
-            vecnorm = VecNorm(input_shape=shape, stats_shape=shape, decay=1.0)
+            vecnorm = vecnorm_cls(input_shape=shape, stats_shape=shape, decay=0.9999)
             self.vecnorms[key] = vecnorm
-            modules.append(Mod(vecnorm, [key], [key])) # inplace norm
-            self.norm_map[key] = key
+            modules.append(Mod(vecnorm, [key], [key]))  # inplace norm
 
         self.vecnorm = Seq(*modules).to(self.device)
-    
+
+    @VecNorm.freeze()
     def compute_value(self, tensordict):
         self.vecnorm(tensordict)
         return self.critic(tensordict)
@@ -360,14 +381,36 @@ class PPOROA(PPOBase):
         def wrap_td_module(module):
             return DDPWithAttr(module, **ddp_kwargs)
 
-        self.actor = wrap_td_module(self.actor)
-        self.actor_adapt = wrap_td_module(self.actor_adapt)
-        self.encoder_priv = wrap_td_module(self.encoder_priv)
+        self.actor_teacher = wrap_td_module(self.actor_teacher)
+        self.actor_student = wrap_td_module(self.actor_student)
+        self.encoder_teacher = wrap_td_module(self.encoder_teacher)
+        self.encoder_student = wrap_td_module(self.encoder_student)
         self.critic = wrap_td_module(self.critic)
-        self.adapt_module = wrap_td_module(self.adapt_module)
+
+    @torch.no_grad()
+    def _broadcast_parameters(self):
+        for module in (
+            self.actor_teacher,
+            self.actor_student,
+            self.encoder_teacher,
+            self.encoder_student,
+            self.critic,
+        ):
+            for param in module.parameters():
+                dist.broadcast(param, src=0)
+
+    @torch.no_grad()
+    def _all_reduce_grads(self, *modules):
+        for module in modules:
+            if module is None:
+                continue
+            for param in module.parameters():
+                if param.grad is None:
+                    continue
+                dist.all_reduce(param.grad.data, op=dist.ReduceOp.AVG)
 
     def make_tensordict_primer(self):
-        return TensorDictPrimer({}, reset_key="done")
+        return TensorDictPrimer({}, reset_key="done", expand_specs=False)
 
     def on_stage_start(self, stage: str):
         return None
@@ -375,11 +418,13 @@ class PPOROA(PPOBase):
     def _get_current_iter(self) -> int:
         return int(getattr(self.env, "current_iter", 0))
 
-    def get_rollout_policy(self, mode: str = "train"):
+    def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         if mode == "deploy":
             vecnorms = []
-            in_keys = set(self.adapt_module.in_keys).union(set(self.actor_adapt.in_keys))
-            in_keys = [key for key in in_keys if key in self.norm_map]
+            in_keys = set(self.encoder_student.in_keys).union(
+                set(self.actor_student.in_keys)
+            )
+            in_keys = [key for key in in_keys if key in self.vecnorms]
             for key in in_keys:
                 vecnorms.append(Mod(self.vecnorms[key], [key], [key]))
             vecnorm = Seq(*vecnorms).to(self.device)
@@ -387,14 +432,13 @@ class PPOROA(PPOBase):
             modules = [vecnorm, ood_detector]
         else:
             modules = [self.vecnorm]
-            
 
         if self.cfg.phase == "train":
-            modules += [self.encoder_priv, self.actor]
+            modules += [self.encoder_teacher, self.actor_teacher]
         elif self.cfg.phase == "adapt":
-            modules += [self.adapt_module, self.actor_adapt]
+            modules += [self.encoder_student, self.actor_student]
         elif self.cfg.phase == "finetune":
-            modules += [self.adapt_module, self.actor_adapt]
+            modules += [self.encoder_student, self.actor_student]
 
         if mode == "deploy":
             modules[-1] = modules[-1].module[0]
@@ -403,7 +447,10 @@ class PPOROA(PPOBase):
         else:
             out_keys = ["sample_log_prob", ACTION_KEY] + self.dist_keys
 
-        return Seq(*modules, selected_out_keys=out_keys)
+        rollout_policy = Seq(*modules, selected_out_keys=out_keys)
+        if self.cfg.phase == "adapt":
+            rollout_policy.forward = VecNorm.freeze()(rollout_policy.forward)
+        return rollout_policy
 
     @VecNorm.freeze()
     def train_op(self, tensordict: TensorDict):
@@ -427,25 +474,36 @@ class PPOROA(PPOBase):
                 for b in m.buffers():
                     dist.all_reduce(b, op=dist.ReduceOp.AVG)
 
-            for name, vecnorm in self.vecnorms.items():
-                loc_diffs, scale_diffs = check_vecnorm_divergence(vecnorm)
-                if aa.is_main_process():
-                    info[f"vecnorm/{name}/loc_diff_max"] = max(loc_diffs)
-                    info[f"vecnorm/{name}/scale_diff_max"] = max(scale_diffs)
-                    info[f"vecnorm/{name}/loc_diff_mean"] = sum(loc_diffs) / len(loc_diffs)
-                    info[f"vecnorm/{name}/scale_diff_mean"] = sum(scale_diffs) / len(scale_diffs)
-                vecnorm.synchronize(mode="aggregate")
+            if self.cfg.vecnorm is not None:
+                for name, vecnorm in self.vecnorms.items():
+                    loc_diffs, scale_diffs = check_vecnorm_divergence(vecnorm)
+                    if aa.is_main_process():
+                        info[f"vecnorm/{name}/loc_diff_max"] = max(loc_diffs)
+                        info[f"vecnorm/{name}/scale_diff_max"] = max(scale_diffs)
+                        info[f"vecnorm/{name}/loc_diff_mean"] = sum(loc_diffs) / len(
+                            loc_diffs
+                        )
+                        info[f"vecnorm/{name}/scale_diff_mean"] = sum(
+                            scale_diffs
+                        ) / len(scale_diffs)
+                    vecnorm.synchronize(mode="broadcast")
 
-        action_std = self._get_actor_std(self.actor if self.cfg.phase == "train" else self.actor_adapt)
+        action_std = self._get_actor_std(
+            self.actor_teacher if self.cfg.phase == "train" else self.actor_student
+        )
         if action_std is not None:
             for joint_name, std in zip(self.joint_names, action_std):
                 info[f"actor_std/{joint_name}"] = std
             info["actor_std/mean"] = action_std.mean()
 
-        if PRIV_FEATURE_KEY in tensordict.keys():
-            info["adapt/priv_feature_norm"] = tensordict[PRIV_FEATURE_KEY].norm(p=2, dim=-1).mean().detach()
-        if PRIV_PRED_KEY in tensordict.keys():
-            info["adapt/priv_pred_norm"] = tensordict[PRIV_PRED_KEY].norm(p=2, dim=-1).mean().detach()
+        if PRIV_TEACHER_KEY in tensordict.keys():
+            info["adapt/priv_feature_norm"] = (
+                tensordict[PRIV_TEACHER_KEY].norm(p=2, dim=-1).mean().detach()
+            )
+        if PRIV_STUDENT_KEY in tensordict.keys():
+            info["adapt/priv_pred_norm"] = (
+                tensordict[PRIV_STUDENT_KEY].norm(p=2, dim=-1).mean().detach()
+            )
 
         return info
 
@@ -458,13 +516,26 @@ class PPOROA(PPOBase):
 
     def train_policy(self, tensordict: TensorDict):
         infos = []
-        self._compute_advantage(tensordict, self.critic, "adv", "ret", update_value_norm=True)
+        self._compute_advantage(
+            tensordict, self.critic, "adv", "ret", update_value_norm=True
+        )
 
         current_iter = self._get_current_iter()
-        progress = float(np.clip(current_iter / self.cfg.entropy_decay_iters, 0.0, 1.0))
-        self.entropy_coef = self.cfg.entropy_coef_start + (
-            self.cfg.entropy_coef_end - self.cfg.entropy_coef_start
-        ) * progress
+        if current_iter <= self.cfg.entropy_decay_start:
+            self.entropy_coef = self.cfg.entropy_coef_start
+        elif current_iter >= self.cfg.entropy_decay_end:
+            self.entropy_coef = self.cfg.entropy_coef_end
+        elif self.cfg.entropy_decay_end > self.cfg.entropy_decay_start:
+            progress = float(
+                (current_iter - self.cfg.entropy_decay_start)
+                / (self.cfg.entropy_decay_end - self.cfg.entropy_decay_start)
+            )
+            self.entropy_coef = (
+                self.cfg.entropy_coef_start
+                + (self.cfg.entropy_coef_end - self.cfg.entropy_coef_start) * progress
+            )
+        else:
+            self.entropy_coef = self.cfg.entropy_coef_end
 
         for _ in range(self.cfg.ppo_epochs):
             for minibatch in make_batch(tensordict, self.cfg.num_minibatches):
@@ -473,8 +544,8 @@ class PPOROA(PPOBase):
 
                 if self.desired_kl is not None:
                     kl = info["actor/kl"]
-                    # if aa.is_distributed():
-                    #     dist.all_reduce(kl, op=dist.ReduceOp.AVG)
+                    if aa.is_distributed():
+                        dist.all_reduce(kl, op=dist.ReduceOp.AVG)
                     if kl > self.desired_kl * 2.0:
                         self.lr_policy = max(1e-5, self.lr_policy / 1.5)
                     elif kl < self.desired_kl / 2.0 and kl > 0.0:
@@ -502,25 +573,33 @@ class PPOROA(PPOBase):
         infos = []
 
         with torch.no_grad():
-            self.encoder_priv(tensordict)
+            self.encoder_teacher(tensordict)
 
         for _ in range(2):
-            for minibatch in make_batch(tensordict, self.cfg.num_minibatches, self.cfg.train_every):
+            for minibatch in make_batch(
+                tensordict, self.cfg.num_minibatches, self.cfg.train_every
+            ):
                 info = {}
                 valid = ~minibatch["is_init"].squeeze(-1)
 
-                self.adapt_module(minibatch)
-                priv_loss = F.mse_loss(minibatch[PRIV_PRED_KEY], minibatch[PRIV_FEATURE_KEY], reduction="none")
+                self.encoder_student(minibatch)
+                priv_loss = F.mse_loss(
+                    minibatch[PRIV_STUDENT_KEY],
+                    minibatch[PRIV_TEACHER_KEY],
+                    reduction="none",
+                )
                 priv_loss = priv_loss[valid].mean()
 
                 if self.cfg.residual_action:
                     with torch.no_grad():
-                        dist_teacher = self.actor.get_dist(minibatch)
+                        dist_teacher = self.actor_teacher.get_dist(minibatch)
 
                     # TODO: check if should detach
-                    minibatch[PRIV_PRED_KEY] = minibatch[PRIV_PRED_KEY].detach()
-                    dist_student = self.actor_adapt.get_dist(minibatch)
-                    actor_loss = F.mse_loss(dist_teacher.mean, dist_student.mean, reduction="none")
+                    minibatch[PRIV_STUDENT_KEY] = minibatch[PRIV_STUDENT_KEY].detach()
+                    dist_student = self.actor_student.get_dist(minibatch)
+                    actor_loss = F.mse_loss(
+                        dist_teacher.mean, dist_student.mean, reduction="none"
+                    )
                     actor_loss = actor_loss[valid].mean()
                 else:
                     actor_loss = torch.zeros((), device=self.device)
@@ -530,6 +609,8 @@ class PPOROA(PPOBase):
 
                 self.opt_adapt.zero_grad()
                 (priv_loss + actor_loss).backward()
+                if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
+                    self._all_reduce_grads(self.encoder_student, self.actor_student)
                 self.opt_adapt.step()
 
                 infos.append(TensorDict(info, []))
@@ -617,26 +698,38 @@ class PPOROA(PPOBase):
         dist_kwargs_old = tensordict.select(*self.dist_keys)
 
         if self.cfg.phase == "train":
-            self.encoder_priv(tensordict)
-            actor = self.actor
+            self.encoder_teacher(tensordict)
+            actor = self.actor_teacher
         elif self.cfg.phase == "finetune":
-            context = nullcontext() if self.cfg.finetune_adapt_module else torch.no_grad()
+            context = (
+                nullcontext() if self.cfg.finetune_adapt_module else torch.no_grad()
+            )
             with context:
-                 self.adapt_module(tensordict)
-            actor = self.actor_adapt
+                self.encoder_student(tensordict)
+            actor = self.actor_student
         else:
             raise ValueError(f"Invalid phase: {self.cfg.phase}")
 
-        dist_now: D.Independent = actor.get_dist(tensordict)
+        [tensordict.pop(key) for key in self.dist_keys]
+        action_old = tensordict.pop(ACTION_KEY)
+        logp_old = tensordict.pop("sample_log_prob")
+        if self.cfg.manual_construct_dist_now:
+            actor_base = actor.module if isinstance(actor, DDP) else actor
+            actor_base(tensordict)
+            dist_now = self.dist_cls(
+                loc=tensordict["loc"], scale=tensordict["scale"]
+            )
+        else:
+            dist_now: D.Independent = actor.get_dist(tensordict)
+
         with set_composite_lp_aggregate(True):
-            log_probs = dist_now.log_prob(tensordict[ACTION_KEY])
+            log_probs = dist_now.log_prob(action_old)
+        entropy = dist_now.entropy().mean()
 
         valid = ~tensordict["is_init"].squeeze(-1)
-        entropy_all = dist_now.entropy()
-        entropy = entropy_all[valid].mean() if valid.any() else entropy_all.mean()
 
         adv = tensordict["adv"]
-        log_ratio = (log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
+        log_ratio = (log_probs - logp_old).unsqueeze(-1)
         ratio = torch.exp(log_ratio)
         surr1 = adv * ratio
         surr2 = adv * ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param)
@@ -645,28 +738,49 @@ class PPOROA(PPOBase):
 
         b_returns = tensordict["ret"]
         values = self.critic(tensordict)["state_value"]
-        value_loss = self.critic_loss_fn(b_returns, values)
+        value_loss = F.mse_loss(b_returns, values, reduction="none")
         value_loss = value_loss[valid].mean(dim=0)
 
         if self.cfg.phase == "train":
-            if PRIV_PRED_KEY not in tensordict.keys():
+            if PRIV_STUDENT_KEY not in tensordict.keys():
                 with torch.no_grad():
-                    self.adapt_module(tensordict)
-            reg_loss = F.mse_loss(tensordict[PRIV_PRED_KEY], tensordict[PRIV_FEATURE_KEY], reduction="none")
+                    self.encoder_student(tensordict)
+            reg_loss = F.mse_loss(
+                tensordict[PRIV_STUDENT_KEY],
+                tensordict[PRIV_TEACHER_KEY],
+                reduction="none",
+            )
             reg_loss = torch.mean(reg_loss[valid])
         else:
             reg_loss = torch.zeros((), device=self.device)
-        
-        loss = policy_loss + entropy_loss + value_loss.mean() + self.cfg.reg_coef * reg_loss
+
+        loss = (
+            policy_loss
+            + entropy_loss
+            + value_loss.mean()
+            + self.cfg.reg_coef * reg_loss
+        )
 
         self.opt_policy.zero_grad()
         self.opt_critic.zero_grad()
         loss.backward()
-        actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), self.cfg.max_grad_norm)
-        critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.cfg.max_grad_norm)
+        if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
+            self._all_reduce_grads(
+                self.actor_teacher,
+                self.actor_student,
+                self.encoder_teacher,
+                self.encoder_student,
+                self.critic,
+            )
+        actor_grad_norm = nn.utils.clip_grad_norm_(
+            actor.parameters(), self.cfg.max_grad_norm
+        )
+        critic_grad_norm = nn.utils.clip_grad_norm_(
+            self.critic.parameters(), self.cfg.max_grad_norm
+        )
         if self.cfg.phase == "train":
             priv_grad_norm = nn.utils.clip_grad_norm_(
-                self.encoder_priv.parameters(), self.cfg.max_grad_norm
+                self.encoder_teacher.parameters(), self.cfg.max_grad_norm
             )
         else:
             priv_grad_norm = torch.zeros(1, device=self.device)
@@ -683,7 +797,6 @@ class PPOROA(PPOBase):
             "actor/policy_loss": policy_loss.detach(),
             "actor/reg_loss": reg_loss.detach(),
             "actor/clamp_ratio": clipfrac.detach(),
-
             "actor/entropy": entropy.detach(),
             "actor/mean_std": tensordict["scale"].detach().mean(),
             "actor/kl": kl.detach(),
@@ -701,13 +814,18 @@ class PPOROA(PPOBase):
     def state_dict(self):
         if self.cfg.phase == "train":
             if not self.cfg.residual_action:
-                for src, dst in zip(self.actor.parameters(), self.actor_adapt.parameters()):
+                for src, dst in zip(
+                    self.actor_teacher.parameters(), self.actor_student.parameters()
+                ):
                     dst.data.copy_(src.data)
             else:
                 # copy actor_std
-                for name, param in self.actor.named_parameters():
+                for name, param in self.actor_teacher.named_parameters():
                     if "actor_std" in name:
-                        for adapt_name, adapt_param in self.actor_adapt.named_parameters():
+                        for (
+                            adapt_name,
+                            adapt_param,
+                        ) in self.actor_student.named_parameters():
                             if "actor_std" in adapt_name:
                                 adapt_param.data.copy_(param.data)
 
@@ -718,7 +836,6 @@ class PPOROA(PPOBase):
             state_dict[name] = module.state_dict()
         state_dict["last_phase"] = self.cfg.phase
         state_dict["last_iter"] = self._get_current_iter()
-        state_dict["lr_policy"] = self.lr_policy
         return state_dict
 
     def load_state_dict(self, state_dict, strict=True):
@@ -742,12 +859,6 @@ class PPOROA(PPOBase):
             start_iter = 0
         if hasattr(self.env, "set_progress"):
             self.env.set_progress(start_iter)
-
-        lr_policy = state_dict.get("lr_policy", None)
-        if lr_policy is not None:
-            self.lr_policy = lr_policy
-            for param_group in self.opt_policy.param_groups:
-                param_group["lr"] = self.lr_policy
 
         return failed_keys
 
@@ -778,6 +889,7 @@ class MeanAction(TensorDictModuleBase):
     def forward(self, td):
         td[ACTION_KEY] = td["loc"]
         return td
+
 
 class ObsOODDetector(TensorDictModuleBase):
     def __init__(self, in_keys, sigma: float = 5.0):

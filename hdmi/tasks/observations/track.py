@@ -5,19 +5,8 @@ from active_adaptation.envs.mdp.observations.base import Observation as BaseObse
 
 import torch
 from typing import cast
-from active_adaptation.utils.math import (
-    quat_rotate_inverse as quat_apply_inverse,
-    quat_mul,
-    quat_conjugate,
-    matrix_from_quat,
-    yaw_quat,
-    batchify,
-)
-
-quat_apply_inverse = batchify(quat_apply_inverse)
 
 TrackObservation = BaseObservation[RobotTracking]
-
 
 
 class ref_joint_pos_future(TrackObservation, namespace="hdmi"):
@@ -54,6 +43,7 @@ class ref_joint_action(TrackObservation, namespace="hdmi"):
         ) / self.action_scaling
         return ref_joint_action
 
+# root_diff_obs
 
 class ref_root_pos_future_b(TrackObservation, namespace="hdmi"):
     """
@@ -67,20 +57,9 @@ class ref_root_pos_future_b(TrackObservation, namespace="hdmi"):
             self.num_envs, num_future_steps, 3, device=self.device
         )
 
-    def update(self):
-        ref_root_pos_future_w = (
-            self.command_manager.ref_root_pos_future_w
-        )  
-        robot_root_link_pos_w = self.command_manager.robot_root_pos_w.unsqueeze(1)
-        robot_root_link_quat_w = self.command_manager.robot_root_quat_w.unsqueeze(1)
-
-        ref_root_pos_future_b = quat_apply_inverse(
-            robot_root_link_quat_w, ref_root_pos_future_w - robot_root_link_pos_w
-        )
-        self.ref_root_pos_future_b = ref_root_pos_future_b
 
     def compute(self):
-        return self.ref_root_pos_future_b.view(self.num_envs, -1)
+        return self.command_manager.ref_root_pos_future_b.view(self.num_envs, -1)
 
 
 class ref_root_ori_future_b(TrackObservation, namespace="hdmi"):
@@ -96,22 +75,18 @@ class ref_root_ori_future_b(TrackObservation, namespace="hdmi"):
         )
         self.noise_std = noise_std
 
-    def update(self):
-        ref_root_quat_future_w = self.command_manager.ref_root_quat_future_w
-        robot_root_link_quat_w = self.command_manager.robot_root_quat_w.unsqueeze(1)
-
-        ref_root_quat_future_b = quat_mul(
-            quat_conjugate(robot_root_link_quat_w).expand_as(ref_root_quat_future_w),
-            ref_root_quat_future_w,
-        )
-        ref_root_ori_future_b = matrix_from_quat(ref_root_quat_future_b)
-        if self.noise_std > 0.0:
-            ref_root_ori_future_b += torch.randn_like(ref_root_ori_future_b).clamp(-3.0, 3.0) * self.noise_std
-        self.ref_root_ori_future_b = ref_root_ori_future_b[:, :, :2, :]
 
     def compute(self):
-        return self.ref_root_ori_future_b.reshape(self.num_envs, -1)
+        ref_root_ori_future_b = self.command_manager.ref_root_ori_future_b_matrix
+        if self.noise_std > 0.0:
+            ref_root_ori_future_b = ref_root_ori_future_b.clone()
+            ref_root_ori_future_b += (
+                torch.randn_like(ref_root_ori_future_b).clamp(-3.0, 3.0) * self.noise_std
+            )
+        return ref_root_ori_future_b[:, :, :2, :].reshape(self.num_envs, -1)
 
+
+# motion_local_obs
 
 class ref_body_pos_future_local(TrackObservation, namespace="hdmi"):
     """
@@ -128,26 +103,8 @@ class ref_body_pos_future_local(TrackObservation, namespace="hdmi"):
             device=self.device,
         )
 
-    def update(self):
-        ref_body_pos_future_w = (
-            self.command_manager.ref_body_pos_future_w
-        )  # shape: [num_envs, num_future_steps, num_tracking_bodies, 3]
-        ref_anchor_link_pos_w = self.command_manager.ref_anchor_pos_w
-        ref_anchor_link_pos_w = ref_anchor_link_pos_w.unsqueeze(1).unsqueeze(2)
-        ref_anchor_link_quat_w = self.command_manager.ref_anchor_quat_w
-        ref_anchor_link_quat_w = ref_anchor_link_quat_w.unsqueeze(1).unsqueeze(2)
-
-        ref_anchor_link_pos_w = ref_anchor_link_pos_w.clone()
-        ref_anchor_link_pos_w[..., 2] = 0.0
-        ref_anchor_link_quat_w = yaw_quat(ref_anchor_link_quat_w)
-
-        ref_body_pos_future_local = quat_apply_inverse(
-            ref_anchor_link_quat_w, ref_body_pos_future_w - ref_anchor_link_pos_w
-        )
-        self.ref_body_pos_future_local = ref_body_pos_future_local
-
     def compute(self):
-        return self.ref_body_pos_future_local.view(self.num_envs, -1)
+        return self.command_manager.ref_body_pos_future_local.view(self.num_envs, -1)
 
 
 class ref_body_ori_future_local(TrackObservation, namespace="hdmi"):
@@ -166,24 +123,13 @@ class ref_body_ori_future_local(TrackObservation, namespace="hdmi"):
             device=self.device,
         )
 
-    def update(self):
-        ref_body_quat_future_w = self.command_manager.ref_body_quat_future_w
-        # shape: [num_envs, num_future_steps, num_tracking_bodies, 4]
-        ref_anchor_link_quat_w = self.command_manager.ref_anchor_quat_w
-        ref_anchor_link_quat_w = ref_anchor_link_quat_w.unsqueeze(1).unsqueeze(2)
-        # shape: [num_envs, 1, 1, 4]
-
-        ref_anchor_link_quat_w = yaw_quat(ref_anchor_link_quat_w)
-
-        ref_body_quat_future_local = quat_mul(
-            quat_conjugate(ref_anchor_link_quat_w).expand_as(ref_body_quat_future_w),
-            ref_body_quat_future_w,
-        )
-        self.ref_body_ori_future_local = matrix_from_quat(ref_body_quat_future_local)
 
     def compute(self):
-        return self.ref_body_ori_future_local[:, :, :, :2, :].reshape(self.num_envs, -1)
+        return self.command_manager.ref_body_ori_future_local_matrix[:, :, :, :2, :].reshape(
+            self.num_envs, -1
+        )
 
+# body_local_diff_obs
 
 class diff_body_pos_future_local(TrackObservation, namespace="hdmi"):
     """
@@ -200,45 +146,9 @@ class diff_body_pos_future_local(TrackObservation, namespace="hdmi"):
             device=self.device,
         )
 
-    def update(self):
-        ref_body_pos_future_w = (
-            self.command_manager.ref_body_pos_future_w
-        )  # shape: [num_envs, num_future_steps, num_tracking_bodies, 3]
-        ref_anchor_link_pos_w = self.command_manager.ref_anchor_pos_w[
-            :, None, None, :
-        ].clone()  # shape: [num_envs, 1, 1, 3]
-        ref_anchor_link_quat_w = self.command_manager.ref_anchor_quat_w[
-            :, None, None, :
-        ]  # shape: [num_envs, 1, 1, 4]
-
-        robot_body_link_pos_w = (
-            self.command_manager.robot_body_link_pos_w
-        )  # shape: [num_envs, num_tracking_bodies, 3]
-        robot_anchor_link_pos_w = self.command_manager.robot_anchor_pos_w[
-            :, None, :
-        ].clone()  # shape: [num_envs, 1, 3]
-        robot_anchor_link_quat_w = self.command_manager.robot_anchor_quat_w[
-            :, None, :
-        ]  # shape: [num_envs, 1, 4]
-
-        ref_anchor_link_pos_w[..., 2] = 0.0
-        robot_anchor_link_pos_w[..., 2] = 0.0
-        ref_anchor_link_quat_w = yaw_quat(ref_anchor_link_quat_w)
-        robot_anchor_link_quat_w = yaw_quat(robot_anchor_link_quat_w)
-
-        ref_body_pos_future_local = quat_apply_inverse(
-            ref_anchor_link_quat_w, ref_body_pos_future_w - ref_anchor_link_pos_w
-        )
-        robot_body_pos_local = quat_apply_inverse(
-            robot_anchor_link_quat_w, robot_body_link_pos_w - robot_anchor_link_pos_w
-        )
-
-        self.diff_body_pos_future_local = (
-            ref_body_pos_future_local - robot_body_pos_local.unsqueeze(1)
-        )
 
     def compute(self):
-        return self.diff_body_pos_future_local.view(self.num_envs, -1)
+        return self.command_manager.diff_body_pos_future_local.view(self.num_envs, -1)
 
 
 class diff_body_lin_vel_future_local(TrackObservation, namespace="hdmi"):
@@ -256,36 +166,9 @@ class diff_body_lin_vel_future_local(TrackObservation, namespace="hdmi"):
             device=self.device,
         )
 
-    def update(self):
-        ref_body_lin_vel_future_w = (
-            self.command_manager.ref_body_lin_vel_future_w
-        )  # shape: [num_envs, num_future_steps, num_tracking_bodies, 3]
-        ref_anchor_link_quat_w = self.command_manager.ref_anchor_quat_w[
-            :, None, None, :
-        ]  # shape: [num_envs, 1, 1, 4]
-        robot_body_link_lin_vel_w = (
-            self.command_manager.robot_body_com_lin_vel_w
-        )  # shape: [num_envs, num_tracking_bodies, 3]
-        robot_anchor_link_quat_w = self.command_manager.robot_anchor_quat_w[
-            :, None, :
-        ]  # shape: [num_envs, 1, 4]
-
-        ref_anchor_link_quat_w = yaw_quat(ref_anchor_link_quat_w)
-        robot_anchor_link_quat_w = yaw_quat(robot_anchor_link_quat_w)
-
-        ref_body_lin_vel_future_local = quat_apply_inverse(
-            ref_anchor_link_quat_w, ref_body_lin_vel_future_w
-        )
-        robot_body_lin_vel_local = quat_apply_inverse(
-            robot_anchor_link_quat_w, robot_body_link_lin_vel_w
-        )
-
-        self.diff_body_lin_vel_future_local = (
-            ref_body_lin_vel_future_local - robot_body_lin_vel_local.unsqueeze(1)
-        )
 
     def compute(self):
-        return self.diff_body_lin_vel_future_local.view(self.num_envs, -1)
+        return self.command_manager.diff_body_lin_vel_future_local.view(self.num_envs, -1)
 
 
 class diff_body_ori_future_local(TrackObservation, namespace="hdmi"):
@@ -304,39 +187,9 @@ class diff_body_ori_future_local(TrackObservation, namespace="hdmi"):
             device=self.device,
         )
 
-    def update(self):
-        ref_body_quat_future_w = (
-            self.command_manager.ref_body_quat_future_w
-        )  # shape: [num_envs, num_future_steps, num_tracking_bodies, 4]
-        ref_anchor_link_quat_w = self.command_manager.ref_anchor_quat_w[
-            :, None, None, :
-        ]  # shape: [num_envs, 1, 1, 4]
-        robot_body_link_quat_w = (
-            self.command_manager.robot_body_link_quat_w
-        )  # shape: [num_envs, num_tracking_bodies, 4]
-        robot_anchor_link_quat_w = self.command_manager.robot_anchor_quat_w[
-            :, None, :
-        ]  # shape: [num_envs, 1, 4]
-
-        ref_anchor_link_quat_w = yaw_quat(ref_anchor_link_quat_w)
-        robot_anchor_link_quat_w = yaw_quat(robot_anchor_link_quat_w)
-
-        ref_body_quat_future_local = quat_mul(
-            quat_conjugate(ref_anchor_link_quat_w).expand_as(ref_body_quat_future_w),
-            ref_body_quat_future_w,
-        )
-        robot_body_quat_local = quat_mul(
-            quat_conjugate(robot_anchor_link_quat_w).expand_as(robot_body_link_quat_w),
-            robot_body_link_quat_w,
-        ).unsqueeze(1)
-        diff_body_quat_future = quat_mul(
-            quat_conjugate(robot_body_quat_local).expand_as(ref_body_quat_future_w),
-            ref_body_quat_future_local,
-        )
-        self.diff_body_ori_future_local = matrix_from_quat(diff_body_quat_future)
 
     def compute(self):
-        return self.diff_body_ori_future_local[:, :, :, :2, :].reshape(
+        return self.command_manager.diff_body_ori_future_local_matrix[:, :, :, :2, :].reshape(
             self.num_envs, -1
         )
 
@@ -356,38 +209,11 @@ class diff_body_ang_vel_future_local(TrackObservation, namespace="hdmi"):
             device=self.device,
         )
 
-    def update(self):
-        ref_body_ang_vel_future_w = (
-            self.command_manager.ref_body_ang_vel_future_w
-        )  # shape: [num_envs, num_future_steps, num_tracking_bodies, 3]
-        ref_anchor_link_quat_w = self.command_manager.ref_anchor_quat_w[
-            :, None, None, :
-        ]  # shape: [num_envs, 1, 1, 4]
-        robot_body_link_ang_vel_w = (
-            self.command_manager.robot_body_com_ang_vel_w
-        )  # shape: [num_envs, num_tracking_bodies, 3]
-        robot_anchor_link_quat_w = self.command_manager.robot_anchor_quat_w[
-            :, None, :
-        ]  # shape: [num_envs, 1, 4]
-
-        ref_anchor_link_quat_w = yaw_quat(ref_anchor_link_quat_w)
-        robot_anchor_link_quat_w = yaw_quat(robot_anchor_link_quat_w)
-
-        ref_body_ang_vel_future_local = quat_apply_inverse(
-            ref_anchor_link_quat_w, ref_body_ang_vel_future_w
-        )
-        robot_body_ang_vel_local = quat_apply_inverse(
-            robot_anchor_link_quat_w, robot_body_link_ang_vel_w
-        )
-
-        self.diff_body_ang_vel_future_local = (
-            ref_body_ang_vel_future_local - robot_body_ang_vel_local.unsqueeze(1)
-        )
 
     def compute(self):
-        return self.diff_body_ang_vel_future_local.view(self.num_envs, -1)
+        return self.command_manager.diff_body_ang_vel_future_local.view(self.num_envs, -1)
 
 
 class ref_motion_phase(TrackObservation, namespace="hdmi"):
     def compute(self):
-        return (self.command_manager.t / self.command_manager.motion_len).unsqueeze(1)
+        return (self.command_manager.obs_motion_t / self.command_manager.motion_len).unsqueeze(1)

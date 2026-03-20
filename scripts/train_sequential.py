@@ -69,40 +69,15 @@ def run_training_stage(
     ]
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
-    run = None
-    if aa.is_main_process():
-        run = wandb.init(
-            job_type=cfg.wandb.job_type,
-            project=cfg.wandb.project,
-            mode=cfg.wandb.mode,
-            tags=cfg.wandb.tags,
-        )
-        run.config.update(OmegaConf.to_container(cfg))
-        run.config["world_size"] = aa.get_world_size()
-
-        default_run_name = (
-            f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-        )
-        run_idx = run.name.split("-")[-1]
-        run.name = f"{run_idx}-{default_run_name}"
-        setproctitle(run.name)
-
-        run_dir = Path(run.dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        cfg_save_path = run_dir / "cfg.yaml"
-        OmegaConf.save(cfg, cfg_save_path)
-        run.save(str(cfg_save_path), policy="now")
-        run.save(str(run_dir / "config.yaml"), policy="now")
-
     def save(policy, checkpoint_name: str, *, upload_to_wandb: bool = True):
-        if not aa.is_main_process():
-            return None
         assert run is not None
         run_dir = Path(run.dir)
         ckpt_path = run_dir / f"{checkpoint_name}.pt"
         state_dict = OrderedDict()
         state_dict["wandb"] = {"name": run.name, "id": run.id}
         state_dict["policy"] = policy.state_dict()
+        state_dict["env"] = env.state_dict()
+        state_dict["cfg"] = cfg
 
         torch.save(state_dict, ckpt_path)
         if upload_to_wandb:
@@ -148,6 +123,30 @@ def run_training_stage(
         stages = policy.cfg.stages
     else:
         stages = ("",)
+
+    if aa.is_main_process():
+        run = wandb.init(
+            job_type=cfg.wandb.job_type,
+            project=cfg.wandb.project,
+            mode=cfg.wandb.mode,
+            tags=cfg.wandb.tags,
+        )
+        run.config.update(OmegaConf.to_container(cfg))
+        run.config["world_size"] = aa.get_world_size()
+
+        default_run_name = (
+            f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+        )
+        run_idx = run.name.split("-")[-1]
+        run.name = f"{run_idx}-{default_run_name}"
+        setproctitle(run.name)
+
+        run_dir = Path(run.dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cfg_save_path = run_dir / "cfg.yaml"
+        OmegaConf.save(cfg, cfg_save_path)
+        run.save(str(cfg_save_path), policy="now")
+        run.save(str(run_dir / "config.yaml"), policy="now")
 
     for stage in stages:
         policy.on_stage_start(stage)
@@ -234,25 +233,34 @@ def run_training_stage(
                     print(f"Latest checkpoint: {ckpt_path}")
 
             if aa.is_main_process() and run is not None:
+                # ScopedTimer.print_summary(clear=True)
+                # print(
+                #     OmegaConf.to_yaml(
+                #         {k: v for k, v in info.items() if isinstance(v, (float, int))}
+                #     )
+                # )
                 run.log(info)
 
     run_path = None
     if aa.is_main_process() and run is not None:
         final_ckpt = save(policy, "checkpoint_final")
-        policy_eval = policy.get_rollout_policy("eval")
-        info, _, _ = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
-        info["env_frames"] = env_frames
-        run.log(info)
-
         run_path = f"{run.entity}/{run.project}/{run.id}"
         print(f"Final checkpoint: {final_ckpt}")
         print(f"Run path: {run_path}")
         wandb.finish()
 
+    if aa.is_distributed() and torch.distributed.is_available() and torch.distributed.is_initialized():
+        run_path_payload = [run_path]
+        torch.distributed.broadcast_object_list(run_path_payload, src=0)
+        run_path = run_path_payload[0]
+
     if return_queue is not None:
         return_queue.put(run_path)
         return_queue.close()
         return_queue.join_thread()
+
+    if aa.is_distributed() and torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
     return
 
 
