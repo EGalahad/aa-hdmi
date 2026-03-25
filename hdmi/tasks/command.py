@@ -86,8 +86,11 @@ def _compute_current_tracking_state(
     robot_anchor_pos_w_z0 = robot_anchor_pos_w.clone()
     robot_anchor_pos_w_z0[..., 2] = 0.0
 
-    ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
-    robot_anchor_yaw_quat_w = yaw_quat(robot_anchor_quat_w)
+    # ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
+    # robot_anchor_yaw_quat_w = yaw_quat(robot_anchor_quat_w)
+    ref_anchor_yaw_quat_w = ref_anchor_quat_w
+    robot_anchor_yaw_quat_w = robot_anchor_quat_w
+    
     ref_anchor_yaw_quat_conj_w = quat_conjugate(ref_anchor_yaw_quat_w)
     robot_anchor_yaw_quat_conj_w = quat_conjugate(robot_anchor_yaw_quat_w)
 
@@ -174,7 +177,8 @@ def _compute_motion_local_obs(
     ref_anchor_pos_w_z0[..., 2] = 0.0
     ref_anchor_pos_w_z0_future = ref_anchor_pos_w_z0[:, None, None, :]
 
-    ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
+    # ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
+    ref_anchor_yaw_quat_w = ref_anchor_quat_w
     ref_anchor_yaw_quat_w_future = ref_anchor_yaw_quat_w[:, None, None, :]
     ref_anchor_yaw_quat_conj_w_future = quat_conjugate(ref_anchor_yaw_quat_w_future)
 
@@ -213,8 +217,10 @@ def _compute_body_local_diff_obs(
     ref_anchor_pos_w_z0_future = ref_anchor_pos_w_z0[:, None, None, :]
     robot_anchor_pos_w_z0_body = robot_anchor_pos_w_z0[:, None, :]
 
-    ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
-    robot_anchor_yaw_quat_w = yaw_quat(robot_anchor_quat_w)
+    # ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
+    # robot_anchor_yaw_quat_w = yaw_quat(robot_anchor_quat_w)
+    ref_anchor_yaw_quat_w = ref_anchor_quat_w
+    robot_anchor_yaw_quat_w = robot_anchor_quat_w
     ref_anchor_yaw_quat_w_future = ref_anchor_yaw_quat_w[:, None, None, :]
     robot_anchor_yaw_quat_w_body = robot_anchor_yaw_quat_w[:, None, :]
     ref_anchor_yaw_quat_conj_w_future = quat_conjugate(ref_anchor_yaw_quat_w_future)
@@ -308,7 +314,6 @@ class RobotTracking(Command, namespace="hdmi"):
         future_steps: List[int] = [1, 2, 8, 16],
         anchor_body_name: str = "torso_link",
         call_update: bool = True,
-        sample_motion: bool = False,
         replay_motion: bool = False,
         record_motion: bool = False,
         rewind_prob: float = 0.0,
@@ -404,7 +409,6 @@ class RobotTracking(Command, namespace="hdmi"):
         assert self.rewind_steps_range[1] > self.rewind_steps_range[0]
 
         self.first_sample_motion = True
-        self.sample_motion = sample_motion
         self.replay_motion = replay_motion
         self.record_motion = record_motion
 
@@ -435,44 +439,78 @@ class RobotTracking(Command, namespace="hdmi"):
         self._ghost_model = None
 
     def _sample_motions(self, env_ids: torch.Tensor) -> None:
-        if self.sample_motion or self.first_sample_motion:
-            # sample motion id for each env
-            motion_ids = torch.randint(
-                0, self.dataset.num_motions, size=(len(env_ids),), device=self.device
-            )
-            for i, motion_id in enumerate(motion_ids):
-                # print(f"Sampling motion {self.dataset.motion_paths[motion_id.item()]} for env {env_ids[i].item()}:")
-                pass
-            self.motion_ids[env_ids] = motion_ids
-            self.motion_len[env_ids] = motion_len = self.dataset.lengths[motion_ids]
-            self.motion_starts[env_ids] = self.dataset.starts[motion_ids]
-            self.motion_ends[env_ids] = self.dataset.ends[motion_ids]
-            self.first_sample_motion = False
-        else:
-            motion_len = self.motion_len[env_ids]
-
-        max_len = motion_len - self.future_steps[-1]
-        start_phase = torch.rand(len(env_ids), device=self.device)
-        start_t = (start_phase * max_len).long()
-
-        terminated_t = self.t[env_ids]
-        rewind_mask = torch.rand(len(env_ids), device=self.device) < self.rewind_prob
-        rewind_steps = torch.randint(
-            *self.rewind_steps_range, (len(env_ids),), device=self.device
-        )
-        rewind_t = torch.clamp(terminated_t - rewind_steps, min=0)
-        start_t = torch.where(rewind_mask, rewind_t, start_t)
-
-        if not (self.env.training or self.record_motion):
-            start_t.fill_(0)
+        num_resets = len(env_ids)
 
         if self.replay_motion:
+            if self.first_sample_motion:
+                sampled_frame_ids = torch.randint(
+                    0, self.dataset.num_steps, size=(num_resets,), device=self.device
+                )
+                motion_ids = self.dataset.data.motion_id[sampled_frame_ids].long()
+                self.motion_ids[env_ids] = motion_ids
+                self.motion_len[env_ids] = self.dataset.lengths[motion_ids]
+                self.motion_starts[env_ids] = self.dataset.starts[motion_ids]
+                self.motion_ends[env_ids] = self.dataset.ends[motion_ids]
+                self.first_sample_motion = False
+
+            motion_len = self.motion_len[env_ids]
             self.replay_motion_t[env_ids] = (
                 self.replay_motion_t[env_ids] + 1
             ) % motion_len
-            start_t = self.replay_motion_t[env_ids]
+            self.t[env_ids] = self.replay_motion_t[env_ids]
+            return
 
+        if not self.env.training and not self.record_motion:
+            if self.first_sample_motion:
+                sampled_frame_ids = torch.randint(
+                    0, self.dataset.num_steps, size=(num_resets,), device=self.device
+                )
+                motion_ids = self.dataset.data.motion_id[sampled_frame_ids].long()
+                self.motion_ids[env_ids] = motion_ids
+                self.motion_len[env_ids] = self.dataset.lengths[motion_ids]
+                self.motion_starts[env_ids] = self.dataset.starts[motion_ids]
+                self.motion_ends[env_ids] = self.dataset.ends[motion_ids]
+                self.first_sample_motion = False
+
+            self.t[env_ids] = 0
+            return
+
+        # Sample uniformly on the flattened dataset timeline, then recover the
+        # owning motion and local step from that frame.
+        sampled_frame_ids = torch.randint(
+            0, self.dataset.num_steps, size=(num_resets,), device=self.device
+        )
+        sampled_motion_ids = self.dataset.data.motion_id[sampled_frame_ids].long()
+        sampled_start_t = self.dataset.data.step[sampled_frame_ids].long()
+        sampled_motion_len = self.dataset.lengths[sampled_motion_ids]
+        sampled_motion_starts = self.dataset.starts[sampled_motion_ids]
+        sampled_motion_ends = self.dataset.ends[sampled_motion_ids]
+
+        terminated_t = self.t[env_ids]
+        rewind_mask = torch.rand(num_resets, device=self.device) < self.rewind_prob
+        if self.first_sample_motion:
+            rewind_mask.fill_(False)
+        rewind_steps = torch.randint(
+            *self.rewind_steps_range, (num_resets,), device=self.device
+        )
+        rewind_t = torch.clamp(terminated_t - rewind_steps, min=0)
+
+        motion_ids = torch.where(rewind_mask, self.motion_ids[env_ids], sampled_motion_ids)
+        motion_len = torch.where(rewind_mask, self.motion_len[env_ids], sampled_motion_len)
+        motion_starts = torch.where(
+            rewind_mask, self.motion_starts[env_ids], sampled_motion_starts
+        )
+        motion_ends = torch.where(
+            rewind_mask, self.motion_ends[env_ids], sampled_motion_ends
+        )
+        start_t = torch.where(rewind_mask, rewind_t, sampled_start_t)
+
+        self.motion_ids[env_ids] = motion_ids
+        self.motion_len[env_ids] = motion_len
+        self.motion_starts[env_ids] = motion_starts
+        self.motion_ends[env_ids] = motion_ends
         self.t[env_ids] = start_t
+        self.first_sample_motion = False
 
     def sample_init(self, env_ids: torch.Tensor) -> None:
         self._sample_motions(env_ids)
@@ -755,10 +793,10 @@ class RobotTracking(Command, namespace="hdmi"):
         self.ref_anchor_quat_w = self.ref_anchor_quat_future_w[:, self.reward_current_step_index]
 
         (
-            ref_body_pos_local,
-            ref_body_quat_local,
-            robot_body_pos_local,
-            robot_body_quat_local,
+            self.ref_body_pos_local,
+            self.ref_body_quat_local,
+            self.robot_body_pos_local,
+            self.robot_body_quat_local,
         ) = _compute_current_tracking_state(
             self.ref_anchor_pos_w,
             self.ref_anchor_quat_w,
@@ -784,14 +822,14 @@ class RobotTracking(Command, namespace="hdmi"):
             self.ref_body_quat_w,
             self.ref_body_lin_vel_w,
             self.ref_body_ang_vel_w,
-            ref_body_pos_local,
-            ref_body_quat_local,
+            self.ref_body_pos_local,
+            self.ref_body_quat_local,
             self.robot_body_link_pos_w,
             self.robot_body_link_quat_w,
             self.robot_body_lin_vel_w,
             self.robot_body_ang_vel_w,
-            robot_body_pos_local,
-            robot_body_quat_local,
+            self.robot_body_pos_local,
+            self.robot_body_quat_local,
             self.ref_joint_pos,
             self.ref_joint_vel,
             self.robot_joint_pos,

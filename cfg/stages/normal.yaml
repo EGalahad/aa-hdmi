@@ -12,5 +12,4 @@ stages:
   - name: finetune
     overrides:
       - +exp=finetune
-      - +task/patches=temporal_align
     load_checkpoint_from_previous: true

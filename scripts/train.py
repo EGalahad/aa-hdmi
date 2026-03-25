@@ -128,6 +128,7 @@ def main(cfg: DictConfig):
             project=cfg.wandb.project,
             mode=cfg.wandb.mode,
             tags=cfg.wandb.tags,
+            id=cfg.wandb.get("id", None),
         )
         run.config.update(OmegaConf.to_container(cfg))
         run.config["world_size"] = aa.get_world_size()
@@ -135,8 +136,8 @@ def main(cfg: DictConfig):
         default_run_name = (
             f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
         )
-        run_idx = run.name.split("-")[-1]
-        run.name = f"{run_idx}-{default_run_name}"
+        wandb_id = run.name.split("-")[-1]
+        run.name = f"{wandb_id}-{default_run_name}"
         setproctitle(run.name)
 
         run_dir = Path(run.dir)

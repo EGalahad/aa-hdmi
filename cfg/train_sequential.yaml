@@ -1,6 +1,6 @@
 hydra:
   run:
-    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-${task.name}-${algo.name}
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-train-sequential
   job:
     chdir: true
 
@@ -24,11 +24,17 @@ checkpoint_path: null
 export_policy: false
 
 camera_follow: true
+nproc_per_node: 8
+script: projects/hdmi/scripts/train.py
+random_suffix_length: 8
+tag: ${task.name}
 
 wandb:
-  name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
-  job_type: train
+  entity: null
   project: ${oc.select:task.project,active_adaptation}
+  name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
+  id: null
+  job_type: train
   mode: online
   tags: []
 

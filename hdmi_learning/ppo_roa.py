@@ -107,6 +107,7 @@ class PPOConfig:
 
     phase: str = "train"
     vecnorm: bool = True
+    freeze_vecnorm: bool = False
     checkpoint_path: Union[str, None] = None
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, OBS_PRIV_KEY)
 
@@ -448,7 +449,7 @@ class PPOROA(PPOBase):
             out_keys = ["sample_log_prob", ACTION_KEY] + self.dist_keys
 
         rollout_policy = Seq(*modules, selected_out_keys=out_keys)
-        if self.cfg.phase == "adapt":
+        if self.cfg.freeze_vecnorm:
             rollout_policy.forward = VecNorm.freeze()(rollout_policy.forward)
         return rollout_policy
 

@@ -35,6 +35,7 @@ wandb:
   job_type: train
   project: ${oc.select:task.project,active_adaptation}
   mode: online # set to 'disabled' when debugging locally
+  id: null
   tags: []
 
 defaults:

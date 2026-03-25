@@ -70,8 +70,6 @@ command:
   root_body_name: "pelvis"
   anchor_body_name: "torso_link"
 
-  sample_motion: false
-
   # TODO: put this into randomization reset callbacks
   pose_range:
     x: [-0.05, 0.05]
@@ -173,7 +171,7 @@ reward:
       _target_: hdmi.keypoint_pos_tracking_aligned
       body_names: ["torso_link"]
       enabled: false
-      look_ahead: 100
+      look_ahead: 50
       weight: 0.5
       sigma: 0.3
 
@@ -384,7 +382,8 @@ termination:
     _target_: cum_body_pos_error_aligned
     body_names: "torso_link"
     min_steps: 25
-    threshold: 0.4
+    threshold: 0.3
+    look_ahead: 50
     enabled: false
 
   root_pos_error:
@@ -401,22 +400,22 @@ termination:
   root_linvel_error:
     _target_: cum_body_lin_vel_error
     body_names: "torso_link"
-    min_steps: 50
+    min_steps: 25
     threshold: 1.0
   root_angvel_error:
     _target_: cum_body_ang_vel_error
     body_names: "torso_link"
-    min_steps: 50
+    min_steps: 25
     threshold: 2.5
   
   body_pos_error:
     _target_: cum_body_pos_error_local
     body_names: [".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
-    min_steps: 50
+    min_steps: 25
     threshold: 0.4
   body_ori_error:
     _target_: cum_body_ori_error_local
     body_names: [".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
-    min_steps: 50
-    threshold: 1.2
+    min_steps: 25
+    threshold: 0.8
   

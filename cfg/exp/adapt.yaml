@@ -6,3 +6,6 @@ defaults:
 total_iters: 1000
 checkpoint_interval: 500
 upload_interval: 500
+
+algo:
+  freeze_vecnorm: true

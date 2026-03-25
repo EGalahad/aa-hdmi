@@ -4,10 +4,11 @@ defaults:
   - override /algo: ppo_roa_train
 
 total_iters: 5000
-checkpoint_interval: 500
-upload_interval: 500
+checkpoint_interval: 1000
+upload_interval: 1000
 
 algo:
+  freeze_vecnorm: false
   entropy_coef_start: 0.012
   entropy_coef_end: 0.002
   entropy_decay_start: 2000
