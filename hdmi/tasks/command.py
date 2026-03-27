@@ -32,6 +32,13 @@ from tensordict import TensorDict
 
 quat_apply_inverse = batchify(quat_apply_inverse)
 
+DEBUG_TEMPORAL_ALIGN_DRAW = True
+DEBUG_TEMPORAL_ALIGN_TARGET_Z_OFFSET = 0.02
+DEBUG_TEMPORAL_ALIGN_CURRENT_Z_OFFSET = 0.0
+DEBUG_TEMPORAL_ALIGN_TARGET_ALPHA = 1.0
+DEBUG_TEMPORAL_ALIGN_CURRENT_ALPHA = 1.0
+DEBUG_TEMPORAL_ALIGN_AXIS_SCALE = 4.0
+DEBUG_TEMPORAL_ALIGN_AXIS_RADIUS = 0.15
 
 _DESIRED_FRAME_COLORS = (
     (0.9, 0.3, 0.3, 0.9),
@@ -313,6 +320,7 @@ class RobotTracking(Command, namespace="hdmi"):
         # observation parameters
         future_steps: List[int] = [1, 2, 8, 16],
         anchor_body_name: str = "torso_link",
+        look_ahead: List[int] | int = 50,
         call_update: bool = True,
         replay_motion: bool = False,
         record_motion: bool = False,
@@ -369,10 +377,28 @@ class RobotTracking(Command, namespace="hdmi"):
         self.anchor_body_name = anchor_body_name
         self.anchor_body_idx_motion = self.dataset.body_names.index(anchor_body_name)
         self.anchor_body_idx_asset = self.asset.body_names.index(anchor_body_name)
+        if isinstance(look_ahead, int):
+            look_ahead = [look_ahead]
+        self.look_ahead = sorted(set(int(step) for step in look_ahead))
+        assert self.look_ahead, "look_ahead must not be empty"
+        assert self.look_ahead[0] > 0, "look_ahead must be positive"
+        self.num_look_ahead = len(self.look_ahead)
+        self.max_look_ahead = max(self.look_ahead)
 
         with torch.device(self.device):
             self.is_standing_env = torch.zeros(self.num_envs, 1, dtype=bool)
             self.future_steps = torch.tensor(future_steps)
+            self.look_ahead_row_idx = torch.arange(self.num_look_ahead, dtype=torch.long)
+            self.look_ahead_time_idx = torch.tensor(
+                [step - 1 for step in self.look_ahead], dtype=torch.long
+            )
+            self.look_ahead_indices = torch.arange(self.max_look_ahead, dtype=torch.long)
+            self.target_anchor_pos_buf = torch.zeros(
+                self.num_envs,
+                self.num_look_ahead,
+                self.max_look_ahead,
+                3,
+            )
 
             self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long)
             self.motion_len = torch.zeros(self.num_envs, dtype=torch.long)
@@ -428,6 +454,7 @@ class RobotTracking(Command, namespace="hdmi"):
         if call_update:
             self._read_current_robot_state()
             self._refresh_future_buffers()
+            self._reset_target_anchor_pos_buf(self.all_env_ids)
             self.update()
             if self.record_motion:
                 self.motion_frames = []
@@ -593,6 +620,9 @@ class RobotTracking(Command, namespace="hdmi"):
                 self._save_motion()
                 self.motion_frames = []
 
+    def reset(self, env_ids: torch.Tensor) -> None:
+        self._reset_target_anchor_pos_buf(env_ids)
+
     def _write_root_com_velocity(
         self, root_com_velocity: torch.Tensor, env_ids: torch.Tensor
     ) -> None:
@@ -756,6 +786,42 @@ class RobotTracking(Command, namespace="hdmi"):
             self.robot_body_link_quat_w,
         )
 
+    def _reset_target_anchor_pos_buf(self, env_ids: torch.Tensor) -> None:
+        future_ref_motion = self.dataset.get_slice(
+            self.motion_ids[env_ids],
+            self.t[env_ids],
+            steps=self.look_ahead_indices,
+        )
+        ref_pos = future_ref_motion.body_pos_w[:, :, self.anchor_body_idx_motion]
+        ref_pos = ref_pos + self.env.scene.env_origins[env_ids].unsqueeze(1)
+        self.target_anchor_pos_buf[env_ids] = ref_pos.unsqueeze(1)
+
+    def _update_target_anchor_pos_buf(self) -> None:
+        look_ahead_motion = self.dataset.get_slice(
+            self.motion_ids,
+            self.t,
+            steps=self.look_ahead_time_idx,
+        )
+        ref_pos_look_ahead = (
+            look_ahead_motion.body_pos_w[:, :, self.anchor_body_idx_motion]
+            + self.env.scene.env_origins[:, None, :]
+        )
+
+        ref_pos_current = self.ref_anchor_pos_w.clone()
+        robot_pos_current = self.robot_anchor_pos_w.clone()
+        ref_pos_current[:, 2] = 0.0
+        robot_pos_current[:, 2] = 0.0
+
+        aligned_anchor_pos_w = (
+            ref_pos_look_ahead
+            - ref_pos_current[:, None, :]
+            + robot_pos_current[:, None, :]
+        )
+        self.target_anchor_pos_buf[:] = self.target_anchor_pos_buf.roll(-1, dims=2)
+        self.target_anchor_pos_buf[:, self.look_ahead_row_idx, self.look_ahead_time_idx] = (
+            aligned_anchor_pos_w
+        )
+
     def step(self):
         self._refresh_future_buffers()
         self.t += 1
@@ -791,6 +857,7 @@ class RobotTracking(Command, namespace="hdmi"):
         self.ref_joint_vel = self.ref_joint_vel_future_[:, self.reward_current_step_index]
         self.ref_anchor_pos_w = self.ref_anchor_pos_future_w[:, self.reward_current_step_index]
         self.ref_anchor_quat_w = self.ref_anchor_quat_future_w[:, self.reward_current_step_index]
+        self._update_target_anchor_pos_buf()
 
         (
             self.ref_body_pos_local,
@@ -853,6 +920,51 @@ class RobotTracking(Command, namespace="hdmi"):
         scene: "ViserMujocoScene" | None = getattr(viewer, "scene", None)
         if scene is None:
             return
+
+        if (
+            self.env.backend == "mjlab"
+            and DEBUG_TEMPORAL_ALIGN_DRAW
+            and hasattr(self, "target_anchor_pos_buf")
+        ):
+            if scene.show_all_envs or self.num_envs == 1:
+                temporal_env_ids = range(self.num_envs)
+            else:
+                temporal_env_ids = [int(scene.env_idx)]
+
+            env_ids_tensor = torch.tensor(
+                list(temporal_env_ids), device=self.device, dtype=torch.long
+            )
+            target_anchor_pos = self.target_anchor_pos_buf[
+                env_ids_tensor, :, 0
+            ].mean(dim=1)
+            target_anchor_pos[:, 2] += DEBUG_TEMPORAL_ALIGN_TARGET_Z_OFFSET
+            target_anchor_mat = matrix_from_quat(self.ref_anchor_quat_w[env_ids_tensor])
+
+            robot_anchor_pos = self.robot_anchor_pos_w[env_ids_tensor].clone()
+            robot_anchor_pos[:, 2] += DEBUG_TEMPORAL_ALIGN_CURRENT_Z_OFFSET
+            robot_anchor_mat = matrix_from_quat(self.robot_anchor_quat_w[env_ids_tensor])
+
+            target_anchor_pos = target_anchor_pos.detach().cpu()
+            target_anchor_mat = target_anchor_mat.detach().cpu()
+            robot_anchor_pos = robot_anchor_pos.detach().cpu()
+            robot_anchor_mat = robot_anchor_mat.detach().cpu()
+
+            for env_idx in range(len(env_ids_tensor)):
+                scene.add_frame(
+                    target_anchor_pos[env_idx],
+                    target_anchor_mat[env_idx],
+                    scale=scene.meansize * DEBUG_TEMPORAL_ALIGN_AXIS_SCALE,
+                    axis_radius=scene.meansize * DEBUG_TEMPORAL_ALIGN_AXIS_RADIUS,
+                    alpha=DEBUG_TEMPORAL_ALIGN_TARGET_ALPHA,
+                    axis_colors=_DESIRED_FRAME_COLORS,
+                )
+                scene.add_frame(
+                    robot_anchor_pos[env_idx],
+                    robot_anchor_mat[env_idx],
+                    scale=scene.meansize * DEBUG_TEMPORAL_ALIGN_AXIS_SCALE,
+                    axis_radius=scene.meansize * DEBUG_TEMPORAL_ALIGN_AXIS_RADIUS,
+                    alpha=DEBUG_TEMPORAL_ALIGN_CURRENT_ALPHA,
+                )
 
         if self.viz.mode == "ghost":
             if self._ghost_model is None:

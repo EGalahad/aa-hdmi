@@ -80,14 +80,13 @@ def main(cfg: DictConfig):
         torch.save(state_dict, ckpt_path)
         if upload_to_wandb:
             run.save(str(ckpt_path), policy="now", base_path=run.dir)
-        
+
         latest_link = run_dir / "checkpoint_latest.pt"
         if latest_link.exists() or latest_link.is_symlink():
             latest_link.unlink()
         latest_link.symlink_to(ckpt_path.name)
         logging.info(
-            f"Saved checkpoint to {ckpt_path}"
-            + (" (wandb)" if upload_to_wandb else "")
+            f"Saved checkpoint to {ckpt_path}" + (" (wandb)" if upload_to_wandb else "")
         )
         return str(ckpt_path)
 
@@ -151,14 +150,18 @@ def main(cfg: DictConfig):
         policy.on_stage_start(stage)
         rollout_policy = policy.get_rollout_policy("train")
 
-        with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM), VecNorm.freeze():
+        with (
+            torch.inference_mode(),
+            set_exploration_type(ExplorationType.RANDOM),
+            VecNorm.freeze(),
+        ):
             tmp_carry = rollout_policy(carry.clone(True))
             tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
             tmp_td["next"] = tmp_td["next"].select(*next_saved_keys, strict=False)
 
-        data_buf: TensorDict = tmp_td.unsqueeze(-1).expand(
-            env.num_envs, cfg.algo.train_every
-        ).clone()
+        data_buf: TensorDict = (
+            tmp_td.unsqueeze(-1).expand(env.num_envs, cfg.algo.train_every).clone()
+        )
 
         progress = range(total_iters)
         if aa.is_main_process():
@@ -168,7 +171,10 @@ def main(cfg: DictConfig):
         for i in progress:
             rollout_start = time.perf_counter()
             with ScopedTimer("rollout") as rollout_timer:
-                with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
+                with (
+                    torch.inference_mode(),
+                    set_exploration_type(ExplorationType.RANDOM),
+                ):
                     if hasattr(env, "set_progress"):
                         env.set_progress(start_iter + i)
                     for step in range(cfg.algo.train_every):
@@ -179,16 +185,14 @@ def main(cfg: DictConfig):
 
                     policy.critic(data_buf)
                     values = data_buf["state_value"]
+                    last_value = policy.compute_value(carry.copy())["state_value"]
+                    next_values = torch.cat(
+                        [values[:, 1:], last_value.unsqueeze(1)], dim=1
+                    )
                     data_buf["next", "state_value"] = torch.where(
                         data_buf["next", "done"],
                         values,
-                        torch.cat(
-                            [
-                                values[:, 1:],
-                                policy.compute_value(carry.copy())["state_value"].unsqueeze(1),
-                            ],
-                            dim=1,
-                        ),
+                        next_values,
                     )
 
             rollout_time = rollout_timer.last_time
@@ -225,9 +229,7 @@ def main(cfg: DictConfig):
                 checkpoint_name = (
                     f"checkpoint_{i}" if should_upload else "checkpoint_temp"
                 )
-                ckpt_path = save(
-                    policy, checkpoint_name, upload_to_wandb=should_upload
-                )
+                ckpt_path = save(policy, checkpoint_name, upload_to_wandb=should_upload)
                 if ckpt_path is not None:
                     print(f"Latest checkpoint: {ckpt_path}")
 

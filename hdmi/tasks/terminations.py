@@ -79,9 +79,9 @@ class cum_body_z_error(_cum_error_mixin, RobotTrackTermination):
 
     def update(self):
         body_pos_error = (
-            self.command_manager.ref_body_pos_w[:, self.body_indices_tracking, 2]
-            - self.command_manager.robot_body_link_pos_w[:, self.body_indices_tracking, 2]
-        ).abs()
+            self.command_manager.ref_body_pos_w
+            - self.command_manager.robot_body_link_pos_w
+        )[:, self.body_indices_tracking, 2].abs()
         self.error[:] = body_pos_error.max(dim=1).values
         super().update()
 
@@ -156,6 +156,15 @@ class cum_body_pos_error_local(_cum_error_mixin, RobotTrackTermination):
         body_pos_error = self.command_manager.body_pos_error_local[:, self.body_indices_tracking]
         self.error[:] = body_pos_error.max(dim=1).values
         super().update()
+        # print("body pos error local, value:", self.error)
+        # print("body pos error local,  step:", self._cum_error_mixin__cum_steps)
+        # print("body pos error local,  body:", [self.body_names[i.item()] for i in body_pos_error.argmax(dim=1)])
+        # if self.error.max() > 0.9:
+        #     self.command_manager.ref_body_pos_w[1, [8, 9]] # env 1, ankle roll links
+        #     self.command_manager.robot_body_link_pos_w[1, [8, 9]]
+        #     self.command_manager.ref_body_pos_local[1, [8, 9]]
+        #     self.command_manager.robot_body_pos_local[1, [8, 9]]
+        #     breakpoint()
 
 
 class cum_body_ori_error_local(_cum_error_mixin, RobotTrackTermination):
@@ -173,6 +182,9 @@ class cum_body_ori_error_local(_cum_error_mixin, RobotTrackTermination):
         body_ori_error = self.command_manager.body_ori_error_local[:, self.body_indices_tracking]
         self.error[:] = body_ori_error.max(dim=1).values
         super().update()
+        # print("body ori error local, value:", self.error)
+        # print("body ori error local,  step:", self._cum_error_mixin__cum_steps)
+        # print("body ori error local, max indices:", [self.body_names[i.item()] for i in body_ori_error.argmax(dim=1)])
 
 
 class cum_body_pos_error_aligned(_cum_error_mixin, RobotTrackTermination):

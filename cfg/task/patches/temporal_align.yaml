@@ -7,8 +7,8 @@ reward:
     tracking_root_pos:
       enabled: false
 
-termination:
-  root_pos_error_aligned:
-    enabled: true
-  root_pos_error:
-    enabled: false
+# termination:
+#   root_pos_error_aligned:
+#     enabled: true
+#   root_pos_error:
+#     enabled: false

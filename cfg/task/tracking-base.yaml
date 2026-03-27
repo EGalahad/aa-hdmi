@@ -11,7 +11,7 @@ terrain: plane
 enable_cameras: false
 
 num_envs: 8192
-max_episode_length: 4000
+max_episode_length: 1000
 
 sim:
   step_dt: 0.02
@@ -69,6 +69,7 @@ command:
   ]
   root_body_name: "pelvis"
   anchor_body_name: "torso_link"
+  look_ahead: [25, 50, 75]
 
   # TODO: put this into randomization reset callbacks
   pose_range:
@@ -91,7 +92,8 @@ command:
 
   rewind_prob: 0.6
   rewind_steps_range: [25, 125]
-  future_steps: [-4, -2, 0, 1, 2, 3, 4, 8, 16]
+  future_steps: [-8, -4, -2, 0, 1, 2, 3, 4, 8, 16, 24]
+  # future_steps: [-4, -2, 0, 1, 2, 3, 4, 8, 16]
 
 observation:
   command:
@@ -105,19 +107,19 @@ observation:
   policy:
     root_ang_vel_history:
       _target_: hdmi.root_ang_vel_history
-      history_steps: [0, 1, 2, 4, 8]
+      history_steps: [0, 1, 2, 4, 8, 16]
       noise_std: 0.2
     projected_gravity_history:
       _target_: hdmi.projected_gravity_history
-      history_steps: [0, 1, 2, 4, 8]
+      history_steps: [0, 1, 2, 4, 8, 16]
       noise_std: 0.01
     joint_pos_history:
       _target_: hdmi.joint_pos_history
-      history_steps: [0, 1, 2, 4, 8]
+      history_steps: [0, 1, 2, 4, 8, 16]
       noise_std: 0.02
     joint_vel_history:
       _target_: hdmi.joint_vel_history
-      history_steps: [0, 1, 2, 4, 8]
+      history_steps: [0, 1, 2, 4, 8, 16]
       noise_std: 0.5
     prev_actions:
       _target_: hdmi.prev_actions
@@ -125,16 +127,58 @@ observation:
   priv:
     root_ang_vel_history:
       _target_: hdmi.root_ang_vel_history
-      history_steps: [0, 1, 2, 4, 8]
+      history_steps: [0, 1, 2, 4, 8, 16]
       noise_std: 0.0
     projected_gravity_history:
       _target_: hdmi.projected_gravity_history
-      history_steps: [0, 1, 2, 4, 8]
+      history_steps: [0, 1, 2, 4, 8, 16]
       noise_std: 0.0
     joint_pos_history:
       _target_: hdmi.joint_pos_history
-      history_steps: [0, 1, 2, 4, 8]
+      history_steps: [0, 1, 2, 4, 8, 16]
       noise_std: 0.0
+    joint_vel_history:
+      _target_: hdmi.joint_vel_history
+      history_steps: [0, 1, 2, 4, 8, 16]
+      noise_std: 0.0
+      
+  # policy:
+  #   root_ang_vel_history:
+  #     _target_: hdmi.root_ang_vel_history
+  #     history_steps: [0, 1, 2, 4, 8]
+  #     noise_std: 0.2
+  #   projected_gravity_history:
+  #     _target_: hdmi.projected_gravity_history
+  #     history_steps: [0, 1, 2, 4, 8]
+  #     noise_std: 0.01
+  #   joint_pos_history:
+  #     _target_: hdmi.joint_pos_history
+  #     history_steps: [0, 1, 2, 4, 8]
+  #     noise_std: 0.02
+  #   joint_vel_history:
+  #     _target_: hdmi.joint_vel_history
+  #     history_steps: [0, 1, 2, 4, 8]
+  #     noise_std: 0.5
+  #   prev_actions:
+  #     _target_: hdmi.prev_actions
+  #     steps: 3
+  # priv:
+  #   root_ang_vel_history:
+  #     _target_: hdmi.root_ang_vel_history
+  #     history_steps: [0, 1, 2, 4, 8]
+  #     noise_std: 0.0
+  #   projected_gravity_history:
+  #     _target_: hdmi.projected_gravity_history
+  #     history_steps: [0, 1, 2, 4, 8]
+  #     noise_std: 0.0
+  #   joint_pos_history:
+  #     _target_: hdmi.joint_pos_history
+  #     history_steps: [0, 1, 2, 4, 8]
+  #     noise_std: 0.0
+  #   joint_vel_history:
+  #     _target_: hdmi.joint_vel_history
+  #     history_steps: [0, 1, 2, 4, 8]
+  #     noise_std: 0.0
 
     ref_root_pos_future_b:
       _target_: hdmi.ref_root_pos_future_b
@@ -171,7 +215,6 @@ reward:
       _target_: hdmi.keypoint_pos_tracking_aligned
       body_names: ["torso_link"]
       enabled: false
-      look_ahead: 50
       weight: 0.5
       sigma: 0.3
 
@@ -239,11 +282,6 @@ reward:
       joint_names: ".*"
       soft_factor: 0.9
       enabled: true
-    # joint_torque_limits: 
-    #   _target_: hdmi.joint_torque_limits
-    #   weight: 0.01
-    #   enabled: true
-    #   soft_factor: 0.6
     self_collisions:
       _target_: hdmi.self_collisions
       weight: -1.0
@@ -260,28 +298,14 @@ reward:
 
     feet_air_time:
       _target_: hdmi.feet_air_time
-      weight: 5.0
+      weight: 8.0
       enabled: true
-      body_names: .*ankle_roll_link
-      thres: 0.5
-
-    ref_contact:
-      _target_: hdmi.ref_contact
-      weight: 0.5
-      enabled: false
       body_names: [left_ankle_roll_link, right_ankle_roll_link]
       body2_names: [left_ankle_roll_link_toe, right_ankle_roll_link_toe]
-      air_h_low: 0.035
-      air_h_high: 0.155
-      contact_h_low: 0.035
-      contact_h_high: 0.125
-      feet_standing_z_enter: 0.18
-      feet_standing_z_exit: 0.25
-      feet_standing_vxy_enter: 0.2
-      feet_standing_vxy_exit: 0.3
-      feet_standing_vz_enter: 0.15
-      feet_standing_vz_exit: 0.25
-
+      thres: 0.8
+      # height_range: [0.035, 0.155]
+      height_range: [0.06, 0.155]
+      time_factor_range: [0.2, 1.0]
 
     survival:           {weight: 4.0, enabled: true}
   tracking_metrics:
@@ -348,17 +372,17 @@ randomization:
   perturb_body_com:
     "pelvis|torso_link": [-0.03, 0.03]
 
-  motor_params_implicit:
-    stiffness_range:
-      ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
-      ".*(waist|hip|knee|ankle).*": [0.8, 1.2]
-    damping_range:
-      ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
-      ".*(waist|hip|knee|ankle).*": [0.8, 1.2]
-    armature_range:
-      .*: [0.75, 1.25]
-    friction_range:
-      .*: [0.05, 0.25]
+  # motor_params_implicit:
+  #   stiffness_range:
+  #     ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
+  #     ".*(waist|hip|knee|ankle).*": [0.8, 1.2]
+  #   damping_range:
+  #     ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
+  #     ".*(waist|hip|knee|ankle).*": [0.8, 1.2]
+  #   armature_range:
+  #     .*: [0.75, 1.25]
+  #   friction_range:
+  #     .*: [0.05, 0.25]
 
 
   random_joint_offset:
@@ -376,38 +400,14 @@ randomization:
     yaw: [-0.4, 0.4]
 
 termination:
-  motion_timeout:           {is_timeout: true}
+  max_episode_length: {}
+  motion_timeout:     {is_timeout: true}
 
-  root_pos_error_aligned:
-    _target_: cum_body_pos_error_aligned
-    body_names: "torso_link"
-    min_steps: 25
-    threshold: 0.3
-    look_ahead: 50
-    enabled: false
-
-  root_pos_error:
-    _target_: cum_body_pos_error
-    body_names: "torso_link"
-    min_steps: 25
-    threshold: 0.4
-    enabled: true
   root_ori_error:
     _target_: cum_body_ori_error
     body_names: "torso_link"
     min_steps: 25
     threshold: 1.2
-  root_linvel_error:
-    _target_: cum_body_lin_vel_error
-    body_names: "torso_link"
-    min_steps: 25
-    threshold: 1.0
-  root_angvel_error:
-    _target_: cum_body_ang_vel_error
-    body_names: "torso_link"
-    min_steps: 25
-    threshold: 2.5
-  
   body_pos_error:
     _target_: cum_body_pos_error_local
     body_names: [".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
@@ -417,5 +417,4 @@ termination:
     _target_: cum_body_ori_error_local
     body_names: [".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
     min_steps: 25
-    threshold: 0.8
-  
+    threshold: 1.2

@@ -50,14 +50,6 @@ class ref_root_pos_future_b(TrackObservation, namespace="hdmi"):
     Reference root position in robot root frame
     """
 
-    def __init__(self, env, **kwargs):
-        super().__init__(env, **kwargs)
-        num_future_steps = self.command_manager.num_future_steps
-        self.ref_root_pos_future_b = torch.zeros(
-            self.num_envs, num_future_steps, 3, device=self.device
-        )
-
-
     def compute(self):
         return self.command_manager.ref_root_pos_future_b.view(self.num_envs, -1)
 
@@ -69,12 +61,7 @@ class ref_root_ori_future_b(TrackObservation, namespace="hdmi"):
 
     def __init__(self, env, noise_std=0.0, **kwargs):
         super().__init__(env, **kwargs)
-        num_future_steps = self.command_manager.num_future_steps
-        self.ref_root_ori_future_b = torch.zeros(
-            self.num_envs, num_future_steps, 2, 3, device=self.device
-        )
         self.noise_std = noise_std
-
 
     def compute(self):
         ref_root_ori_future_b = self.command_manager.ref_root_ori_future_b_matrix

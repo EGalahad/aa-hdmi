@@ -122,14 +122,43 @@ class feet_air_time(TrackReward, namespace="hdmi"):
     def __init__(
         self,
         env,
-        body_names: str,
+        body_names: str | list[str],
         thres: float,
         weight: float,
+        height_range: tuple[float, float] | list[float] = (0.035, 0.155),
+        time_factor_range: tuple[float, float] | list[float] = (0.2, 2.0),
+        body2_names: str | list[str] | None = None,
+        debug_first_contact_color: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 1.0),
+        debug_air_color: tuple[float, float, float, float] = (0.1, 0.4, 1.0, 1.0),
         **kwargs,
     ):
         super().__init__(env, weight=weight, **kwargs)
+        self.asset = self.env.scene.articulations["robot"]
         self.contact_sensor: "IsaacContactSensor" | "MJLabContactSensor" = self.env.scene.sensors["contact_forces"]
-        sensor_ids, _ = _find_sensor_bodies(self.contact_sensor, body_names)
+        body_indices, matched_body_names = self.asset.find_bodies(body_names)
+        self.body_indices = torch.as_tensor(
+            body_indices, dtype=torch.long, device=self.device
+        )
+        if body2_names is None:
+            self.body2_indices = self.body_indices
+        else:
+            body2_indices, _ = self.asset.find_bodies(body2_names)
+            self.body2_indices = torch.as_tensor(
+                body2_indices, dtype=torch.long, device=self.device
+            )
+            if len(self.body2_indices) != len(self.body_indices):
+                raise ValueError(
+                    "body2_names must match body_names length for feet_air_time."
+                )
+
+        sensor_ids, sensor_names = _find_sensor_bodies_by_names(
+            self.contact_sensor, matched_body_names
+        )
+        if set(sensor_names) != set(matched_body_names):
+            missing = sorted(set(matched_body_names) - set(sensor_names))
+            raise RuntimeError(
+                f"feet_air_time: missing feet in contact sensor: {missing}"
+            )
 
         self.sensor_body_ids = torch.as_tensor(sensor_ids, device=self.device)
         self.current_contact = torch.zeros(
@@ -138,12 +167,34 @@ class feet_air_time(TrackReward, namespace="hdmi"):
         self.prev_contact = torch.zeros_like(self.current_contact)
         self.is_first_contact = torch.zeros_like(self.current_contact)
 
+        self.current_air_time = torch.zeros_like(self.current_contact, dtype=torch.float32)
+        self.reward_time = torch.zeros_like(self.current_air_time)
+        self.air_ratio = torch.zeros_like(self.current_air_time)
+
         self.thres = thres
+        if len(height_range) != 2:
+            raise ValueError("height_range must have exactly two values for feet_air_time.")
+        if len(time_factor_range) != 2:
+            raise ValueError("time_factor_range must have exactly two values for feet_air_time.")
+        self.air_h_low = float(height_range[0])
+        self.air_h_high = float(height_range[1])
+        self.air_h_span = max(self.air_h_high - self.air_h_low, 1e-6)
+        self.air_time_factor_low = float(time_factor_range[0])
+        self.air_time_factor_high = float(time_factor_range[1])
+        self.air_time_factor_span = self.air_time_factor_high - self.air_time_factor_low
+
+        self.debug_first_contact_color = debug_first_contact_color
+        self.debug_air_color = debug_air_color
+        self.debug_first_contact_size = 0.2
+        self.debug_air_size = 0.2
 
     def reset(self, env_ids):
         self.current_contact[env_ids] = False
         self.prev_contact[env_ids] = False
         self.is_first_contact[env_ids] = False
+        self.current_air_time[env_ids] = 0.0
+        self.reward_time[env_ids] = 0.0
+        self.air_ratio[env_ids] = 0.0
 
     def update(self):
         self.prev_contact[:] = self.current_contact
@@ -152,18 +203,96 @@ class feet_air_time(TrackReward, namespace="hdmi"):
         )
         self.is_first_contact[:] = (~self.prev_contact) & self.current_contact
 
+        feet_height = torch.minimum(
+            self.asset.data.body_link_pos_w[:, self.body_indices, 2],
+            self.asset.data.body_link_pos_w[:, self.body2_indices, 2],
+        )
+        air_ratio = ((feet_height - self.air_h_low) / self.air_h_span).clamp(0.0, 1.0)
+        self.air_ratio.copy_(air_ratio)
+        # print(feet_height[0])
+        # print(air_ratio[0])
+        air_time_factor = self.air_time_factor_low + air_ratio * self.air_time_factor_span
+
+        self.current_air_time += self.env.step_dt * air_time_factor
+        self.reward_time.copy_(self.current_air_time)
+        self.current_air_time.masked_fill_(self.current_contact, 0.0)
+
     def _compute(self):
-        last_air_time = self.contact_sensor.data.last_air_time
-        if last_air_time is None:
-            last_air_time = self.contact_sensor.data.current_air_time
-        last_air_time = last_air_time[:, self.sensor_body_ids]
         reward = torch.sum(
-            (last_air_time - self.thres).clamp_max(0.0) * self.is_first_contact,
+            (self.reward_time - self.thres).clamp_max(0.0) * self.is_first_contact,
             dim=1,
             keepdim=True,
         )
         reward *= ~self.command_manager.is_standing_env
         return reward
+
+    def debug_draw(self):
+        positions = self.asset.data.body_link_pos_w[:, self.body_indices].clone()
+        first_contact = self.is_first_contact
+        in_air = ~self.current_contact
+        air_ratio = self.air_ratio
+
+        if aa.get_backend() == "isaac":
+            debug_draw = getattr(self.env, "debug_draw", None)
+            if debug_draw is None:
+                return
+
+            positions = positions.detach().cpu()
+            first_contact = first_contact.detach().cpu()
+            in_air = in_air.detach().cpu()
+            air_ratio = air_ratio.detach().cpu()
+
+            first_contact_points = positions[first_contact]
+            if first_contact_points.numel() > 0:
+                debug_draw.point(
+                    first_contact_points,
+                    color=self.debug_first_contact_color,
+                    size=self.debug_first_contact_size,
+                )
+
+            air_points = positions[in_air]
+            air_sizes = (air_ratio[in_air] * self.debug_air_size).tolist()
+            if air_points.numel() > 0 and air_sizes:
+                debug_draw._draw.draw_points(
+                    air_points.reshape(-1, 3).tolist(),
+                    [self.debug_air_color] * len(air_sizes),
+                    air_sizes,
+                )
+            return
+
+        viewer = getattr(self.env.sim, "viewer", None)
+        if viewer is None:
+            return
+        scene: "ViserMujocoScene" | None = getattr(viewer, "scene", None)
+        if scene is None:
+            return
+
+        positions = positions.detach().cpu()
+        first_contact = first_contact.detach().cpu()
+        in_air = in_air.detach().cpu()
+        air_ratio = air_ratio.detach().cpu()
+
+        if scene.show_all_envs or self.num_envs == 1:
+            env_ids = range(self.num_envs)
+        else:
+            env_ids = [int(scene.env_idx)]
+
+        for env_idx in env_ids:
+            for body_idx in range(len(self.body_indices)):
+                if first_contact[env_idx, body_idx]:
+                    # print(f"env {env_idx} body {body_idx} first contact, size {self.debug_first_contact_size}")
+                    scene.add_sphere(
+                        positions[env_idx, body_idx],
+                        self.debug_first_contact_size,
+                        self.debug_first_contact_color,
+                    )
+                if in_air[env_idx, body_idx]:
+                    # print(f"env {env_idx} body {body_idx} in air, size {self.debug_air_size}")
+                    scene.add_sphere(
+                        positions[env_idx, body_idx],
+                        self.debug_air_size * float(air_ratio[env_idx, body_idx]),
+                        self.debug_air_color,
+                    )
 
 
 class feet_contact_count(TrackReward, namespace="hdmi"):

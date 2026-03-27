@@ -79,7 +79,7 @@ class PPOConfig:
     lmbda: float = 0.95
 
     residual_action: bool = False
-    finetune_adapt_module: bool = True
+    finetune_adapt_module: bool = False
 
     lr: float = 3e-4
     desired_kl: float | None = 0.01

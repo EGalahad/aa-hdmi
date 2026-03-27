@@ -1,0 +1,9 @@
+# @package task
+
+termination:
+  root_pos_error:
+    _target_: cum_body_pos_error
+    body_names: "torso_link"
+    min_steps: 25
+    threshold: 0.4
+    is_timeout: true
