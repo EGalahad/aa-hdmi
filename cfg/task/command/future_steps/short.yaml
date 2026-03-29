@@ -1,0 +1,3 @@
+# @package task.command
+
+future_steps: [-1, 0, 1, 2, 3, 4, 8, 16]

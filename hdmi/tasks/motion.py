@@ -8,7 +8,7 @@ import os
 import shutil
 import time
 import mujoco
-from huggingface_hub import snapshot_download
+from mjhub import resolve_mjcf_reference
 from tqdm import tqdm
 from pathlib import Path
 from tensordict import TensorClass, MemoryMappedTensor, TensorDict
@@ -573,21 +573,13 @@ def _acquire_cache_lock(lock_dir: Path, ready_flag: Path, timeout_s: float = 600
 
 def _resolve_any4hdmi_mjcf_path(dataset_root: Path, manifest: dict) -> Path:
     mjcf_ref = manifest.get("mjcf")
-    if isinstance(mjcf_ref, dict):
-        if mjcf_ref.get("kind") != "huggingface":
-            raise ValueError(f"Unsupported any4hdmi mjcf kind: {mjcf_ref.get('kind')!r}")
-        repo_id = str(mjcf_ref["repo_id"])
-        repo_path = str(mjcf_ref["path"])
-        revision = str(mjcf_ref.get("revision", "main"))
-        snapshot_root = Path(snapshot_download(repo_id=repo_id, revision=revision))
-        mjcf_path = snapshot_root / repo_path
-    elif mjcf_ref is not None:
-        mjcf_path = (dataset_root / Path(mjcf_ref)).resolve()
-    else:
-        mjcf_path_raw = manifest.get("mjcf_path")
-        if mjcf_path_raw is None:
-            raise KeyError(f"{ANY4HDMI_MANIFEST_NAME} is missing mjcf or mjcf_path")
-        mjcf_path = Path(mjcf_path_raw).expanduser().resolve()
+    if mjcf_ref is not None:
+        return resolve_mjcf_reference(mjcf_ref, local_root=dataset_root)
+
+    mjcf_path_raw = manifest.get("mjcf_path")
+    if mjcf_path_raw is None:
+        raise KeyError(f"{ANY4HDMI_MANIFEST_NAME} is missing mjcf or mjcf_path")
+    mjcf_path = Path(mjcf_path_raw).expanduser().resolve()
     if not mjcf_path.is_file():
         raise FileNotFoundError(f"MJCF not found: {mjcf_path}")
     return mjcf_path

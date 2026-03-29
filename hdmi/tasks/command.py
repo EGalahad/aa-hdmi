@@ -24,10 +24,53 @@ from active_adaptation.utils.math import (
     quat_angle_magnitude,
     matrix_from_quat,
     quat_rotate,
-    yaw_quat,
+    quat_from_yaw,
     batchify,
 )
 from tensordict import TensorDict
+
+def projected_yaw_quat(quat: torch.Tensor, x_axis_xy_threshold: float = 0.1) -> torch.Tensor:
+    """Build a level yaw quaternion from horizontal axis projections.
+
+    This keeps the returned frame aligned with world-up and chooses its heading from:
+    1. the anchor x-axis projection when that projection is significant, or
+    2. the anchor z-axis projection when the x-axis is close to vertical.
+
+    The z-axis fallback is sign-adjusted so the heading stays continuous when the
+    anchor x-axis crosses between pointing upward and downward.
+
+    Args:
+        quat: The orientation in (w, x, y, z). Shape is (..., 4).
+        x_axis_xy_threshold: Minimum horizontal norm for using the projected x-axis.
+
+    Returns:
+        A quaternion with only a world-up yaw component.
+    """
+    shape = quat.shape
+    quat_flat = quat.reshape(-1, 4)
+
+    basis_x = torch.zeros(quat_flat.shape[0], 3, device=quat.device, dtype=quat.dtype)
+    basis_x[:, 0] = 1.0
+    basis_z = torch.zeros_like(basis_x)
+    basis_z[:, 2] = 1.0
+
+    x_axis_w = quat_rotate(quat_flat, basis_x)
+    z_axis_w = quat_rotate(quat_flat, basis_z)
+
+    x_axis_xy = x_axis_w[:, :2]
+    z_axis_xy = z_axis_w[:, :2]
+    x_axis_xy_norm = torch.linalg.norm(x_axis_xy, dim=-1, keepdim=True)
+
+    z_axis_heading_xy = torch.where(x_axis_w[:, 2:3] < 0.0, z_axis_xy, -z_axis_xy)
+    heading_xy = torch.where(
+        x_axis_xy_norm > x_axis_xy_threshold,
+        x_axis_xy,
+        z_axis_heading_xy,
+    )
+
+    yaw = torch.atan2(heading_xy[:, 1], heading_xy[:, 0])
+    return quat_from_yaw(yaw).view(shape)
+
 
 
 quat_apply_inverse = batchify(quat_apply_inverse)
@@ -56,28 +99,6 @@ def quat_from_euler_xyz(roll, pitch, yaw):
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs")
-def _compute_root_diff_obs(
-    robot_root_pos_w: torch.Tensor,
-    robot_root_quat_w: torch.Tensor,
-    ref_root_pos_future_w: torch.Tensor,
-    ref_root_quat_future_w: torch.Tensor,
-):
-    robot_root_pos_w_expand = robot_root_pos_w[:, None, :]
-    robot_root_quat_w_expand = robot_root_quat_w[:, None, :]
-    robot_root_quat_w_expand_inv = quat_conjugate(robot_root_quat_w_expand)
-    ref_root_pos_future_b = quat_apply_inverse(
-        robot_root_quat_w_expand,
-        ref_root_pos_future_w - robot_root_pos_w_expand,
-    )
-    ref_root_quat_future_b = quat_mul(
-        robot_root_quat_w_expand_inv.expand_as(ref_root_quat_future_w),
-        ref_root_quat_future_w,
-    )
-    ref_root_mat_future_b = matrix_from_quat(ref_root_quat_future_b)
-    return ref_root_pos_future_b, ref_root_mat_future_b
-
-
-@torch.compile(mode="max-autotune-no-cudagraphs")
 def _compute_current_tracking_state(
     ref_anchor_pos_w: torch.Tensor,
     ref_anchor_quat_w: torch.Tensor,
@@ -93,10 +114,8 @@ def _compute_current_tracking_state(
     robot_anchor_pos_w_z0 = robot_anchor_pos_w.clone()
     robot_anchor_pos_w_z0[..., 2] = 0.0
 
-    # ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
-    # robot_anchor_yaw_quat_w = yaw_quat(robot_anchor_quat_w)
-    ref_anchor_yaw_quat_w = ref_anchor_quat_w
-    robot_anchor_yaw_quat_w = robot_anchor_quat_w
+    ref_anchor_yaw_quat_w = projected_yaw_quat(ref_anchor_quat_w)
+    robot_anchor_yaw_quat_w = projected_yaw_quat(robot_anchor_quat_w)
     
     ref_anchor_yaw_quat_conj_w = quat_conjugate(ref_anchor_yaw_quat_w)
     robot_anchor_yaw_quat_conj_w = quat_conjugate(robot_anchor_yaw_quat_w)
@@ -174,6 +193,28 @@ def _compute_tracking_errors(
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs")
+def _compute_root_diff_obs(
+    robot_root_pos_w: torch.Tensor,
+    robot_root_quat_w: torch.Tensor,
+    ref_root_pos_future_w: torch.Tensor,
+    ref_root_quat_future_w: torch.Tensor,
+):
+    robot_root_pos_w_expand = robot_root_pos_w[:, None, :]
+    robot_root_quat_w_expand = robot_root_quat_w[:, None, :]
+    robot_root_quat_w_expand_inv = quat_conjugate(robot_root_quat_w_expand)
+    ref_root_pos_future_b = quat_apply_inverse(
+        robot_root_quat_w_expand,
+        ref_root_pos_future_w - robot_root_pos_w_expand,
+    )
+    ref_root_quat_future_b = quat_mul(
+        robot_root_quat_w_expand_inv.expand_as(ref_root_quat_future_w),
+        ref_root_quat_future_w,
+    )
+    ref_root_mat_future_b = matrix_from_quat(ref_root_quat_future_b)
+    return ref_root_pos_future_b, ref_root_mat_future_b
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
 def _compute_motion_local_obs(
     ref_anchor_pos_w: torch.Tensor,
     ref_anchor_quat_w: torch.Tensor,
@@ -184,8 +225,7 @@ def _compute_motion_local_obs(
     ref_anchor_pos_w_z0[..., 2] = 0.0
     ref_anchor_pos_w_z0_future = ref_anchor_pos_w_z0[:, None, None, :]
 
-    # ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
-    ref_anchor_yaw_quat_w = ref_anchor_quat_w
+    ref_anchor_yaw_quat_w = projected_yaw_quat(ref_anchor_quat_w)
     ref_anchor_yaw_quat_w_future = ref_anchor_yaw_quat_w[:, None, None, :]
     ref_anchor_yaw_quat_conj_w_future = quat_conjugate(ref_anchor_yaw_quat_w_future)
 
@@ -203,18 +243,16 @@ def _compute_motion_local_obs(
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs")
-def _compute_body_local_diff_obs(
+def _compute_body_diff_obs(
+    # anchor pose
     ref_anchor_pos_w: torch.Tensor,
     ref_anchor_quat_w: torch.Tensor,
     robot_anchor_pos_w: torch.Tensor,
     robot_anchor_quat_w: torch.Tensor,
+    # body pose
     ref_body_pos_future_w: torch.Tensor,
-    ref_body_lin_vel_future_w: torch.Tensor,
-    ref_body_ang_vel_future_w: torch.Tensor,
     ref_body_quat_future_w: torch.Tensor,
     robot_body_link_pos_w: torch.Tensor,
-    robot_body_lin_vel_w: torch.Tensor,
-    robot_body_ang_vel_w: torch.Tensor,
     robot_body_link_quat_w: torch.Tensor,
 ):
     ref_anchor_pos_w_z0 = ref_anchor_pos_w.clone()
@@ -224,10 +262,8 @@ def _compute_body_local_diff_obs(
     ref_anchor_pos_w_z0_future = ref_anchor_pos_w_z0[:, None, None, :]
     robot_anchor_pos_w_z0_body = robot_anchor_pos_w_z0[:, None, :]
 
-    # ref_anchor_yaw_quat_w = yaw_quat(ref_anchor_quat_w)
-    # robot_anchor_yaw_quat_w = yaw_quat(robot_anchor_quat_w)
-    ref_anchor_yaw_quat_w = ref_anchor_quat_w
-    robot_anchor_yaw_quat_w = robot_anchor_quat_w
+    ref_anchor_yaw_quat_w = projected_yaw_quat(ref_anchor_quat_w)
+    robot_anchor_yaw_quat_w = projected_yaw_quat(robot_anchor_quat_w)
     ref_anchor_yaw_quat_w_future = ref_anchor_yaw_quat_w[:, None, None, :]
     robot_anchor_yaw_quat_w_body = robot_anchor_yaw_quat_w[:, None, :]
     ref_anchor_yaw_quat_conj_w_future = quat_conjugate(ref_anchor_yaw_quat_w_future)
@@ -237,14 +273,6 @@ def _compute_body_local_diff_obs(
         ref_anchor_yaw_quat_w_future,
         ref_body_pos_future_w - ref_anchor_pos_w_z0_future,
     )
-    ref_body_lin_vel_future_local = quat_apply_inverse(
-        ref_anchor_yaw_quat_w_future,
-        ref_body_lin_vel_future_w,
-    )
-    ref_body_ang_vel_future_local = quat_apply_inverse(
-        ref_anchor_yaw_quat_w_future,
-        ref_body_ang_vel_future_w,
-    )
     ref_body_quat_future_local = quat_mul(
         ref_anchor_yaw_quat_conj_w_future.expand_as(ref_body_quat_future_w),
         ref_body_quat_future_w,
@@ -253,14 +281,6 @@ def _compute_body_local_diff_obs(
     robot_body_pos_local = quat_apply_inverse(
         robot_anchor_yaw_quat_w_body,
         robot_body_link_pos_w - robot_anchor_pos_w_z0_body,
-    )
-    robot_body_lin_vel_local = quat_apply_inverse(
-        robot_anchor_yaw_quat_w_body,
-        robot_body_lin_vel_w,
-    )
-    robot_body_ang_vel_local = quat_apply_inverse(
-        robot_anchor_yaw_quat_w_body,
-        robot_body_ang_vel_w,
     )
     robot_body_quat_local = quat_mul(
         robot_anchor_yaw_quat_conj_w_body.expand_as(robot_body_link_quat_w),
@@ -276,9 +296,7 @@ def _compute_body_local_diff_obs(
 
     return (
         ref_body_pos_future_local - robot_body_pos_local.unsqueeze(1),
-        ref_body_lin_vel_future_local - robot_body_lin_vel_local.unsqueeze(1),
         diff_body_ori_future_local_matrix,
-        ref_body_ang_vel_future_local - robot_body_ang_vel_local.unsqueeze(1),
     )
 
 
@@ -768,23 +786,19 @@ class RobotTracking(Command, namespace="hdmi"):
         # body_local_diff_obs
         (
             self.diff_body_pos_future_local,
-            self.diff_body_lin_vel_future_local,
             self.diff_body_ori_future_local_matrix,
-            self.diff_body_ang_vel_future_local,
-        ) = _compute_body_local_diff_obs(
+        ) = _compute_body_diff_obs(
             self.ref_anchor_pos_future_w[:, self.obs_current_step_index],
             self.ref_anchor_quat_future_w[:, self.obs_current_step_index],
             self.robot_anchor_pos_w,
             self.robot_anchor_quat_w,
             self.ref_body_pos_future_w,
-            self.ref_body_lin_vel_future_w,
-            self.ref_body_ang_vel_future_w,
             self.ref_body_quat_future_w,
             self.robot_body_link_pos_w,
-            self.robot_body_lin_vel_w,
-            self.robot_body_ang_vel_w,
             self.robot_body_link_quat_w,
         )
+        self.diff_body_lin_vel_future = self.ref_body_lin_vel_future_w - self.robot_body_lin_vel_w.unsqueeze(1)
+        self.diff_body_ang_vel_future = self.ref_body_ang_vel_future_w - self.robot_body_ang_vel_w.unsqueeze(1)
 
     def _reset_target_anchor_pos_buf(self, env_ids: torch.Tensor) -> None:
         future_ref_motion = self.dataset.get_slice(

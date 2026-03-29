@@ -8,7 +8,11 @@ name: lafan
 command:
   # data_path: ../lafan-process/output_motion_chunks/
   # data_path: ../lafan-process/output_motion_chunks/walk1_subject1/0-1000/
-  data_path: ../lafan-process/output_motion_chunks/walk1_subject1/0-1000-extended/
+  # data_path: ../lafan-process/output_motion_chunks/walk1_subject1/1000-2000/
+  # data_path: ../lafan-process/output_motion_chunks/fight1_subject5/0-1000/
+  # data_path: ../lafan-process/output_motion_chunks/jumps1_subject2/0-1000/
+  data_path: ../lafan-process/output_motion_chunks/dance1_subject1/3000-3945/ # cartwhell
+  # data_path: output/motions/standing
   # data_path: ../lafan-process/output_motion_chunks/dance1_subject2/0-1000/
   # data_path: ../lafan-process/output_motion_chunks/sprint1_subject4/0-1000/
   # data_path: ../lafan-process/output_motion_chunks/fallAndGetUp2_subject3/0-1000/

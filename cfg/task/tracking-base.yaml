@@ -1,4 +1,9 @@
 # @package task
+defaults:
+  - command/future_steps: short
+  - observation/priv: root_body_actions
+  - _self_
+
 name: G1TrackBase
 project: hdmi
 
@@ -41,8 +46,8 @@ input:
       .*_wrist_roll_joint: 0.44
       .*_wrist_pitch_joint: 0.07
       .*_wrist_yaw_joint: 0.07
-    min_delay: 2
-    max_delay: 6
+    min_delay: 1
+    max_delay: 3
     alpha_range: [0.8, 1.0]
 
 command:
@@ -90,15 +95,14 @@ command:
   init_joint_pos_noise: 0.1
   init_joint_vel_noise: 0.1
 
-  rewind_prob: 0.6
+  rewind_prob: 0.8
   rewind_steps_range: [25, 125]
-  future_steps: [-8, -4, -2, 0, 1, 2, 3, 4, 8, 16, 24]
-  # future_steps: [-4, -2, 0, 1, 2, 3, 4, 8, 16]
 
 observation:
   command:
     ref_body_pos_future_local:
       _target_: hdmi.ref_body_pos_future_local
+      body_names: "torso_link"
     ref_joint_pos_future:
       _target_: hdmi.ref_joint_pos_future
     ref_root_ori_future_b:
@@ -107,168 +111,80 @@ observation:
   policy:
     root_ang_vel_history:
       _target_: hdmi.root_ang_vel_history
-      history_steps: [0, 1, 2, 4, 8, 16]
+      history_steps: [0, 1, 2, 3, 4, 8, 16]
       noise_std: 0.2
     projected_gravity_history:
       _target_: hdmi.projected_gravity_history
-      history_steps: [0, 1, 2, 4, 8, 16]
+      history_steps: [0, 1, 2, 3, 4, 8, 16]
       noise_std: 0.01
     joint_pos_history:
       _target_: hdmi.joint_pos_history
-      history_steps: [0, 1, 2, 4, 8, 16]
+      history_steps: [0, 1, 2, 3, 4, 8, 16]
       noise_std: 0.02
     joint_vel_history:
       _target_: hdmi.joint_vel_history
-      history_steps: [0, 1, 2, 4, 8, 16]
+      history_steps: [0, 1, 2, 3, 4, 8, 16]
       noise_std: 0.5
     prev_actions:
       _target_: hdmi.prev_actions
       steps: 3
-  priv:
-    root_ang_vel_history:
-      _target_: hdmi.root_ang_vel_history
-      history_steps: [0, 1, 2, 4, 8, 16]
-      noise_std: 0.0
-    projected_gravity_history:
-      _target_: hdmi.projected_gravity_history
-      history_steps: [0, 1, 2, 4, 8, 16]
-      noise_std: 0.0
-    joint_pos_history:
-      _target_: hdmi.joint_pos_history
-      history_steps: [0, 1, 2, 4, 8, 16]
-      noise_std: 0.0
-    joint_vel_history:
-      _target_: hdmi.joint_vel_history
-      history_steps: [0, 1, 2, 4, 8, 16]
-      noise_std: 0.0
-      
-  # policy:
-  #   root_ang_vel_history:
-  #     _target_: hdmi.root_ang_vel_history
-  #     history_steps: [0, 1, 2, 4, 8]
-  #     noise_std: 0.2
-  #   projected_gravity_history:
-  #     _target_: hdmi.projected_gravity_history
-  #     history_steps: [0, 1, 2, 4, 8]
-  #     noise_std: 0.01
-  #   joint_pos_history:
-  #     _target_: hdmi.joint_pos_history
-  #     history_steps: [0, 1, 2, 4, 8]
-  #     noise_std: 0.02
-  #   joint_vel_history:
-  #     _target_: hdmi.joint_vel_history
-  #     history_steps: [0, 1, 2, 4, 8]
-  #     noise_std: 0.5
-  #   prev_actions:
-  #     _target_: hdmi.prev_actions
-  #     steps: 3
-  # priv:
-  #   root_ang_vel_history:
-  #     _target_: hdmi.root_ang_vel_history
-  #     history_steps: [0, 1, 2, 4, 8]
-  #     noise_std: 0.0
-  #   projected_gravity_history:
-  #     _target_: hdmi.projected_gravity_history
-  #     history_steps: [0, 1, 2, 4, 8]
-  #     noise_std: 0.0
-  #   joint_pos_history:
-  #     _target_: hdmi.joint_pos_history
-  #     history_steps: [0, 1, 2, 4, 8]
-  #     noise_std: 0.0
-  #   joint_vel_history:
-  #     _target_: hdmi.joint_vel_history
-  #     history_steps: [0, 1, 2, 4, 8]
-  #     noise_std: 0.0
-
-    ref_root_pos_future_b:
-      _target_: hdmi.ref_root_pos_future_b
-    ref_root_ori_future_b:
-      _target_: hdmi.ref_root_ori_future_b
-
-    diff_body_pos_future_local:
-      _target_: hdmi.diff_body_pos_future_local
-    diff_body_ori_future_local:
-      _target_: hdmi.diff_body_ori_future_local
-    diff_body_lin_vel_future_local:
-      _target_: hdmi.diff_body_lin_vel_future_local
-    diff_body_ang_vel_future_local:
-      _target_: hdmi.diff_body_ang_vel_future_local
-
-    body_pos_b:
-      _target_: hdmi.body_pos_b
-      body_names: ^(?!.*(_mimic|_toe)$).+$
-    body_vel_b:
-      _target_: hdmi.body_vel_b
-      body_names: ^(?!.*(_mimic|_toe)$).+$
-
-    applied_action:
-      _target_: hdmi.applied_action
-    applied_torque:
-      _target_: hdmi.applied_torque
-  ref_joint_pos_:
-    ref_joint_action:
-      _target_: hdmi.ref_joint_action
+  # ref_joint_pos_:
+  #   ref_joint_action:
+  #     _target_: hdmi.ref_joint_action
 
 reward:
   tracking:
-    tracking_root_pos_aligned:
-      _target_: hdmi.keypoint_pos_tracking_aligned
-      body_names: ["torso_link"]
-      enabled: false
-      weight: 0.5
-      sigma: 0.3
-
-    tracking_root_pos:
+    root_pos:
       _target_: hdmi.keypoint_pos_tracking_product
       body_names: ["torso_link"]
       enabled: true
       weight: 0.5
       sigma: 0.3
-    tracking_root_ori:
+    root_ori:
       _target_: hdmi.keypoint_ori_tracking_product
       body_names: ["torso_link"]
       weight: 0.5
       sigma: 0.4
-    tracking_root_linvel:
+    root_linvel:
       _target_: hdmi.keypoint_lin_vel_tracking_product
       body_names: ["torso_link"]
       weight: 0.5
       sigma: 1.0
-    tracking_root_angvel:
+    root_angvel:
       _target_: hdmi.keypoint_ang_vel_tracking_product
       body_names: ["torso_link"]
       weight: 0.5
       sigma: 2.5
 
-    tracking_body_pos:
+    body_pos:
       _target_: hdmi.keypoint_pos_tracking_local_product
       body_names: ["pelvis", ".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 1.0
       sigma: 0.3
-    tracking_body_ori:
+    body_ori:
       _target_: hdmi.keypoint_ori_tracking_local_product
       body_names: ["pelvis", ".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 1.0
       sigma: 0.4
 
-    tracking_body_linvel:
+    body_linvel:
       _target_: hdmi.keypoint_lin_vel_tracking_product
       body_names: ["pelvis", ".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", "torso_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 0.5
       sigma: 1.0
-    tracking_body_angvel:
+    body_angvel:
       _target_: hdmi.keypoint_ang_vel_tracking_product
       body_names: ["pelvis", ".*_hip_yaw_link", ".*_knee_link", ".*_ankle_roll_link", "torso_link", ".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
       weight: 0.5
       sigma: 2.5
 
 
-    joint_pos_tracking_product:
+    joint_pos:
       _target_: hdmi.joint_pos_tracking_product
       joint_names: ["waist_.*_joint", ".*_hip_.*_joint", ".*_knee_joint", ".*_shoulder_.*_joint", ".*_elbow_joint", ".*_wrist_.*_joint"]
       weight: 0.5
       sigma: 0.25
-    joint_vel_tracking_product:
+    joint_vel:
       _target_: hdmi.joint_vel_tracking_product
       joint_names: ["waist_.*_joint", ".*_hip_.*_joint", ".*_knee_joint", ".*_shoulder_.*_joint", ".*_elbow_joint", ".*_wrist_.*_joint"]
       weight: 0.5
@@ -276,6 +192,7 @@ reward:
 
   loco:
     action_rate_l2:     {weight: 0.1, enabled: true}
+    joint_vel_l2:       {weight: 5.0e-4, joint_names: .*}
     joint_pos_limits:  
       _target_: hdmi.joint_pos_limits
       weight: 10.0
@@ -402,6 +319,25 @@ randomization:
 termination:
   max_episode_length: {}
   motion_timeout:     {is_timeout: true}
+
+  root_pos_error:
+    _target_: cum_body_pos_error
+    body_names: "torso_link"
+    min_steps: 25
+    threshold: 0.4
+    is_timeout: true
+    enabled: true
+
+  # root_linvel_error:
+  #   _target_: cum_body_lin_vel_error
+  #   body_names: "torso_link"
+  #   min_steps: 25
+  #   threshold: 1.0
+  # root_angvel_error:
+  #   _target_: cum_body_ang_vel_error
+  #   body_names: "torso_link"
+  #   min_steps: 25
+  #   threshold: 2.5
 
   root_ori_error:
     _target_: cum_body_ori_error

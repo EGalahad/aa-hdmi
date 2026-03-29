@@ -178,7 +178,8 @@ def main(cfg: DictConfig):
                     if hasattr(env, "set_progress"):
                         env.set_progress(start_iter + i)
                     for step in range(cfg.algo.train_every):
-                        carry = rollout_policy(carry)
+                        with ScopedTimer("policy_inference"):
+                            carry = rollout_policy(carry)
                         td, carry = env.step_and_maybe_reset(carry)
                         td["next"] = td["next"].select(*next_saved_keys, strict=False)
                         data_buf[:, step] = td
