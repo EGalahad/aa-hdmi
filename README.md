@@ -44,3 +44,13 @@ uv --project venv/mjlab run projects/hdmi/scripts/play.py \
     task.max_episode_steps=4000 \
     checkpoint_path=run:elijahgalahad/hdmi/runs/8c72248f_exp1_ppo_scale_512x8_seed1_train
 ```
+
+## Troubleshooting
+
+If IsaacLab picks up Isaac Sim's bundled Warp instead of the venv-installed
+`warp-lang`, clear the cached Omni Warp extensions and retry:
+
+```bash
+rm -rf venv/isaaclab/.venv/lib/python3.11/site-packages/isaacsim/extscache/omni.warp*
+rm -rf venv/isaaclab/.venv/lib/python3.11/site-packages/isaacsim/kit/data/Kit/Isaac-Sim/5.1/exts/3/omni.warp*
+```

@@ -66,7 +66,8 @@ def _wandb_project_path(cfg: DictConfig) -> str:
         default_entity = getattr(wandb.Api(), "default_entity", None)
         if default_entity:
             return f"{default_entity}/{project}"
-    except Exception:
+    except Exception as e:
+        print(f"Error while trying to determine default W&B entity: {e}")
         pass
     raise ValueError(
         "Need `wandb.entity`, a slash-qualified `wandb.project`, or a locally "
@@ -99,6 +100,15 @@ def _to_stage_items(stages_cfg) -> list[dict[str, object]]:
     return [_normalize_stage(stage, index) for index, stage in enumerate(stages)]
 
 
+def _has_future_checkpoint_consumer(
+    stages: list[dict[str, object]], current_index: int
+) -> bool:
+    return any(
+        bool(stage["load_checkpoint_from_previous"])
+        for stage in stages[current_index + 1 :]
+    )
+
+
 def _run_command(command: list[str]) -> None:
     print(f">>> {shlex.join(command)}", flush=True)
     process = subprocess.Popen(command, cwd=ROOT_PATH)
@@ -114,9 +124,9 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.resolve(cfg)
 
     cli_overrides = _collect_cli_overrides()
+    stages = _to_stage_items(cfg.stages)
     tag = _sanitize_tag(str(cfg.tag))
     suffix = _random_suffix(int(cfg.random_suffix_length))
-    wandb_project_path = _wandb_project_path(cfg)
     script_path = _resolve_script_path(str(cfg.script))
 
     print("=" * 80)
@@ -128,22 +138,26 @@ def main(cfg: DictConfig) -> None:
         print("  - None")
     print("=" * 80)
 
-    previous_run_path = None
+    previous_run_id = None
+    wandb_project_path = None
 
-    for i, stage in enumerate(_to_stage_items(cfg.stages)):
+    for i, stage in enumerate(stages):
         stage_name_value = str(stage["name"])
         stage_specific_overrides = list(stage["overrides"])
         load_from_previous = bool(stage["load_checkpoint_from_previous"])
 
         print("\n" + "=" * 80)
-        print(f"Preparing stage {i + 1}/{len(cfg.stages)}: {stage_name_value}")
+        print(f"Preparing stage {i + 1}/{len(stages)}: {stage_name_value}")
         print("=" * 80)
 
         stage_run_id = f"{suffix}_{tag}_{stage_name_value}"
         stage_overrides = cli_overrides.copy()
         stage_overrides.extend(stage_specific_overrides)
 
-        if previous_run_path and load_from_previous:
+        if previous_run_id and load_from_previous:
+            if wandb_project_path is None:
+                wandb_project_path = _wandb_project_path(cfg)
+            previous_run_path = f"{wandb_project_path}/{previous_run_id}"
             stage_overrides.append(f"checkpoint_path=run:{previous_run_path}")
             print(f"Loading checkpoint from previous run: {previous_run_path}")
 
@@ -163,9 +177,17 @@ def main(cfg: DictConfig) -> None:
         _run_command(command)
         print(f"Child process for stage '{stage_name_value}' finished")
 
-        previous_run_path = f"{wandb_project_path}/{stage_run_id}"
-        print(f"Completed stage {i + 1}/{len(cfg.stages)}: {stage_name_value}")
-        print(f"Run path: {previous_run_path}")
+        if _has_future_checkpoint_consumer(stages, i):
+            previous_run_id = stage_run_id
+            print(f"Recorded run ID for downstream stages: {previous_run_id}")
+        else:
+            previous_run_id = None
+
+        print(f"Completed stage {i + 1}/{len(stages)}: {stage_name_value}")
+        if wandb_project_path is not None:
+            print(f"Run path: {wandb_project_path}/{stage_run_id}")
+        else:
+            print(f"Run ID: {stage_run_id}")
         print("=" * 80)
 
     print("\nAll training stages finished")

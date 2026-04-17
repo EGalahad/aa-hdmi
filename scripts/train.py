@@ -169,6 +169,15 @@ def main(cfg: DictConfig):
 
         start_iter = getattr(env, "current_iter", 0)
         for i in progress:
+            if should_save(i):
+                should_upload = i % upload_interval == 0
+                checkpoint_name = (
+                    f"checkpoint_{i}" if should_upload else "checkpoint_temp"
+                )
+                ckpt_path = save(policy, checkpoint_name, upload_to_wandb=should_upload)
+                if ckpt_path is not None:
+                    print(f"Latest checkpoint: {ckpt_path}")
+
             rollout_start = time.perf_counter()
             with ScopedTimer("rollout") as rollout_timer:
                 with (
@@ -225,15 +234,6 @@ def main(cfg: DictConfig):
             info["performance/training_time"] = training_time
             info["performance/iter_time"] = time.perf_counter() - rollout_start
 
-            if should_save(i):
-                should_upload = i % upload_interval == 0
-                checkpoint_name = (
-                    f"checkpoint_{i}" if should_upload else "checkpoint_temp"
-                )
-                ckpt_path = save(policy, checkpoint_name, upload_to_wandb=should_upload)
-                if ckpt_path is not None:
-                    print(f"Latest checkpoint: {ckpt_path}")
-
             if aa.is_main_process() and run is not None:
                 # ScopedTimer.print_summary(clear=True)
                 # print(
@@ -244,7 +244,7 @@ def main(cfg: DictConfig):
                 run.log(info)
 
     if aa.is_main_process():
-        ckpt_path = save(policy, "checkpoint_final")
+        ckpt_path = save(policy, f"checkpoint_{total_iters}")
         # policy_eval = policy.get_rollout_policy("eval")
         # info, trajs, stats = evaluate(
         #     env, policy_eval, render=cfg.eval_render, seed=cfg.seed

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 TrackReward = BaseReward[RobotTracking]
 
 
-class _tracking_keypoint(TrackReward, namespace="hdmi"):
+class _tracking_body(TrackReward, namespace="hdmi"):
     def __init__(
         self,
         env,
@@ -42,61 +42,61 @@ class _tracking_keypoint(TrackReward, namespace="hdmi"):
         raise NotImplementedError
 
 
-class keypoint_pos_tracking_product(_tracking_keypoint, namespace="hdmi"):
+class body_pos_exp(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_pos_error[:, self.body_indices_tracking]
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_pos_tracking_local_product(_tracking_keypoint, namespace="hdmi"):
+class body_pos_local_exp(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_pos_error_local[:, self.body_indices_tracking]
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_pos_error(_tracking_keypoint, namespace="hdmi"):
+class body_pos_error(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_pos_error[:, self.body_indices_tracking]
         return error.mean(dim=1).unsqueeze(1)
 
 
-class keypoint_pos_error_local(_tracking_keypoint, namespace="hdmi"):
+class body_pos_error_local(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_pos_error_local[:, self.body_indices_tracking]
         return error.mean(dim=1).unsqueeze(1)
 
 
-class keypoint_ori_tracking_product(_tracking_keypoint, namespace="hdmi"):
+class body_ori_exp(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_ori_error[:, self.body_indices_tracking]
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_ori_tracking_local_product(_tracking_keypoint, namespace="hdmi"):
+class body_ori_local_exp(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_ori_error_local[:, self.body_indices_tracking]
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_ori_error(_tracking_keypoint, namespace="hdmi"):
+class body_ori_error(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_ori_error[:, self.body_indices_tracking]
         return error.mean(dim=1).unsqueeze(1)
 
 
-class keypoint_ori_error_local(_tracking_keypoint, namespace="hdmi"):
+class body_ori_error_local(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_ori_error_local[:, self.body_indices_tracking]
         return error.mean(dim=1).unsqueeze(1)
 
 
-class keypoint_lin_vel_tracking_product(_tracking_keypoint, namespace="hdmi"):
+class body_lin_vel_exp(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_lin_vel_error[:, self.body_indices_tracking]
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 
-class keypoint_ang_vel_tracking_product(_tracking_keypoint, namespace="hdmi"):
+class body_ang_vel_exp(_tracking_body, namespace="hdmi"):
     def _compute(self):
         error = self.command_manager.body_ang_vel_error[:, self.body_indices_tracking]
         return torch.exp(-error.mean(dim=1) / self.sigma).unsqueeze(1)
@@ -204,42 +204,3 @@ class feet_air_time_ref(TrackReward, namespace="hdmi"):
 
         self.reward_time = self.reward_time * (~current_contact)
         return reward
-
-
-# --------------------------------------------------------------------------- #
-# Keypoint position tracking with root alignment & look-ahead buffer
-# --------------------------------------------------------------------------- #
-class keypoint_pos_tracking_aligned(TrackReward, namespace="hdmi"):
-    def __init__(
-        self,
-        env,
-        body_names: List[str] | str,
-        sigma: float = 0.3,
-        **kwargs,
-    ):
-        super().__init__(env, **kwargs)
-        self.sigma = sigma
-
-        body_indices_tracking, matched_body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_body_names
-        )
-        assert matched_body_names, "keypoint_pos_tracking_aligned: no body matched"
-        self.body_indices_tracking = list(body_indices_tracking)
-        self.body_names = list(matched_body_names)
-        self.num_bodies = len(self.body_indices_tracking)
-
-    # --- reward --- #
-    def _compute(self):
-        target_anchor_pos = self.command_manager.target_anchor_pos_buf[:, :, 0].mean(
-            dim=1
-        )
-        ref_body_pos = self.command_manager.ref_body_pos_w[:, self.body_indices_tracking]
-        ref_anchor_pos = self.command_manager.ref_anchor_pos_w
-        aligned_body_pos_w = (
-            ref_body_pos - ref_anchor_pos.unsqueeze(1) + target_anchor_pos.unsqueeze(1)
-        )
-        robot_body_pos_w = self.command_manager.robot_body_link_pos_w[
-            :, self.body_indices_tracking
-        ]
-        error = (aligned_body_pos_w - robot_body_pos_w).norm(dim=-1)
-        return torch.exp(-error.mean(dim=1, keepdim=True) / self.sigma)

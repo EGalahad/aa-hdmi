@@ -3,13 +3,13 @@
 defaults:
   - override /algo: ppo_roa_finetune
 
-total_iters: 2000
+total_iters: 1000
 checkpoint_interval: 1000
 upload_interval: 1000
 
 algo:
   freeze_vecnorm: true
   entropy_coef_start: 0.002
-  entropy_coef_end: 0.0005
-  entropy_decay_start: 0
-  entropy_decay_end: 500
+  entropy_coef_end: 0.001
+  entropy_decay_start: 500
+  entropy_decay_end: 1000

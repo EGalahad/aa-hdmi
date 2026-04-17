@@ -9,6 +9,7 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "active_adaptation",
     "mjhub @ git+https://github.com/EGalahad/mjhub.git@main",
+    "any4hdmi @ git+https://github.com/EGalahad/any4hdmi.git@main",
 ]
 
 [project.entry-points."active_adaptation.projects"]

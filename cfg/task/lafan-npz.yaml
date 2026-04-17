@@ -6,5 +6,8 @@ defaults:
 name: lafan
 
 command:
-  data_path: ../lafan-process/output_motion/
-  # data_path: ../any4hdmi/output/lafan/motions/walk1_subject1.npz
+  motion_cfgs:
+    lafan:
+      path: "../lafan-process/output_motion/"
+      weight: 1.0
+      full_motion: true

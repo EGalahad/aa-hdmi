@@ -3,7 +3,7 @@
 defaults:
   - override /algo: ppo_roa_adapt
 
-total_iters: 1000
+total_iters: 500
 checkpoint_interval: 500
 upload_interval: 500
 

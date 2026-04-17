@@ -14,14 +14,60 @@ except ModuleNotFoundError:
 TrackObservation = BaseObservation[RobotTracking]
 
 
-class ref_joint_pos_future(TrackObservation, namespace="hdmi"):
-    def compute(self):
-        return self.command_manager.ref_joint_pos_future_.view(self.num_envs, -1)
+class _tracking_future_step_observation(TrackObservation):
+    def __init__(
+        self,
+        env,
+        future_steps: List[int] | int | None = None,
+        **kwargs,
+    ):
+        super().__init__(env, **kwargs)
+        if future_steps is None:
+            future_steps = self.command_manager.future_steps.tolist()
+        elif isinstance(future_steps, int):
+            future_steps = [future_steps]
+
+        available_future_steps = [
+            int(step) for step in self.command_manager.future_steps.tolist()
+        ]
+        future_step_indices = []
+        for step in future_steps:
+            step = int(step)
+            if step not in available_future_steps:
+                raise ValueError(
+                    f"future step {step} not in command.future_steps={available_future_steps}"
+                )
+            future_step_indices.append(available_future_steps.index(step))
+
+        self.future_step_indices = torch.as_tensor(
+            future_step_indices, dtype=torch.long, device=self.device
+        )
+
+    def _select_future_steps(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.index_select(x, 1, self.future_step_indices)
 
 
-class ref_joint_vel_future(TrackObservation, namespace="hdmi"):
+class ref_joint_pos_future(_tracking_future_step_observation, namespace="hdmi"):
+    def __init__(self, env, noise_std=0.0, **kwargs):
+        super().__init__(env, **kwargs)
+        self.noise_std = noise_std
+        
     def compute(self):
-        return self.command_manager.ref_joint_vel_future_.view(self.num_envs, -1)
+        joint_pos = self._select_future_steps(
+            self.command_manager.ref_joint_pos_future_
+        ).reshape(self.num_envs, -1)
+        if self.noise_std > 0.0:
+            joint_pos += (
+                torch.randn_like(joint_pos).clamp(-3.0, 3.0) * self.noise_std
+            )
+        return joint_pos
+
+
+class ref_joint_vel_future(_tracking_future_step_observation, namespace="hdmi"):
+    def compute(self):
+        return self._select_future_steps(
+            self.command_manager.ref_joint_vel_future_
+        ).reshape(self.num_envs, -1)
 
 
 class ref_joint_action(TrackObservation, namespace="hdmi"):
@@ -59,7 +105,7 @@ class ref_root_pos_future_b(TrackObservation, namespace="hdmi"):
         return self.command_manager.ref_root_pos_future_b.view(self.num_envs, -1)
 
 
-class ref_root_ori_future_b(TrackObservation, namespace="hdmi"):
+class ref_root_ori_future_b(_tracking_future_step_observation, namespace="hdmi"):
     """
     Reference root orientation in robot root frame
     """
@@ -69,7 +115,9 @@ class ref_root_ori_future_b(TrackObservation, namespace="hdmi"):
         self.noise_std = noise_std
 
     def compute(self):
-        ref_root_ori_future_b = self.command_manager.ref_root_ori_future_b_matrix
+        ref_root_ori_future_b = self._select_future_steps(
+            self.command_manager.ref_root_ori_future_b_matrix
+        )
         if self.noise_std > 0.0:
             ref_root_ori_future_b = ref_root_ori_future_b.clone()
             ref_root_ori_future_b += (
@@ -128,20 +176,28 @@ class ref_body_pos_future_local(
     _tracking_body_future_observation, namespace="hdmi"
 ):
     """
-    Reference body position in motion anchor frame
+    Reference body position in the projected-yaw anchor frame.
     """
+    def __init__(self, env, noise_std=0.0, **kwargs):
+        super().__init__(env, **kwargs)
+        self.noise_std = noise_std
 
     def compute(self):
-        return self._select_body_future(
+        ref_body_pos_future_local = self._select_body_future(
             self.command_manager.ref_body_pos_future_local
         ).reshape(self.num_envs, -1)
+        if self.noise_std > 0.0:
+            ref_body_pos_future_local += (
+                torch.randn_like(ref_body_pos_future_local).clamp(-3.0, 3.0) * self.noise_std
+            )
+        return ref_body_pos_future_local
 
 
 class ref_body_ori_future_local(
     _tracking_body_future_observation, namespace="hdmi"
 ):
     """
-    Reference body orientation in motion anchor frame
+    Reference body orientation in the projected-yaw anchor frame.
     """
 
     def compute(self):
@@ -155,7 +211,7 @@ class diff_body_pos_future_local(
     _tracking_body_future_observation, namespace="hdmi"
 ):
     """
-    Reference body position in each motion anchor frame - Robot body position in robot anchor frame.
+    Reference body position in the projected-yaw anchor frame minus robot body position in the projected-yaw anchor frame.
     """
 
     def compute(self):
@@ -168,7 +224,7 @@ class diff_body_lin_vel_future(
     _tracking_body_future_observation, namespace="hdmi"
 ):
     """
-    Reference body linear velocity in motion anchor frame - Robot body linear velocity in robot anchor frame.
+    Reference body linear velocity minus robot body linear velocity.
     """
 
     def compute(self):
@@ -181,7 +237,7 @@ class diff_body_ori_future_local(
     _tracking_body_future_observation, namespace="hdmi"
 ):
     """
-    Reference body orientation in motion anchor frame - Robot body orientation in robot anchor frame.
+    Reference body orientation in the projected-yaw anchor frame minus robot body orientation in the projected-yaw anchor frame.
     """
 
     def compute(self):
@@ -194,7 +250,7 @@ class diff_body_ang_vel_future(
     _tracking_body_future_observation, namespace="hdmi"
 ):
     """
-    Reference body linear velocity in motion anchor frame - Robot body linear velocity in robot anchor frame.
+    Reference body angular velocity minus robot body angular velocity.
     """
 
     def compute(self):

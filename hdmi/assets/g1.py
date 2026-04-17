@@ -6,21 +6,43 @@ from active_adaptation.assets.asset_cfg import (
 )
 from active_adaptation.assets.humanoid import G1_WAIST_UNLOCKED_CFG
 from active_adaptation.registry import Registry
-from pathlib import Path
+
+from mjhub import resolve_asset_reference
 
 registry = Registry.instance()
 
 
-# MJCF/USD paths.
-G1_MJCF_DIR = Path(__file__).resolve().parent / "assets"
-G1_USD = G1_MJCF_DIR / "g1_mode_13_15" / "g1_mode_13_15.usd"
+G1_XMLS_REPO_ID = "elijahgalahad/g1_xmls"
+G1_XMLS_REVISION = "main"
 
-G1_MJCF_BY_MODE = {
-    5: G1_MJCF_DIR / "g1-mode_5_11.xml",
-    11: G1_MJCF_DIR / "g1-mode_5_11.xml",
-    13: G1_MJCF_DIR / "g1-mode_13_15.xml",
-    15: G1_MJCF_DIR / "g1-mode_13_15.xml",
+G1_MJCF_REF_BY_MODE = {
+    5: f"hf://{G1_XMLS_REPO_ID}@{G1_XMLS_REVISION}/g1-mode_5_11.xml",
+    11: f"hf://{G1_XMLS_REPO_ID}@{G1_XMLS_REVISION}/g1-mode_5_11.xml",
+    13: f"hf://{G1_XMLS_REPO_ID}@{G1_XMLS_REVISION}/g1-mode_13_15.xml",
+    15: f"hf://{G1_XMLS_REPO_ID}@{G1_XMLS_REVISION}/g1-mode_13_15.xml",
 }
+
+G1_URDF_REF_BY_MODE = {
+    5: f"hf://{G1_XMLS_REPO_ID}@{G1_XMLS_REVISION}/g1-mode_5_11.urdf",
+    11: f"hf://{G1_XMLS_REPO_ID}@{G1_XMLS_REVISION}/g1-mode_5_11.urdf",
+    13: f"hf://{G1_XMLS_REPO_ID}@{G1_XMLS_REVISION}/g1-mode_13_15.urdf",
+    15: f"hf://{G1_XMLS_REPO_ID}@{G1_XMLS_REVISION}/g1-mode_13_15.urdf",
+}
+
+TOE_BODY_BY_ANKLE_BODY = {
+    "left_ankle_roll_link": "left_toe_link",
+    "right_ankle_roll_link": "right_toe_link",
+}
+
+
+def _with_toe_body_names(body_names):
+    result = []
+    for body_name in body_names:
+        result.append(body_name)
+        toe_body_name = TOE_BODY_BY_ANKLE_BODY.get(body_name)
+        if toe_body_name is not None:
+            result.append(toe_body_name)
+    return result
 
 
 def reflected_inertia_from_two_stage_planetary(
@@ -177,8 +199,8 @@ def _build_g1_cfg(mode: int) -> AssetCfg:
     wrist_act = G1_ACTUATOR_WRIST_4010 if mode in (5, 11) else G1_ACTUATOR_WRIST_5010
 
     return AssetCfg(
-        mjcf_path=G1_MJCF_BY_MODE[mode],
-        usd_path=G1_USD,
+        mjcf_path=resolve_asset_reference(G1_MJCF_REF_BY_MODE[mode]),
+        usd_path=resolve_asset_reference(G1_URDF_REF_BY_MODE[mode]),
         init_state=KNEES_BENT_KEYFRAME,
         self_collisions=True,
         actuators={
@@ -193,16 +215,14 @@ def _build_g1_cfg(mode: int) -> AssetCfg:
         sensors_isaaclab=[
             ContactSensorCfg(
                 name="contact_forces",
-                # g1_mjlab.usd nests rigid links under Robot/pelvis/*
-                primary="pelvis/.*",
+                primary=".*",
                 secondary=[],
                 track_air_time=True,
                 history_length=4,
             ),
             ContactSensorCfg(
                 name="self_collision",
-                # g1_mjlab.usd nests rigid links under Robot/pelvis/*
-                primary="^pelvis/(?!.*_ankle_roll_link.*$)(?!.*_wrist_yaw_link$).+$",
+                primary="^(?!.*_ankle_roll_link.*$)(?!.*_toe_link$)(?!.*_wrist_yaw_link$).+$",
                 secondary=[],
                 track_air_time=True,
                 history_length=4,
@@ -237,7 +257,9 @@ def _build_g1_cfg(mode: int) -> AssetCfg:
             ),
         ],
         joint_names_simulation=G1_WAIST_UNLOCKED_CFG.joint_names_simulation,
-        body_names_simulation=G1_WAIST_UNLOCKED_CFG.body_names_simulation,
+        body_names_simulation=_with_toe_body_names(
+            list(G1_WAIST_UNLOCKED_CFG.body_names_simulation)
+        ),
         joint_symmetry_mapping=G1_WAIST_UNLOCKED_CFG.joint_symmetry_mapping,
         spatial_symmetry_mapping=G1_WAIST_UNLOCKED_CFG.spatial_symmetry_mapping,
     )

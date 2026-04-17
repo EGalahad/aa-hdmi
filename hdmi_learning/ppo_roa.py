@@ -48,6 +48,7 @@ torch.set_float32_matmul_precision("high")
 REF_JPOS_KEY = "ref_joint_pos_"
 PRIV_TEACHER_KEY = "priv_teacher"
 PRIV_STUDENT_KEY = "priv_student"
+CMD_SHORT_KEY = "command_short"
 
 
 class NullVecNorm(VecNorm):
@@ -80,6 +81,8 @@ class PPOConfig:
 
     residual_action: bool = False
     finetune_adapt_module: bool = False
+    teacher_use_priv: bool = False
+    student_use_command_short: bool = True
 
     lr: float = 3e-4
     desired_kl: float | None = 0.01
@@ -109,7 +112,7 @@ class PPOConfig:
     vecnorm: bool = True
     freeze_vecnorm: bool = False
     checkpoint_path: Union[str, None] = None
-    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, OBS_PRIV_KEY)
+    in_keys: Tuple[str, ...] = (CMD_KEY, CMD_SHORT_KEY, OBS_KEY, OBS_PRIV_KEY)
 
     # TODO: ddp sync mode has some bugs
     grad_sync_mode: str | None = "manual" # Options: "ddp", "manual", None
@@ -171,8 +174,25 @@ class PPOROA(PPOBase):
 
         self._build_vecnorm_modules(observation_spec)
 
-        encoder_teacher_in_keys = [OBS_PRIV_KEY]
-        encoder_student_in_keys = [OBS_KEY, CMD_KEY]
+        observation_keys = set(observation_spec.keys(True, True))
+        required_keys = {CMD_KEY, OBS_KEY, OBS_PRIV_KEY}
+        missing_keys = sorted(required_keys.difference(observation_keys))
+        if missing_keys:
+            raise KeyError(f"Missing required observation keys: {missing_keys}")
+
+        self.student_command_key = (
+            CMD_SHORT_KEY if self.cfg.student_use_command_short else CMD_KEY
+        )
+        if self.student_command_key not in observation_keys:
+            raise KeyError(
+                f"Missing required student command observation key: "
+                f"{self.student_command_key!r}"
+            )
+
+        encoder_teacher_in_keys = (
+            [OBS_PRIV_KEY] if self.cfg.teacher_use_priv else [OBS_KEY, CMD_KEY]
+        )
+        encoder_student_in_keys = [OBS_KEY, self.student_command_key]
         critic_in_keys = [
             OBS_PRIV_KEY,
             OBS_KEY,
@@ -271,10 +291,10 @@ class PPOROA(PPOBase):
         self.dist_keys = ["loc", "scale"]
 
         self.actor_teacher = build_actor(
-            [CMD_KEY, OBS_KEY, PRIV_TEACHER_KEY],
+            [OBS_KEY, PRIV_TEACHER_KEY],
             residual=residual_module,
         )
-        self.actor_student = build_actor([CMD_KEY, OBS_KEY, PRIV_STUDENT_KEY])
+        self.actor_student = build_actor([OBS_KEY, PRIV_STUDENT_KEY])
 
         self.critic = Seq(
             CatTensors(critic_in_keys, "_critic_input", del_keys=False),
@@ -346,7 +366,7 @@ class PPOROA(PPOBase):
         self.vecnorms: Mapping[str, VecNorm] = nn.ModuleDict()
         vecnorm_cls = NullVecNorm if self.cfg.vecnorm is None else VecNorm
 
-        keys_to_norm = [CMD_KEY, OBS_KEY, OBS_PRIV_KEY]
+        keys_to_norm = [CMD_KEY, CMD_SHORT_KEY, OBS_KEY, OBS_PRIV_KEY]
         for key in keys_to_norm:
             if key not in observation_spec.keys(True, True):
                 continue

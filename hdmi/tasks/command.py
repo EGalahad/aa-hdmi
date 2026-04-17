@@ -3,11 +3,19 @@ from active_adaptation.assets.asset_cfg import (
     to_simulation_body_order,
     to_simulation_joint_order,
 )
-from hdmi.tasks.motion import MotionDataset, MotionData
+from hdmi.tasks.motion import MotionData, create_dataset_from_path
+from hdmi.tasks.multi_dataset import (
+    MotionDatasetConfig,
+    load_motion_dataset_collection,
+    normalize_motion_cfgs,
+)
 
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, TYPE_CHECKING, Literal
+from typing import List, Dict, Tuple, TYPE_CHECKING, Literal, Mapping
 import copy
+import importlib
+import json
+import os
 
 if TYPE_CHECKING:
     from mjlab.viewer.viser import ViserMujocoScene
@@ -74,14 +82,6 @@ def projected_yaw_quat(quat: torch.Tensor, x_axis_xy_threshold: float = 0.1) -> 
 
 
 quat_apply_inverse = batchify(quat_apply_inverse)
-
-DEBUG_TEMPORAL_ALIGN_DRAW = True
-DEBUG_TEMPORAL_ALIGN_TARGET_Z_OFFSET = 0.02
-DEBUG_TEMPORAL_ALIGN_CURRENT_Z_OFFSET = 0.0
-DEBUG_TEMPORAL_ALIGN_TARGET_ALPHA = 1.0
-DEBUG_TEMPORAL_ALIGN_CURRENT_ALPHA = 1.0
-DEBUG_TEMPORAL_ALIGN_AXIS_SCALE = 4.0
-DEBUG_TEMPORAL_ALIGN_AXIS_RADIUS = 0.15
 
 _DESIRED_FRAME_COLORS = (
     (0.9, 0.3, 0.3, 0.9),
@@ -307,12 +307,21 @@ class VizCfg:
     ghost_color: tuple[float, float, float, float] = (0.5, 0.7, 0.5, 0.5)
 
 
+@dataclass
+class ResetProfileStats:
+    calls: int = 0
+    envs_total: int = 0
+    total_reset_t: int = 0
+    max_reset_envs_one_call: int = 0
+    max_reset_t_seen: int = 0
+
+
 class RobotTracking(Command, namespace="hdmi"):
     def __init__(
         self,
         env,
-        data_path: List[str] | str,
-        tracking_keypoint_names: List[str],
+        motion_cfgs: Mapping[str, object],
+        tracking_body_names: List[str],
         tracking_joint_names: List[str],
         # reset parameters
         # will be offloaded to a dedicated randomization module in the future
@@ -338,7 +347,6 @@ class RobotTracking(Command, namespace="hdmi"):
         # observation parameters
         future_steps: List[int] = [1, 2, 8, 16],
         anchor_body_name: str = "torso_link",
-        look_ahead: List[int] | int = 50,
         call_update: bool = True,
         replay_motion: bool = False,
         record_motion: bool = False,
@@ -346,21 +354,22 @@ class RobotTracking(Command, namespace="hdmi"):
         rewind_steps_range: Tuple[int, int] = (25, 125),
         viz: VizCfg | Dict | None = None,
     ):
-        from . import observations
-        from . import rewards
-        from . import terminations
+        for module_name in (".observations", ".rewards", ".terminations"):
+            importlib.import_module(module_name, package=__package__)
 
         super().__init__(env)
-        self.dataset = MotionDataset.create_from_path(
-            data_path,
-            asset_joint_names=self.asset.joint_names,
+        self.motion_cfgs: list[MotionDatasetConfig] = normalize_motion_cfgs(motion_cfgs)
+        self.dataset = load_motion_dataset_collection(
+            self.motion_cfgs,
+            create_dataset_fn=create_dataset_from_path,
             target_fps=int(1 / self.env.step_dt),
+            num_envs=self.num_envs,
         ).to(self.device)
 
         # Set tracking body and joint names for observation and termination
-        tracking_body_names = self.asset.find_bodies(tracking_keypoint_names)[1]
+        matched_tracking_body_names = self.asset.find_bodies(tracking_body_names)[1]
         self.tracking_body_names = to_simulation_body_order(
-            tracking_body_names,
+            matched_tracking_body_names,
             self.asset.cfg,
         )
         self.tracking_body_indices_motion = [
@@ -395,35 +404,16 @@ class RobotTracking(Command, namespace="hdmi"):
         self.anchor_body_name = anchor_body_name
         self.anchor_body_idx_motion = self.dataset.body_names.index(anchor_body_name)
         self.anchor_body_idx_asset = self.asset.body_names.index(anchor_body_name)
-        if isinstance(look_ahead, int):
-            look_ahead = [look_ahead]
-        self.look_ahead = sorted(set(int(step) for step in look_ahead))
-        assert self.look_ahead, "look_ahead must not be empty"
-        assert self.look_ahead[0] > 0, "look_ahead must be positive"
-        self.num_look_ahead = len(self.look_ahead)
-        self.max_look_ahead = max(self.look_ahead)
 
         with torch.device(self.device):
             self.is_standing_env = torch.zeros(self.num_envs, 1, dtype=bool)
-            self.future_steps = torch.tensor(future_steps)
-            self.look_ahead_row_idx = torch.arange(self.num_look_ahead, dtype=torch.long)
-            self.look_ahead_time_idx = torch.tensor(
-                [step - 1 for step in self.look_ahead], dtype=torch.long
-            )
-            self.look_ahead_indices = torch.arange(self.max_look_ahead, dtype=torch.long)
-            self.target_anchor_pos_buf = torch.zeros(
-                self.num_envs,
-                self.num_look_ahead,
-                self.max_look_ahead,
-                3,
-            )
 
+        with torch.device(self.dataset.device):
             self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long)
             self.motion_len = torch.zeros(self.num_envs, dtype=torch.long)
-            self.motion_starts = torch.zeros(self.num_envs, dtype=torch.long)
-            self.motion_ends = torch.zeros(self.num_envs, dtype=torch.long)
             self.t = torch.zeros(self.num_envs, dtype=torch.long)
-            self.replay_motion_t = torch.zeros(self.num_envs, dtype=torch.long)
+            self.future_steps = torch.tensor(future_steps)
+            self.future_one_step = torch.zeros(1, dtype=torch.long)
 
         # get root body and joint indices in motion for reset
         self.root_body_name = root_body_name
@@ -448,20 +438,23 @@ class RobotTracking(Command, namespace="hdmi"):
         self.init_joint_vel_noise = init_joint_vel_noise
 
         self.rewind_prob = rewind_prob
-        self.rewind_steps_range = list(rewind_steps_range)
+        self.rewind_steps_range: Tuple[int, int] = tuple(rewind_steps_range)
         assert self.rewind_steps_range[0] >= 0
         assert self.rewind_steps_range[1] > self.rewind_steps_range[0]
 
+        if replay_motion:
+            raise NotImplementedError(
+                "replay_motion reset sampling is no longer supported on this command path"
+            )
         self.first_sample_motion = True
-        self.replay_motion = replay_motion
         self.record_motion = record_motion
+        self._profile_resets = os.environ.get("HDMI_PROFILE_RESETS", "0") == "1"
+        self._profile_resets_print_every = max(
+            1, int(os.environ.get("HDMI_PROFILE_RESETS_PRINT_EVERY", "10"))
+        )
+        self._reset_profile_stats = ResetProfileStats()
 
         self.all_env_ids = torch.arange(self.num_envs, device=self.device)
-
-        if self.replay_motion:
-            self.pose_range.fill_(0.0)
-            self.init_joint_pos_noise = 0.0
-            self.init_joint_vel_noise = 0.0
 
         if self.record_motion:
             assert self.num_envs == 1, "record_motion only supports num_envs=1"
@@ -472,7 +465,6 @@ class RobotTracking(Command, namespace="hdmi"):
         if call_update:
             self._read_current_robot_state()
             self._refresh_future_buffers()
-            self._reset_target_anchor_pos_buf(self.all_env_ids)
             self.update()
             if self.record_motion:
                 self.motion_frames = []
@@ -484,86 +476,43 @@ class RobotTracking(Command, namespace="hdmi"):
         self._ghost_model = None
 
     def _sample_motions(self, env_ids: torch.Tensor) -> None:
-        num_resets = len(env_ids)
-
-        if self.replay_motion:
-            if self.first_sample_motion:
-                sampled_frame_ids = torch.randint(
-                    0, self.dataset.num_steps, size=(num_resets,), device=self.device
-                )
-                motion_ids = self.dataset.data.motion_id[sampled_frame_ids].long()
-                self.motion_ids[env_ids] = motion_ids
-                self.motion_len[env_ids] = self.dataset.lengths[motion_ids]
-                self.motion_starts[env_ids] = self.dataset.starts[motion_ids]
-                self.motion_ends[env_ids] = self.dataset.ends[motion_ids]
-                self.first_sample_motion = False
-
-            motion_len = self.motion_len[env_ids]
-            self.replay_motion_t[env_ids] = (
-                self.replay_motion_t[env_ids] + 1
-            ) % motion_len
-            self.t[env_ids] = self.replay_motion_t[env_ids]
-            return
-
-        if not self.env.training and not self.record_motion:
-            if self.first_sample_motion:
-                sampled_frame_ids = torch.randint(
-                    0, self.dataset.num_steps, size=(num_resets,), device=self.device
-                )
-                motion_ids = self.dataset.data.motion_id[sampled_frame_ids].long()
-                self.motion_ids[env_ids] = motion_ids
-                self.motion_len[env_ids] = self.dataset.lengths[motion_ids]
-                self.motion_starts[env_ids] = self.dataset.starts[motion_ids]
-                self.motion_ends[env_ids] = self.dataset.ends[motion_ids]
-                self.first_sample_motion = False
-
-            self.t[env_ids] = 0
-            return
-
-        # Sample uniformly on the flattened dataset timeline, then recover the
-        # owning motion and local step from that frame.
-        sampled_frame_ids = torch.randint(
-            0, self.dataset.num_steps, size=(num_resets,), device=self.device
-        )
-        sampled_motion_ids = self.dataset.data.motion_id[sampled_frame_ids].long()
-        sampled_start_t = self.dataset.data.step[sampled_frame_ids].long()
-        sampled_motion_len = self.dataset.lengths[sampled_motion_ids]
-        sampled_motion_starts = self.dataset.starts[sampled_motion_ids]
-        sampled_motion_ends = self.dataset.ends[sampled_motion_ids]
-
         terminated_t = self.t[env_ids]
-        rewind_mask = torch.rand(num_resets, device=self.device) < self.rewind_prob
+        rewind_mask = torch.rand(len(env_ids), device=self.dataset.device) < self.rewind_prob
+
+        # do not rewind when motion is about to finish
+        finish_mask = terminated_t >= self.motion_len[env_ids] - 50
+        rewind_mask &= ~finish_mask
+
         if self.first_sample_motion:
             rewind_mask.fill_(False)
         rewind_steps = torch.randint(
-            *self.rewind_steps_range, (num_resets,), device=self.device
+            *self.rewind_steps_range,
+            (len(env_ids),),
+            device=self.dataset.device,
         )
-        rewind_t = torch.clamp(terminated_t - rewind_steps, min=0)
-
-        motion_ids = torch.where(rewind_mask, self.motion_ids[env_ids], sampled_motion_ids)
-        motion_len = torch.where(rewind_mask, self.motion_len[env_ids], sampled_motion_len)
-        motion_starts = torch.where(
-            rewind_mask, self.motion_starts[env_ids], sampled_motion_starts
+        sampled_motion = self.dataset.sample_motion(
+            env_ids,
+            terminated_t=terminated_t,
+            rewind_mask=rewind_mask,
+            rewind_steps=rewind_steps,
         )
-        motion_ends = torch.where(
-            rewind_mask, self.motion_ends[env_ids], sampled_motion_ends
-        )
-        start_t = torch.where(rewind_mask, rewind_t, sampled_start_t)
-
-        self.motion_ids[env_ids] = motion_ids
-        self.motion_len[env_ids] = motion_len
-        self.motion_starts[env_ids] = motion_starts
-        self.motion_ends[env_ids] = motion_ends
-        self.t[env_ids] = start_t
+        self.motion_ids[env_ids] = sampled_motion.motion_id
+        self.motion_len[env_ids] = sampled_motion.motion_len
+        self.t[env_ids] = sampled_motion.start_t
         self.first_sample_motion = False
 
     def sample_init(self, env_ids: torch.Tensor) -> None:
+        if self._profile_resets:
+            self._record_reset_profile(env_ids)
         self._sample_motions(env_ids)
 
         # reset root state and joint position/velocity from motion
         self._motion_reset: MotionData = self.dataset.get_slice(
-            self.motion_ids[env_ids], self.t[env_ids], 1
-        ).squeeze(1)
+            self.motion_ids[env_ids],
+            self.t[env_ids],
+            self.future_one_step,
+            profile_name="motion_reset",
+        ).to(self.device).squeeze(1)
         # shape: [len(env_ids), num_bodies/num_joints, 3/4/...]
 
         motion = self._motion_reset
@@ -639,7 +588,44 @@ class RobotTracking(Command, namespace="hdmi"):
                 self.motion_frames = []
 
     def reset(self, env_ids: torch.Tensor) -> None:
-        self._reset_target_anchor_pos_buf(env_ids)
+        pass
+
+    def _record_reset_profile(self, env_ids: torch.Tensor) -> None:
+        reset_count = int(len(env_ids))
+        if reset_count == 0:
+            return
+        reset_t = self.t[env_ids.to(self.dataset.device)]
+        total_reset_t = int(reset_t.sum().item())
+        max_reset_t = int(reset_t.max().item())
+        stats = self._reset_profile_stats
+        stats.calls += 1
+        stats.envs_total += reset_count
+        stats.total_reset_t += total_reset_t
+        stats.max_reset_envs_one_call = max(stats.max_reset_envs_one_call, reset_count)
+        stats.max_reset_t_seen = max(stats.max_reset_t_seen, max_reset_t)
+
+        if stats.calls % self._profile_resets_print_every != 0:
+            return
+
+        avg_envs = stats.envs_total / stats.calls
+        avg_reset_t = stats.total_reset_t / stats.envs_total if stats.envs_total > 0 else 0.0
+        dataset_kind = getattr(self.dataset, "dataset_kind", None)
+        if dataset_kind is None:
+            dataset_kind = (
+                "online_any4hdmi"
+                if self.dataset.__class__.__module__.startswith("any4hdmi.")
+                else "legacy_npz"
+            )
+        print(
+            "[hdmi][reset_profile]"
+            f" dataset={dataset_kind}"
+            f" calls={stats.calls}"
+            f" envs_total={stats.envs_total}"
+            f" avg_envs_per_call={avg_envs:.2f}"
+            f" avg_reset_t={avg_reset_t:.2f}"
+            f" max_reset_envs_one_call={stats.max_reset_envs_one_call}"
+            f" max_reset_t_seen={stats.max_reset_t_seen}"
+        )
 
     def _write_root_com_velocity(
         self, root_com_velocity: torch.Tensor, env_ids: torch.Tensor
@@ -676,7 +662,6 @@ class RobotTracking(Command, namespace="hdmi"):
         save_dir = "record_motion"
         motion_data_path = f"{save_dir}/motion.npz"
         motion_meta_path = f"{save_dir}/meta.json"
-        import os, json
 
         os.makedirs(save_dir, exist_ok=True)
         np.savez_compressed(motion_data_path, **motion_data)
@@ -720,7 +705,10 @@ class RobotTracking(Command, namespace="hdmi"):
         # `self.t` anchors the future-motion buffer used by observations.
         self.obs_motion_t = self.t.clone()
         self.future_ref_motion = self.dataset.get_slice(
-            self.motion_ids, self.t, steps=self.future_steps
+            self.motion_ids,
+            self.t,
+            steps=self.future_steps,
+            profile_name="future_ref_motion",
         )
         env_origins = self.env.scene.env_origins
 
@@ -800,52 +788,11 @@ class RobotTracking(Command, namespace="hdmi"):
         self.diff_body_lin_vel_future = self.ref_body_lin_vel_future_w - self.robot_body_lin_vel_w.unsqueeze(1)
         self.diff_body_ang_vel_future = self.ref_body_ang_vel_future_w - self.robot_body_ang_vel_w.unsqueeze(1)
 
-    def _reset_target_anchor_pos_buf(self, env_ids: torch.Tensor) -> None:
-        future_ref_motion = self.dataset.get_slice(
-            self.motion_ids[env_ids],
-            self.t[env_ids],
-            steps=self.look_ahead_indices,
-        )
-        ref_pos = future_ref_motion.body_pos_w[:, :, self.anchor_body_idx_motion]
-        ref_pos = ref_pos + self.env.scene.env_origins[env_ids].unsqueeze(1)
-        self.target_anchor_pos_buf[env_ids] = ref_pos.unsqueeze(1)
-
-    def _update_target_anchor_pos_buf(self) -> None:
-        look_ahead_motion = self.dataset.get_slice(
-            self.motion_ids,
-            self.t,
-            steps=self.look_ahead_time_idx,
-        )
-        ref_pos_look_ahead = (
-            look_ahead_motion.body_pos_w[:, :, self.anchor_body_idx_motion]
-            + self.env.scene.env_origins[:, None, :]
-        )
-
-        ref_pos_current = self.ref_anchor_pos_w.clone()
-        robot_pos_current = self.robot_anchor_pos_w.clone()
-        ref_pos_current[:, 2] = 0.0
-        robot_pos_current[:, 2] = 0.0
-
-        aligned_anchor_pos_w = (
-            ref_pos_look_ahead
-            - ref_pos_current[:, None, :]
-            + robot_pos_current[:, None, :]
-        )
-        self.target_anchor_pos_buf[:] = self.target_anchor_pos_buf.roll(-1, dims=2)
-        self.target_anchor_pos_buf[:, self.look_ahead_row_idx, self.look_ahead_time_idx] = (
-            aligned_anchor_pos_w
-        )
-
     def step(self):
         self._refresh_future_buffers()
         self.t += 1
 
     def update(self):
-        refresh_future_buffers = not hasattr(self, "future_ref_motion")
-        if self.replay_motion:
-            self.sample_init(self.all_env_ids)
-            refresh_future_buffers = True
-
         if hasattr(self, "motion_frames"):
             motion_frame = {}
             motion_frame["body_pos_w"] = self.asset.data.body_link_pos_w.cpu()
@@ -857,8 +804,8 @@ class RobotTracking(Command, namespace="hdmi"):
             self.motion_frames.append(TensorDict(motion_frame, batch_size=[1]))
 
         self._read_current_robot_state()
-        if refresh_future_buffers:
-            self._refresh_future_buffers()
+        # if not hasattr(self, "future_ref_motion")
+        #     self._refresh_future_buffers()
 
         # Reward / termination: consume the current frame from the previously
         # prepared future-motion buffer.
@@ -871,8 +818,6 @@ class RobotTracking(Command, namespace="hdmi"):
         self.ref_joint_vel = self.ref_joint_vel_future_[:, self.reward_current_step_index]
         self.ref_anchor_pos_w = self.ref_anchor_pos_future_w[:, self.reward_current_step_index]
         self.ref_anchor_quat_w = self.ref_anchor_quat_future_w[:, self.reward_current_step_index]
-        self._update_target_anchor_pos_buf()
-
         (
             self.ref_body_pos_local,
             self.ref_body_quat_local,
@@ -934,51 +879,6 @@ class RobotTracking(Command, namespace="hdmi"):
         scene: "ViserMujocoScene" | None = getattr(viewer, "scene", None)
         if scene is None:
             return
-
-        if (
-            self.env.backend == "mjlab"
-            and DEBUG_TEMPORAL_ALIGN_DRAW
-            and hasattr(self, "target_anchor_pos_buf")
-        ):
-            if scene.show_all_envs or self.num_envs == 1:
-                temporal_env_ids = range(self.num_envs)
-            else:
-                temporal_env_ids = [int(scene.env_idx)]
-
-            env_ids_tensor = torch.tensor(
-                list(temporal_env_ids), device=self.device, dtype=torch.long
-            )
-            target_anchor_pos = self.target_anchor_pos_buf[
-                env_ids_tensor, :, 0
-            ].mean(dim=1)
-            target_anchor_pos[:, 2] += DEBUG_TEMPORAL_ALIGN_TARGET_Z_OFFSET
-            target_anchor_mat = matrix_from_quat(self.ref_anchor_quat_w[env_ids_tensor])
-
-            robot_anchor_pos = self.robot_anchor_pos_w[env_ids_tensor].clone()
-            robot_anchor_pos[:, 2] += DEBUG_TEMPORAL_ALIGN_CURRENT_Z_OFFSET
-            robot_anchor_mat = matrix_from_quat(self.robot_anchor_quat_w[env_ids_tensor])
-
-            target_anchor_pos = target_anchor_pos.detach().cpu()
-            target_anchor_mat = target_anchor_mat.detach().cpu()
-            robot_anchor_pos = robot_anchor_pos.detach().cpu()
-            robot_anchor_mat = robot_anchor_mat.detach().cpu()
-
-            for env_idx in range(len(env_ids_tensor)):
-                scene.add_frame(
-                    target_anchor_pos[env_idx],
-                    target_anchor_mat[env_idx],
-                    scale=scene.meansize * DEBUG_TEMPORAL_ALIGN_AXIS_SCALE,
-                    axis_radius=scene.meansize * DEBUG_TEMPORAL_ALIGN_AXIS_RADIUS,
-                    alpha=DEBUG_TEMPORAL_ALIGN_TARGET_ALPHA,
-                    axis_colors=_DESIRED_FRAME_COLORS,
-                )
-                scene.add_frame(
-                    robot_anchor_pos[env_idx],
-                    robot_anchor_mat[env_idx],
-                    scale=scene.meansize * DEBUG_TEMPORAL_ALIGN_AXIS_SCALE,
-                    axis_radius=scene.meansize * DEBUG_TEMPORAL_ALIGN_AXIS_RADIUS,
-                    alpha=DEBUG_TEMPORAL_ALIGN_CURRENT_ALPHA,
-                )
 
         if self.viz.mode == "ghost":
             if self._ghost_model is None:

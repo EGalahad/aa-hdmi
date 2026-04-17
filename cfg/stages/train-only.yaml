@@ -1,0 +1,11 @@
+# @package _global_
+
+stages:
+  - name: train
+    overrides:
+      - +exp=train
+      - total_iters=5000
+      - algo.entropy_coef_start=0.012
+      - algo.entropy_coef_end=0.001
+      - algo.entropy_decay_start=3000
+    load_checkpoint_from_previous: false
