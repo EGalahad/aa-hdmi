@@ -40,6 +40,14 @@ def _sanitize_tag(tag: str) -> str:
     return tag.replace("/", "_").replace(" ", "_")
 
 
+def _stage_run_dir(stage_name: str, index: int, base_dir: Path | None = None) -> str:
+    if base_dir is None:
+        base_dir = Path.cwd()
+    stage_slug = _sanitize_tag(stage_name)
+    stage_dir = (base_dir / "stages" / f"{index + 1:02d}-{stage_slug}").resolve()
+    return str(stage_dir)
+
+
 def _collect_cli_overrides() -> list[str]:
     cli_overrides = []
     script_name = Path(__file__).name
@@ -128,6 +136,7 @@ def main(cfg: DictConfig) -> None:
     tag = _sanitize_tag(str(cfg.tag))
     suffix = _random_suffix(int(cfg.random_suffix_length))
     script_path = _resolve_script_path(str(cfg.script))
+    sequential_run_dir = Path.cwd()
 
     print("=" * 80)
     print("Detected command-line overrides applied to all stages:")
@@ -151,8 +160,14 @@ def main(cfg: DictConfig) -> None:
         print("=" * 80)
 
         stage_run_id = f"{suffix}_{tag}_{stage_name_value}"
+        stage_run_dir = _stage_run_dir(
+            stage_name_value,
+            i,
+            base_dir=sequential_run_dir,
+        )
         stage_overrides = cli_overrides.copy()
         stage_overrides.extend(stage_specific_overrides)
+        stage_overrides.append(f"hydra.run.dir={stage_run_dir}")
 
         if previous_run_id and load_from_previous:
             if wandb_project_path is None:
@@ -162,12 +177,12 @@ def main(cfg: DictConfig) -> None:
             print(f"Loading checkpoint from previous run: {previous_run_path}")
 
         stage_overrides.append(f"wandb.id={stage_run_id}")
+        print(f"Stage run dir: {stage_run_dir}")
 
         command = [
-            "uv",
-            "run",
-            "--active",
-            "torchrun",
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
             f"--nproc_per_node={cfg.nproc_per_node}",
             script_path,
             *stage_overrides,

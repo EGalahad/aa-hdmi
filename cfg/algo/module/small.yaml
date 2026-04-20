@@ -1,6 +1,6 @@
 # @package algo
 
-encoder_priv_hidden_dims: [128]
-adapt_module_hidden_dims: [128, 128]
+encoder_teacher_dims: [128]
+encoder_student_dims: [128, 128]
 actor_hidden_dims: [128, 128, 128]
 latent_dim: 128

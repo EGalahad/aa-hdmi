@@ -323,6 +323,7 @@ class RobotTracking(Command, namespace="hdmi"):
         motion_cfgs: Mapping[str, object],
         tracking_body_names: List[str],
         tracking_joint_names: List[str],
+        obs_body_names: List[str] | None = None,
         # reset parameters
         # will be offloaded to a dedicated randomization module in the future
         root_body_name: str = "pelvis",
@@ -346,6 +347,7 @@ class RobotTracking(Command, namespace="hdmi"):
         init_joint_vel_noise: float = 0.0,
         # observation parameters
         future_steps: List[int] = [1, 2, 8, 16],
+        diff_future_steps: List[int] = [0, 1],
         anchor_body_name: str = "torso_link",
         call_update: bool = True,
         replay_motion: bool = False,
@@ -379,6 +381,19 @@ class RobotTracking(Command, namespace="hdmi"):
             self.asset.body_names.index(name) for name in self.tracking_body_names
         ]
 
+        if obs_body_names is None:
+            obs_body_names = self.tracking_body_names
+        matched_obs_body_names = self.asset.find_bodies(obs_body_names)[1]
+        self.obs_body_names = to_simulation_body_order(
+            matched_obs_body_names,
+            self.asset.cfg,
+        )
+        self.obs_body_indices_tracking = torch.tensor(
+            [self.tracking_body_names.index(name) for name in self.obs_body_names],
+            dtype=torch.long,
+            device=self.device,
+        )
+
         tracking_joint_names = self.asset.find_joints(tracking_joint_names)[1]
         self.tracking_joint_names = to_simulation_joint_order(
             tracking_joint_names,
@@ -400,6 +415,11 @@ class RobotTracking(Command, namespace="hdmi"):
         assert 1 in future_steps, "future_steps must include 1 to compute current reward"
         self.obs_current_step_index = future_steps.index(0)
         self.reward_current_step_index = future_steps.index(1)
+        diff_future_steps = sorted(diff_future_steps)
+        for step in diff_future_steps:
+            assert step in future_steps, (
+                f"diff_future_steps must be a subset of future_steps, got step={step}"
+            )
 
         self.anchor_body_name = anchor_body_name
         self.anchor_body_idx_motion = self.dataset.body_names.index(anchor_body_name)
@@ -413,7 +433,12 @@ class RobotTracking(Command, namespace="hdmi"):
             self.motion_len = torch.zeros(self.num_envs, dtype=torch.long)
             self.t = torch.zeros(self.num_envs, dtype=torch.long)
             self.future_steps = torch.tensor(future_steps)
+            self.diff_future_steps = torch.tensor(diff_future_steps)
             self.future_one_step = torch.zeros(1, dtype=torch.long)
+            self.diff_future_step_indices = torch.tensor(
+                [future_steps.index(step) for step in diff_future_steps],
+                dtype=torch.long,
+            )
 
         # get root body and joint indices in motion for reset
         self.root_body_name = root_body_name
@@ -767,8 +792,8 @@ class RobotTracking(Command, namespace="hdmi"):
         ) = _compute_motion_local_obs(
             self.ref_anchor_pos_future_w[:, self.obs_current_step_index],
             self.ref_anchor_quat_future_w[:, self.obs_current_step_index],
-            self.ref_body_pos_future_w,
-            self.ref_body_quat_future_w,
+            self.ref_body_pos_future_w[:, :, self.obs_body_indices_tracking],
+            self.ref_body_quat_future_w[:, :, self.obs_body_indices_tracking],
         )
 
         # body_local_diff_obs
@@ -780,13 +805,17 @@ class RobotTracking(Command, namespace="hdmi"):
             self.ref_anchor_quat_future_w[:, self.obs_current_step_index],
             self.robot_anchor_pos_w,
             self.robot_anchor_quat_w,
-            self.ref_body_pos_future_w,
-            self.ref_body_quat_future_w,
+            self.ref_body_pos_future_w[:, self.diff_future_step_indices],
+            self.ref_body_quat_future_w[:, self.diff_future_step_indices],
             self.robot_body_link_pos_w,
             self.robot_body_link_quat_w,
         )
-        self.diff_body_lin_vel_future = self.ref_body_lin_vel_future_w - self.robot_body_lin_vel_w.unsqueeze(1)
-        self.diff_body_ang_vel_future = self.ref_body_ang_vel_future_w - self.robot_body_ang_vel_w.unsqueeze(1)
+        self.diff_body_lin_vel_future = (
+            self.ref_body_lin_vel_future_w[:, self.diff_future_step_indices] - self.robot_body_lin_vel_w.unsqueeze(1)
+        )
+        self.diff_body_ang_vel_future = (
+            self.ref_body_ang_vel_future_w[:, self.diff_future_step_indices] - self.robot_body_ang_vel_w.unsqueeze(1)
+        )
 
     def step(self):
         self._refresh_future_buffers()

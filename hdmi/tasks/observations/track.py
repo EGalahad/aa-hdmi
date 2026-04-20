@@ -129,6 +129,9 @@ class ref_root_ori_future_b(_tracking_future_step_observation, namespace="hdmi")
 # motion_local_obs
 
 class _tracking_body_future_observation(TrackObservation):
+    available_body_names_attr = "tracking_body_names"
+    available_future_steps_attr = "future_steps"
+
     def __init__(
         self,
         env,
@@ -137,26 +140,36 @@ class _tracking_body_future_observation(TrackObservation):
         **kwargs,
     ):
         super().__init__(env, **kwargs)
+        available_body_names = list(
+            getattr(self.command_manager, self.available_body_names_attr)
+        )
         if body_names is None:
-            body_names = self.command_manager.tracking_body_names
+            body_names = available_body_names
         if future_steps is None:
-            future_steps = self.command_manager.future_steps.tolist()
+            future_steps = getattr(
+                self.command_manager, self.available_future_steps_attr
+            ).tolist()
         elif isinstance(future_steps, int):
             future_steps = [future_steps]
 
         body_indices_tracking, matched_body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_body_names
+            body_names, available_body_names
         )
         if not matched_body_names:
             raise ValueError("No tracking body matched for observation.")
 
-        available_future_steps = [int(step) for step in self.command_manager.future_steps.tolist()]
+        available_future_steps = [
+            int(step)
+            for step in getattr(
+                self.command_manager, self.available_future_steps_attr
+            ).tolist()
+        ]
         future_step_indices = []
         for step in future_steps:
             step = int(step)
             if step not in available_future_steps:
                 raise ValueError(
-                    f"future step {step} not in command.future_steps={available_future_steps}"
+                    f"future step {step} not in command.{self.available_future_steps_attr}={available_future_steps}"
                 )
             future_step_indices.append(available_future_steps.index(step))
 
@@ -172,8 +185,12 @@ class _tracking_body_future_observation(TrackObservation):
         return torch.index_select(x, 2, self.body_indices_tracking)
 
 
+class _motion_local_body_future_observation(_tracking_body_future_observation):
+    available_body_names_attr = "obs_body_names"
+
+
 class ref_body_pos_future_local(
-    _tracking_body_future_observation, namespace="hdmi"
+    _motion_local_body_future_observation, namespace="hdmi"
 ):
     """
     Reference body position in the projected-yaw anchor frame.
@@ -194,7 +211,7 @@ class ref_body_pos_future_local(
 
 
 class ref_body_ori_future_local(
-    _tracking_body_future_observation, namespace="hdmi"
+    _motion_local_body_future_observation, namespace="hdmi"
 ):
     """
     Reference body orientation in the projected-yaw anchor frame.
@@ -207,8 +224,12 @@ class ref_body_ori_future_local(
 
 # body_local_diff_obs
 
+class _diff_body_future_observation(_tracking_body_future_observation):
+    available_future_steps_attr = "diff_future_steps"
+
+
 class diff_body_pos_future_local(
-    _tracking_body_future_observation, namespace="hdmi"
+    _diff_body_future_observation, namespace="hdmi"
 ):
     """
     Reference body position in the projected-yaw anchor frame minus robot body position in the projected-yaw anchor frame.
@@ -221,7 +242,7 @@ class diff_body_pos_future_local(
 
 
 class diff_body_lin_vel_future(
-    _tracking_body_future_observation, namespace="hdmi"
+    _diff_body_future_observation, namespace="hdmi"
 ):
     """
     Reference body linear velocity minus robot body linear velocity.
@@ -234,7 +255,7 @@ class diff_body_lin_vel_future(
 
 
 class diff_body_ori_future_local(
-    _tracking_body_future_observation, namespace="hdmi"
+    _diff_body_future_observation, namespace="hdmi"
 ):
     """
     Reference body orientation in the projected-yaw anchor frame minus robot body orientation in the projected-yaw anchor frame.
@@ -247,7 +268,7 @@ class diff_body_ori_future_local(
 
 
 class diff_body_ang_vel_future(
-    _tracking_body_future_observation, namespace="hdmi"
+    _diff_body_future_observation, namespace="hdmi"
 ):
     """
     Reference body angular velocity minus robot body angular velocity.

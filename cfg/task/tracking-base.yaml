@@ -14,6 +14,13 @@ shared:
   anchor_body_name: pelvis
   reward_root_body_name: torso_link
   termination_root_body_name: torso_link
+  obs_body_names:
+    - "pelvis"
+    - ".*_knee_link"
+    - ".*_toe_link"
+    - ".*_shoulder_yaw_link"
+    - ".*_elbow_link"
+    - ".*_wrist_yaw_link"
 
   tracking_body_names:
     - "pelvis"
@@ -87,7 +94,9 @@ command:
   _target_: hdmi.RobotTracking
   motion_cfgs: ???
   tracking_body_names: ${task.shared.tracking_body_names}
+  obs_body_names: ${task.shared.obs_body_names}
   tracking_joint_names: ${task.shared.tracking_joint_names}
+  diff_future_steps: [0, 1]
   root_body_name: ${task.shared.root_body_name}
   anchor_body_name: ${task.shared.anchor_body_name}
 

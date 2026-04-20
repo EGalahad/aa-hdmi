@@ -113,6 +113,8 @@ def main(cfg: DictConfig):
         "adapt_hx",
         "episode_id",
     ]
+    next_saved_keys.extend(policy.get_next_saved_keys())
+    next_saved_keys = list(dict.fromkeys(next_saved_keys))
 
     env_frames = 0
 
