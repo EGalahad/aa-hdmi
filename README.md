@@ -7,7 +7,7 @@ Clone the `active-adaptation` repository and the HDMI project:
 ```bash
 git clone -b dev/hdmi https://github.com/Agent-3154/active-adaptation.git
 cd active-adaptation
-git clone https://github.com/EGalahad/aa-hdmi projects/aa-hdmi
+git clone https://github.com/EGalahad/aa-hdmi projects/hdmi
 ```
 
 Refresh project discovery:

@@ -8,7 +8,7 @@ from typing import List
 import torch
 from tqdm import tqdm
 
-from any4hdmi import BaseDataset as Any4HDMIBaseDataset, load_any4hdmi_dataset, resolve_input_paths, MotionData
+from any4hdmi import BaseDataset as Any4HDMIBaseDataset, MotionData, load_any4hdmi_dataset
 MOTION_DATASET_VALIDATE_CHUNK_SIZE = 131072
 MOTION_DATASET_QUAT_NORM_ATOL = 1e-3
 
@@ -33,9 +33,8 @@ def create_dataset_from_path(
     import active_adaptation
 
     base_dir = Path(active_adaptation.__file__).parent.parent
-    input_paths = resolve_input_paths(base_dir, root_path)
     dataset = load_any4hdmi_dataset(
-        input_paths=input_paths,
+        root_path=root_path,
         target_fps=target_fps,
         base_dir=base_dir,
         num_envs=num_envs,
