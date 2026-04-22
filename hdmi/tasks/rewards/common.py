@@ -1,15 +1,9 @@
 """Common reward aliases for HDMI tasks."""
 
-import active_adaptation as aa
-from active_adaptation.assets.asset_cfg import to_simulation_joint_order
 from active_adaptation.envs.mdp.rewards.base import Reward as BaseReward
+from active_adaptation.envs.utils import find_joints
 from typing import List, TYPE_CHECKING
 import torch
-
-try:
-    from isaaclab.utils.string import resolve_matching_names
-except ModuleNotFoundError:
-    from mjlab.utils.lab_api.string import resolve_matching_names
 
 if TYPE_CHECKING:
     from mjlab.sensor import ContactSensor as MJLabContactSensor
@@ -27,14 +21,8 @@ class joint_pos_limits(BaseReward, namespace="hdmi"):
     ):
         super().__init__(env, weight=weight, **kwargs)
         self.asset = self.env.scene.articulations["robot"]
-        _, matched_joint_names = resolve_matching_names(
-            joint_names, self.asset.joint_names
-        )
-        self.joint_names = to_simulation_joint_order(matched_joint_names, self.asset.cfg)
-        self.joint_ids = torch.as_tensor(
-            [self.asset.joint_names.index(name) for name in self.joint_names],
-            device=self.device,
-        )
+        joint_ids, self.joint_names = find_joints(self.asset, joint_names)
+        self.joint_ids = torch.as_tensor(joint_ids, device=self.device)
         jpos_limits = self.asset.data.joint_pos_limits[:, self.joint_ids]
         jpos_mean = (jpos_limits[..., 0] + jpos_limits[..., 1]) / 2
         jpos_range = jpos_limits[..., 1] - jpos_limits[..., 0]

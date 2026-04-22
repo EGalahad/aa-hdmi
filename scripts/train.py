@@ -70,6 +70,7 @@ def main(cfg: DictConfig):
     def save(policy, checkpoint_name: str, *, upload_to_wandb: bool = True):
         assert run is not None
         run_dir = Path(run.dir)
+        stage_dir = Path.cwd()
         ckpt_path = run_dir / f"{checkpoint_name}.pt"
         state_dict = OrderedDict()
         state_dict["wandb"] = {"name": run.name, "id": run.id}
@@ -85,6 +86,11 @@ def main(cfg: DictConfig):
         if latest_link.exists() or latest_link.is_symlink():
             latest_link.unlink()
         latest_link.symlink_to(ckpt_path.name)
+
+        stage_latest_link = stage_dir / "checkpoint_latest.pt"
+        if stage_latest_link.exists() or stage_latest_link.is_symlink():
+            stage_latest_link.unlink()
+        stage_latest_link.symlink_to(ckpt_path.resolve())
         logging.info(
             f"Saved checkpoint to {ckpt_path}" + (" (wandb)" if upload_to_wandb else "")
         )
@@ -237,7 +243,7 @@ def main(cfg: DictConfig):
             info["performance/iter_time"] = time.perf_counter() - rollout_start
 
             if aa.is_main_process() and run is not None:
-                # ScopedTimer.print_summary(clear=True)
+                ScopedTimer.print_summary(clear=True, depth=5)
                 # print(
                 #     OmegaConf.to_yaml(
                 #         {k: v for k, v in info.items() if isinstance(v, (float, int))}

@@ -3,11 +3,8 @@
 import torch
 from typing import cast
 import active_adaptation as aa
-from active_adaptation.assets.asset_cfg import (
-    to_simulation_body_order,
-    to_simulation_joint_order,
-)
 from active_adaptation.envs.mdp.observations.base import Observation as BaseObservation
+from active_adaptation.envs.utils import find_bodies, find_joints
 from active_adaptation.utils.math import quat_rotate_inverse
 from hdmi.tasks.actions import JointPosition
 
@@ -22,23 +19,13 @@ def random_noise(x: torch.Tensor, std: float):
 
 
 def _get_simulation_joint_selection(asset, joint_names: str, device: torch.device):
-    _, matched_joint_names = asset.find_joints(joint_names)
-    ordered_joint_names = to_simulation_joint_order(matched_joint_names, asset.cfg)
-    joint_ids = torch.as_tensor(
-        [asset.joint_names.index(joint_name) for joint_name in ordered_joint_names],
-        device=device,
-    )
-    return joint_ids, ordered_joint_names
+    joint_ids, joint_names = find_joints(asset, joint_names)
+    return torch.as_tensor(joint_ids, device=device), joint_names
 
 
 def _get_simulation_body_selection(asset, body_names: str, device: torch.device):
-    _, matched_body_names = asset.find_bodies(body_names)
-    ordered_body_names = to_simulation_body_order(matched_body_names, asset.cfg)
-    body_ids = torch.as_tensor(
-        [asset.body_names.index(body_name) for body_name in ordered_body_names],
-        device=device,
-    )
-    return body_ids, ordered_body_names
+    body_ids, body_names = find_bodies(asset, body_names)
+    return torch.as_tensor(body_ids, device=device), body_names
 
 
 class root_ang_vel_history(BaseObservation, namespace="hdmi"):

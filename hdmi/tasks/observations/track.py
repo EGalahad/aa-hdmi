@@ -2,16 +2,30 @@ from hdmi.tasks.command import RobotTracking
 from hdmi.tasks.actions import JointPosition
 
 from active_adaptation.envs.mdp.observations.base import Observation as BaseObservation
+from active_adaptation.envs.utils import find_bodies
 
 import torch
 from typing import cast, List
 
-try:
-    from isaaclab.utils.string import resolve_matching_names
-except ModuleNotFoundError:
-    from mjlab.utils.lab_api.string import resolve_matching_names
-
 TrackObservation = BaseObservation[RobotTracking]
+
+
+def _select_available_body_names(
+    asset,
+    available_body_names: list[str],
+    body_names: List[str] | str,
+) -> tuple[list[int], list[str]]:
+    _, matched_body_names = find_bodies(asset, body_names)
+    matched_name_set = set(matched_body_names)
+    selected_body_names = [
+        body_name for body_name in available_body_names if body_name in matched_name_set
+    ]
+    if not selected_body_names:
+        raise ValueError("No tracking body matched for observation.")
+    selected_body_indices = [
+        available_body_names.index(body_name) for body_name in selected_body_names
+    ]
+    return selected_body_indices, selected_body_names
 
 
 class _tracking_future_step_observation(TrackObservation):
@@ -152,11 +166,11 @@ class _tracking_body_future_observation(TrackObservation):
         elif isinstance(future_steps, int):
             future_steps = [future_steps]
 
-        body_indices_tracking, matched_body_names = resolve_matching_names(
-            body_names, available_body_names
+        body_indices_tracking, matched_body_names = _select_available_body_names(
+            self.command_manager.asset,
+            available_body_names,
+            body_names,
         )
-        if not matched_body_names:
-            raise ValueError("No tracking body matched for observation.")
 
         available_future_steps = [
             int(step)

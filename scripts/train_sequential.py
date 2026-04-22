@@ -61,29 +61,6 @@ def _collect_cli_overrides() -> list[str]:
     return cli_overrides
 
 
-def _wandb_project_path(cfg: DictConfig) -> str:
-    entity = cfg.wandb.get("entity")
-    project = str(cfg.wandb.project)
-    if entity:
-        return f"{entity}/{project}"
-    if "/" in project:
-        return project
-    try:
-        import wandb
-
-        default_entity = getattr(wandb.Api(), "default_entity", None)
-        if default_entity:
-            return f"{default_entity}/{project}"
-    except Exception as e:
-        print(f"Error while trying to determine default W&B entity: {e}")
-        pass
-    raise ValueError(
-        "Need `wandb.entity`, a slash-qualified `wandb.project`, or a locally "
-        "configured default W&B entity to build "
-        f"checkpoint_path, got project={project!r}."
-    )
-
-
 def _normalize_stage(stage, index: int) -> dict[str, object]:
     if isinstance(stage, DictConfig):
         return {
@@ -147,8 +124,7 @@ def main(cfg: DictConfig) -> None:
         print("  - None")
     print("=" * 80)
 
-    previous_run_id = None
-    wandb_project_path = None
+    previous_checkpoint_path = None
 
     for i, stage in enumerate(stages):
         stage_name_value = str(stage["name"])
@@ -169,12 +145,9 @@ def main(cfg: DictConfig) -> None:
         stage_overrides.extend(stage_specific_overrides)
         stage_overrides.append(f"hydra.run.dir={stage_run_dir}")
 
-        if previous_run_id and load_from_previous:
-            if wandb_project_path is None:
-                wandb_project_path = _wandb_project_path(cfg)
-            previous_run_path = f"{wandb_project_path}/{previous_run_id}"
-            stage_overrides.append(f"checkpoint_path=run:{previous_run_path}")
-            print(f"Loading checkpoint from previous run: {previous_run_path}")
+        if previous_checkpoint_path and load_from_previous:
+            stage_overrides.append(f"checkpoint_path={previous_checkpoint_path}")
+            print(f"Loading checkpoint from previous stage: {previous_checkpoint_path}")
 
         stage_overrides.append(f"wandb.id={stage_run_id}")
         print(f"Stage run dir: {stage_run_dir}")
@@ -193,16 +166,16 @@ def main(cfg: DictConfig) -> None:
         print(f"Child process for stage '{stage_name_value}' finished")
 
         if _has_future_checkpoint_consumer(stages, i):
-            previous_run_id = stage_run_id
-            print(f"Recorded run ID for downstream stages: {previous_run_id}")
+            previous_checkpoint_path = str(Path(stage_run_dir) / "checkpoint_latest.pt")
+            print(
+                "Recorded local checkpoint for downstream stages: "
+                f"{previous_checkpoint_path}"
+            )
         else:
-            previous_run_id = None
+            previous_checkpoint_path = None
 
         print(f"Completed stage {i + 1}/{len(stages)}: {stage_name_value}")
-        if wandb_project_path is not None:
-            print(f"Run path: {wandb_project_path}/{stage_run_id}")
-        else:
-            print(f"Run ID: {stage_run_id}")
+        print(f"Run ID: {stage_run_id}")
         print("=" * 80)
 
     print("\nAll training stages finished")

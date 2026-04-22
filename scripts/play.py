@@ -17,15 +17,13 @@ import re
 import secrets
 import time
 from pathlib import Path
+from tqdm import tqdm
+import yaml
 
 import hydra
-import numpy as np
 import torch
+import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
-from tensordict import TensorDictBase
-from tensordict.nn import TensorDictModuleBase as ModBase
-from tensordict.nn import TensorDictSequential
-from torchvision.io import write_video
 from torchrl.envs.transforms import VecNorm as TorchRLVecNorm
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from active_adaptation.utils.profiling import ScopedTimer
@@ -35,7 +33,6 @@ from active_adaptation.learning.modules.vecnorm import VecNorm
 from active_adaptation.utils.export import export_onnx
 from active_adaptation.utils.helpers import EpisodeStats
 from active_adaptation.utils.timerfd import Timer
-from active_adaptation.utils.torchrl import ObsNorm
 from active_adaptation.utils.wandb import parse_checkpoint_path
 
 from typing import TYPE_CHECKING, cast
@@ -45,21 +42,6 @@ if TYPE_CHECKING:
 
 FILE_PATH = Path(__file__).resolve().parent
 CONFIG_PATH = FILE_PATH.parent / "cfg"
-
-
-def _find_vecnorm(env) -> TorchRLVecNorm | None:
-    transform = getattr(env, "transform", None)
-    if transform is None:
-        return None
-
-    transforms = getattr(transform, "transforms", None)
-    if transforms is None:
-        transforms = [transform]
-
-    for t in transforms:
-        if isinstance(t, TorchRLVecNorm):
-            return t
-    return None
 
 
 def _get_asset_meta(asset) -> dict:
@@ -133,15 +115,7 @@ def export_policy(cfg: DictConfig, env: "_EnvBase", policy) -> None:
     checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path)
     wandb_run_id, checkpoint_num = _checkpoint_tags(checkpoint_path)
 
-    deploy_policy: ModBase = copy.deepcopy(policy.get_rollout_policy("deploy"))
-
-    vecnorm = _find_vecnorm(env)
-    if vecnorm is not None:
-        obs_norm = ObsNorm.from_vecnorm(vecnorm, deploy_policy.in_keys)
-        export_module = TensorDictSequential(obs_norm, deploy_policy).cpu()
-    else:
-        export_module = deploy_policy.cpu()
-
+    deploy_policy = copy.deepcopy(policy.get_rollout_policy("deploy")).cpu()
     fake_input = env.observation_spec[0].rand().cpu()
 
     export_dir = FILE_PATH / "exports" / str(cfg.task.name)
@@ -151,8 +125,7 @@ def export_policy(cfg: DictConfig, env: "_EnvBase", policy) -> None:
     onnx_path = str(base.with_suffix(".onnx"))
     yaml_path = str(base.with_suffix(".yaml"))
 
-    meta = {}
-    export_onnx(export_module, fake_input, onnx_path, meta)
+    export_onnx(deploy_policy, fake_input, onnx_path)
 
     dict_cfg = OmegaConf.to_container(cfg, resolve=True)
     policy_config = {}
@@ -179,15 +152,16 @@ def export_policy(cfg: DictConfig, env: "_EnvBase", policy) -> None:
     command = cast(RobotTracking, env.command_manager)
 
     motion_cfg = policy_config.setdefault("motion", {})
-    # motion_cfg["motion_path"] = dict_cfg["task"]["command"]["data_path"]
-    motion_cfg["motion_path"] = str(command.dataset.motion_paths[0])
+    from hdmi.tasks.multi_dataset import motion_cfgs_to_dict
+
+    motion_cfg["motion_cfgs"] = motion_cfgs_to_dict(command.motion_cfgs)
+    if len(command.motion_cfgs) == 1 and isinstance(command.motion_cfgs[0].path, str):
+        motion_cfg["motion_path"] = str(command.motion_cfgs[0].path)
     motion_cfg["future_steps"] = command.future_steps.tolist()
     motion_cfg["body_names"] = command.tracking_body_names
     motion_cfg["joint_names"] = command.tracking_joint_names
     motion_cfg["root_body_name"] = command.root_body_name
     motion_cfg["anchor_body_name"] = command.anchor_body_name
-
-    import yaml
 
     with open(yaml_path, "w") as f:
         yaml.dump(policy_config, f, sort_keys=False)
@@ -231,12 +205,20 @@ def main(cfg: DictConfig):
     fps_window_frames = 0
     render_seconds = float(cfg.get("render_seconds", 0.0))
     render_enabled = render_seconds != 0.0
-    max_steps = None if not render_enabled else max(1, int(render_seconds / env.step_dt))
-    frames: list[np.ndarray] = []
+    if render_enabled:
+        max_steps = max(1, int(render_seconds / env.step_dt))
+        progress = tqdm(range(max_steps), total=max_steps, desc="Playing", unit="step")
+    else:
+        progress = itertools.count()
+    output_path = _make_render_output_path()
 
     # with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
-    with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
-        for i in itertools.count():
+    with (
+        env.get_recorder(output_path, enabled=render_enabled) as recorder,
+        torch.inference_mode(),
+        set_exploration_type(ExplorationType.MODE),
+    ):
+        for i in progress:
             with ScopedTimer("inference", sync=False):
                 carry = rollout_policy(carry)
             with ScopedTimer("env_step", sync=False):
@@ -249,36 +231,21 @@ def main(cfg: DictConfig):
                     print(k, torch.mean(v).item())
 
             if render_enabled:
-                frame = env.render("rgb_array")
-                if frame is not None:
-                    frames.append(frame)
+                recorder.add_frame()
 
             fps_window_frames += 1
             window_elapsed = time.perf_counter() - fps_window_start
             if window_elapsed >= 1.0:
-                print(
-                    f"Loop FPS: {fps_window_frames} frames in "
-                    f"{window_elapsed:.2f}s"
-                )
+                if not render_enabled:
+                    print(
+                        f"Loop FPS: {fps_window_frames} frames in "
+                        f"{window_elapsed:.2f}s"
+                    )
                 # ScopedTimer.print_summary(clear=True)
                 fps_window_start = time.perf_counter()
                 fps_window_frames = 0
 
-            if max_steps is not None and (i + 1) >= max_steps:
-                break
-
             timer.sleep()
-
-    if frames:
-        output_path = _make_render_output_path()
-        video = np.stack(frames)
-        write_video(
-            str(output_path),
-            video_array=torch.from_numpy(video),
-            fps=round(1.0 / env.step_dt),
-            video_codec="h264",
-        )
-        print(f"Saved video to {output_path}")
 
     env.close()
 

@@ -3,12 +3,9 @@
 import active_adaptation as aa
 from hdmi.tasks.command import RobotTracking
 from active_adaptation.envs.mdp.rewards.base import Reward as BaseReward
+from active_adaptation.envs.utils import find_bodies, find_sensor_bodies
 from typing import TYPE_CHECKING, cast
 import torch
-try:
-    from isaaclab.utils.string import resolve_matching_names
-except ModuleNotFoundError:
-    from mjlab.utils.lab_api.string import resolve_matching_names
 
 if aa.get_backend() == "isaac":
     from isaaclab.sensors import ContactSensor as IsaacContactSensor
@@ -20,40 +17,20 @@ if TYPE_CHECKING:
 
 TrackReward = BaseReward[RobotTracking]
 
-def _sensor_body_names(contact_sensor) -> list[str]:
-    if hasattr(contact_sensor, "body_names"):
-        return list(contact_sensor.body_names)
-    slots = getattr(contact_sensor, "_slots", None)
-    if slots is not None:
-        names: list[str] = []
-        for slot in slots:
-            name = getattr(slot, "primary_name", None)
-            if name is not None and name not in names:
-                names.append(name)
-        if names:
-            return names
-    raise AttributeError("Cannot infer body names from contact sensor.")
 
-
-def _find_sensor_bodies(contact_sensor, body_names: str):
-    if hasattr(contact_sensor, "find_bodies"):
-        return contact_sensor.find_bodies(body_names)
-    sensor_body_names = _sensor_body_names(contact_sensor)
-    return resolve_matching_names(body_names, sensor_body_names)
-
-
-def _find_sensor_bodies_by_names(contact_sensor, body_names: list[str]) -> tuple[list[int], list[str]]:
-    sensor_body_names = _sensor_body_names(contact_sensor)
-    sensor_name_to_id = {name: i for i, name in enumerate(sensor_body_names)}
-    ids = []
-    names = []
-    for name in body_names:
-        sensor_id = sensor_name_to_id.get(name)
-        if sensor_id is None:
-            continue
-        ids.append(sensor_id)
-        names.append(name)
-    return ids, names
+def _select_tracking_body_names(
+    command_manager: RobotTracking,
+    body_names: str | list[str],
+) -> list[str]:
+    available_body_names = list(command_manager.tracking_body_names)
+    _, matched_body_names = find_bodies(command_manager.asset, body_names)
+    matched_name_set = set(matched_body_names)
+    selected_body_names = [
+        body_name for body_name in available_body_names if body_name in matched_name_set
+    ]
+    if not selected_body_names:
+        raise RuntimeError("No matched feet in tracking bodies.")
+    return selected_body_names
 
 
 def _current_in_contact(contact_sensor, body_ids: torch.Tensor) -> torch.Tensor:
@@ -91,14 +68,15 @@ class feet_slip(TrackReward, namespace="hdmi"):
         super().__init__(env, weight=weight, **kwargs)
         self.asset = self.env.scene.articulations["robot"]
         self.contact_sensor = self.env.scene.sensors["contact_forces"]
-        _, matched_body_names = self.asset.find_bodies(body_names)
-        self.body_names = sorted(matched_body_names)
+        articulation_body_ids, self.body_names = find_bodies(self.asset, body_names)
         self.articulation_body_ids = torch.as_tensor(
-            [self.asset.body_names.index(name) for name in self.body_names],
+            articulation_body_ids,
             device=self.device,
         )
-        sensor_ids, sensor_names = _find_sensor_bodies_by_names(
-            self.contact_sensor, self.body_names
+        sensor_ids, sensor_names = find_sensor_bodies(
+            self.asset,
+            self.contact_sensor,
+            self.body_names,
         )
         if set(sensor_names) != set(self.body_names):
             missing = sorted(set(self.body_names) - set(sensor_names))
@@ -135,14 +113,14 @@ class feet_air_time(TrackReward, namespace="hdmi"):
         super().__init__(env, weight=weight, **kwargs)
         self.asset = self.env.scene.articulations["robot"]
         self.contact_sensor: "IsaacContactSensor" | "MJLabContactSensor" = self.env.scene.sensors["contact_forces"]
-        body_indices, matched_body_names = self.asset.find_bodies(body_names)
+        body_indices, matched_body_names = find_bodies(self.asset, body_names)
         self.body_indices = torch.as_tensor(
             body_indices, dtype=torch.long, device=self.device
         )
         if body2_names is None:
             self.body2_indices = self.body_indices
         else:
-            body2_indices, _ = self.asset.find_bodies(body2_names)
+            body2_indices, _ = find_bodies(self.asset, body2_names)
             self.body2_indices = torch.as_tensor(
                 body2_indices, dtype=torch.long, device=self.device
             )
@@ -151,8 +129,10 @@ class feet_air_time(TrackReward, namespace="hdmi"):
                     "body2_names must match body_names length for feet_air_time."
                 )
 
-        sensor_ids, sensor_names = _find_sensor_bodies_by_names(
-            self.contact_sensor, matched_body_names
+        sensor_ids, sensor_names = find_sensor_bodies(
+            self.asset,
+            self.contact_sensor,
+            matched_body_names,
         )
         if set(sensor_names) != set(matched_body_names):
             missing = sorted(set(matched_body_names) - set(sensor_names))
@@ -300,9 +280,14 @@ class feet_contact_count(TrackReward, namespace="hdmi"):
 
     def __init__(self, env, body_names: str, weight: float, enabled: bool = True):
         super().__init__(env, weight=weight, enabled=enabled)
+        self.asset = self.env.scene.articulations["robot"]
         self.contact_sensor: "IsaacContactSensor" | "MJLabContactSensor" = self.env.scene.sensors["contact_forces"]
 
-        body_ids, self.body_names = _find_sensor_bodies(self.contact_sensor, body_names)
+        body_ids, self.body_names = find_sensor_bodies(
+            self.asset,
+            self.contact_sensor,
+            body_names,
+        )
         self.body_ids = torch.as_tensor(body_ids, device=self.env.device)
         self.current_contact = torch.zeros(
             self.num_envs, len(self.body_ids), dtype=torch.bool, device=self.device
@@ -331,9 +316,14 @@ class feet_contact_duration(TrackReward, namespace="hdmi"):
 
     def __init__(self, env, body_names: str, weight: float, enabled: bool = True):
         super().__init__(env, weight=weight, enabled=enabled)
+        self.asset = self.env.scene.articulations["robot"]
         self.contact_sensor: "IsaacContactSensor" | "MJLabContactSensor" = self.env.scene.sensors["contact_forces"]
 
-        body_ids, self.body_names = _find_sensor_bodies(self.contact_sensor, body_names)
+        body_ids, self.body_names = find_sensor_bodies(
+            self.asset,
+            self.contact_sensor,
+            body_names,
+        )
         self.body_ids = torch.as_tensor(body_ids, device=self.env.device)
         self.current_contact = torch.zeros(
             self.num_envs, len(self.body_ids), dtype=torch.bool, device=self.device
@@ -350,249 +340,3 @@ class feet_contact_duration(TrackReward, namespace="hdmi"):
     def _compute(self):
         return self.current_contact.float().mean(1, keepdim=True)
 
-
-class ref_contact(TrackReward, namespace="hdmi"):
-    supported_backends = ("isaac", "mjlab")
-
-    def __init__(
-        self,
-        env,
-        body_names: str | list[str],
-        body2_names: str | list[str] | None = None,
-        air_h_low: float = 0.035,
-        air_h_high: float = 0.155,
-        contact_h_low: float = 0.035,
-        contact_h_high: float = 0.125,
-        feet_standing_z_enter: float = 0.18,
-        feet_standing_z_exit: float = 0.25,
-        feet_standing_vxy_enter: float = 0.2,
-        feet_standing_vxy_exit: float = 0.3,
-        feet_standing_vz_enter: float = 0.15,
-        feet_standing_vz_exit: float = 0.25,
-        debug_draw_enabled: bool = True,
-        debug_target_color: tuple[float, float, float, float] = (1.0, 0.9, 0.1, 1.0),
-        debug_current_color: tuple[float, float, float, float] = (0.1, 0.9, 1.0, 1.0),
-        weight: float = 1.0,
-        **kwargs,
-    ):
-        super().__init__(env, weight=weight, **kwargs)
-        self.asset = self.command_manager.asset
-        self.contact_sensor = self.env.scene.sensors["contact_forces"]
-
-        _, motion_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_body_names
-        )
-        _, asset_names = resolve_matching_names(body_names, self.asset.body_names)
-        matched_names = sorted(set(motion_names) & set(asset_names))
-        if not matched_names:
-            raise RuntimeError("feet_air_time_ref_dense: no matched feet in motion and asset.")
-
-        self.body_indices_motion = torch.tensor(
-            [self.command_manager.tracking_body_names.index(n) for n in matched_names],
-            dtype=torch.long,
-            device=self.device,
-        )
-        self.body_indices_asset = torch.tensor(
-            [self.asset.body_names.index(n) for n in matched_names],
-            dtype=torch.long,
-            device=self.device,
-        )
-        self.num_bodies = len(matched_names)
-
-        sensor_ids, sensor_names = _find_sensor_bodies_by_names(self.contact_sensor, matched_names)
-        if not sensor_ids:
-            raise RuntimeError("feet_air_time_ref_dense: no matched feet in contact sensor.")
-        if set(sensor_names) != set(matched_names):
-            missing = sorted(set(matched_names) - set(sensor_names))
-            raise RuntimeError(
-                f"feet_air_time_ref_dense: missing feet in contact sensor: {missing}"
-            )
-        self.sensor_body_ids = torch.tensor(sensor_ids, dtype=torch.long, device=self.device)
-
-        if body2_names is None:
-            self.body2_indices_asset = self.body_indices_asset
-        else:
-            body2_indices_asset, _ = self.asset.find_bodies(body2_names)
-            self.body2_indices_asset = torch.as_tensor(
-                body2_indices_asset, dtype=torch.long, device=self.device
-            )
-            if len(self.body2_indices_asset) != len(self.body_indices_asset):
-                raise ValueError(
-                    "body2_names must match body_names length for feet_air_time_ref_dense."
-                )
-
-        self.air_h_low = float(air_h_low)
-        self.air_h_high = float(air_h_high)
-        self.air_h_span = max(self.air_h_high - self.air_h_low, 1e-6)
-        self.contact_h_low = float(contact_h_low)
-        self.contact_h_high = float(contact_h_high)
-        self.contact_h_span = max(self.contact_h_high - self.contact_h_low, 1e-6)
-
-        self.feet_standing_z_enter = float(feet_standing_z_enter)
-        self.feet_standing_z_exit = float(feet_standing_z_exit)
-        self.feet_standing_vxy_enter = float(feet_standing_vxy_enter)
-        self.feet_standing_vxy_exit = float(feet_standing_vxy_exit)
-        self.feet_standing_vz_enter = float(feet_standing_vz_enter)
-        self.feet_standing_vz_exit = float(feet_standing_vz_exit)
-
-        self.current_contact = torch.zeros(
-            self.num_envs, len(self.sensor_body_ids), dtype=torch.bool, device=self.device
-        )
-        self.target_contact = torch.zeros_like(self.current_contact)
-
-        self.debug_draw_enabled = bool(debug_draw_enabled)
-        self.debug_target_color = debug_target_color
-        self.debug_current_color = debug_current_color
-        self.debug_point_size = 1.5
-
-    def reset(self, env_ids):
-        self.current_contact[env_ids] = False
-        self.target_contact[env_ids] = False
-
-    def _compute_target_contact(self) -> torch.Tensor:
-        ref_vel = self.command_manager.ref_body_lin_vel_w[:, self.body_indices_motion]
-        ref_pos = self.command_manager.ref_body_pos_w[:, self.body_indices_motion]
-        root_vxy = self.command_manager.current_ref_motion.body_lin_vel_w[
-            :, self.command_manager.root_body_idx_motion, :2
-        ].norm(dim=-1, keepdim=True).clamp_min(1.0)
-
-        feet_vxy = ref_vel[..., :2].norm(dim=-1)
-        feet_vz_abs = ref_vel[..., 2].abs()
-        feet_z = ref_pos[..., 2]
-
-        enter_contact = (
-            (feet_z < self.feet_standing_z_enter)
-            & (feet_vxy < self.feet_standing_vxy_enter * root_vxy)
-            & (feet_vz_abs < self.feet_standing_vz_enter * root_vxy)
-        )
-        exit_contact = (
-            (feet_z > self.feet_standing_z_exit)
-            | (feet_vxy > self.feet_standing_vxy_exit * root_vxy)
-            | (feet_vz_abs > self.feet_standing_vz_exit * root_vxy)
-        )
-        self.target_contact = (self.target_contact & (~exit_contact)) | enter_contact
-        return self.target_contact
-
-    def _compute(self):
-        self.current_contact[:] = _current_in_contact(
-            self.contact_sensor, self.sensor_body_ids
-        )
-        target_contact = self._compute_target_contact()
-        current_contact = self.current_contact
-
-        mismatch = current_contact ^ target_contact
-        both_air = (~current_contact) & (~target_contact)
-        both_contact = current_contact & target_contact
-
-        penalty = torch.zeros_like(current_contact, dtype=torch.float32)
-        penalty[mismatch] = -1.0
-
-        feet_height_air = torch.minimum(
-            self.asset.data.body_link_pos_w[:, self.body_indices_asset, 2],
-            self.asset.data.body_link_pos_w[:, self.body2_indices_asset, 2],
-        )
-        air_ratio = ((feet_height_air - self.air_h_low) / self.air_h_span).clamp(0.0, 1.0)
-        air_penalty = -(1.0 - air_ratio)
-        penalty = torch.where(both_air, air_penalty, penalty)
-
-        feet_height_contact = torch.maximum(
-            self.asset.data.body_link_pos_w[:, self.body_indices_asset, 2],
-            self.asset.data.body_link_pos_w[:, self.body2_indices_asset, 2],
-        )
-        contact_ratio = ((feet_height_contact - self.contact_h_low) / self.contact_h_span).clamp(
-            0.0, 1.0
-        )
-        contact_penalty = -contact_ratio
-        penalty = torch.where(both_contact, contact_penalty, penalty)
-
-        return penalty.mean(dim=1, keepdim=True)
-
-    def debug_draw(self):
-        if not self.debug_draw_enabled:
-            return
-
-        target_positions = self.command_manager.ref_body_pos_w[
-            :, self.body_indices_motion
-        ].clone()
-        current_positions = self.asset.data.body_link_pos_w[
-            :, self.body_indices_asset
-        ].clone()
-
-        target_contact = self.target_contact
-        current_contact = self.current_contact
-        mismatch = target_contact ^ current_contact
-
-        if aa.get_backend() == "isaac":
-            debug_draw = getattr(self.env, "debug_draw", None)
-            if debug_draw is None:
-                return
-
-            target_positions = target_positions.detach().cpu()
-            current_positions = current_positions.detach().cpu()
-            target_contact = target_contact.detach().cpu()
-            current_contact = current_contact.detach().cpu()
-            mismatch = mismatch.detach().cpu()
-
-            target_points = target_positions[target_contact]
-            current_points = current_positions[current_contact]
-            if target_points.numel() > 0:
-                debug_draw.point(
-                    target_points,
-                    color=self.debug_target_color,
-                    size=self.debug_point_size,
-                )
-            if current_points.numel() > 0:
-                debug_draw.point(
-                    current_points,
-                    color=self.debug_current_color,
-                    size=self.debug_point_size,
-                )
-            if mismatch.any().item():
-                debug_draw.vector(
-                    current_positions[mismatch],
-                    target_positions[mismatch] - current_positions[mismatch],
-                    color=(1.0, 0.4, 0.2, 1.0),
-                    size=max(self.debug_point_size * 0.04, 1.0),
-                )
-            return
-
-        viewer = getattr(self.env.sim, "viewer", None)
-        if viewer is None:
-            return
-        scene: "ViserMujocoScene" | None = getattr(viewer, "scene", None)
-        if scene is None:
-            return
-
-        point_radius = scene.meansize * self.debug_point_size
-        target_positions = target_positions.detach().cpu()
-        current_positions = current_positions.detach().cpu()
-        target_contact = target_contact.detach().cpu()
-        current_contact = current_contact.detach().cpu()
-        mismatch = mismatch.detach().cpu()
-
-        if scene.show_all_envs or self.num_envs == 1:
-            env_ids = range(self.num_envs)
-        else:
-            env_ids = [int(scene.env_idx)]
-
-        for env_idx in env_ids:
-            for body_idx in range(self.num_bodies):
-                if target_contact[env_idx, body_idx]:
-                    scene.add_sphere(
-                        target_positions[env_idx, body_idx],
-                        point_radius,
-                        self.debug_target_color,
-                    )
-                if current_contact[env_idx, body_idx]:
-                    scene.add_sphere(
-                        current_positions[env_idx, body_idx],
-                        point_radius,
-                        self.debug_current_color,
-                    )
-                if mismatch[env_idx, body_idx]:
-                    scene.add_arrow(
-                        current_positions[env_idx, body_idx],
-                        target_positions[env_idx, body_idx],
-                        (1.0, 0.4, 0.2, 1.0),
-                        width=max(point_radius * 0.15, 0.003),
-                    )

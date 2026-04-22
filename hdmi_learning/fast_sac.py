@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModule as Mod, TensorDictSequential as Seq
-from torchrl.data import CompositeSpec, LazyTensorStorage, TensorDictReplayBuffer, TensorSpec
+from torchrl.data import Composite as CompositeSpec, LazyTensorStorage, TensorDictReplayBuffer, TensorSpec
 from torchrl.envs.transforms import TensorDictPrimer
 from torchrl.modules import ProbabilisticActor
 

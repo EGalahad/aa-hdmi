@@ -1,13 +1,9 @@
 from hdmi.tasks.command import RobotTracking
 
 from active_adaptation.envs.mdp.rewards.base import Reward as BaseReward
+from active_adaptation.envs.utils import find_bodies, find_joints, find_sensor_bodies
 
 from typing import List, TYPE_CHECKING
-
-try:
-    from isaaclab.utils.string import resolve_matching_names
-except ModuleNotFoundError:
-    from mjlab.utils.lab_api.string import resolve_matching_names
 
 import torch
 
@@ -15,6 +11,40 @@ if TYPE_CHECKING:
     from mjlab.sensor import ContactSensor
 
 TrackReward = BaseReward[RobotTracking]
+
+
+def _select_tracking_body_names(
+    command_manager: RobotTracking,
+    body_names: List[str] | str,
+) -> tuple[list[int], list[str]]:
+    available_body_names = list(command_manager.tracking_body_names)
+    _, matched_body_names = find_bodies(command_manager.asset, body_names)
+    matched_name_set = set(matched_body_names)
+    selected_body_names = [
+        body_name for body_name in available_body_names if body_name in matched_name_set
+    ]
+    assert selected_body_names, "No body names matched in tracking_body_names"
+    selected_body_indices = [
+        available_body_names.index(body_name) for body_name in selected_body_names
+    ]
+    return selected_body_indices, selected_body_names
+
+
+def _select_tracking_joint_names(
+    command_manager: RobotTracking,
+    joint_names: List[str] | str,
+) -> tuple[list[int], list[str]]:
+    available_joint_names = list(command_manager.tracking_joint_names)
+    _, matched_joint_names = find_joints(command_manager.asset, joint_names)
+    matched_name_set = set(matched_joint_names)
+    selected_joint_names = [
+        joint_name for joint_name in available_joint_names if joint_name in matched_name_set
+    ]
+    assert selected_joint_names, "No joint names matched in tracking_joint_names"
+    selected_joint_indices = [
+        available_joint_names.index(joint_name) for joint_name in selected_joint_names
+    ]
+    return selected_joint_indices, selected_joint_names
 
 
 class _tracking_body(TrackReward, namespace="hdmi"):
@@ -30,10 +60,10 @@ class _tracking_body(TrackReward, namespace="hdmi"):
             body_names = self.command_manager.tracking_body_names
 
         self.sigma = sigma
-        body_indices_tracking, matched_body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_body_names
+        body_indices_tracking, matched_body_names = _select_tracking_body_names(
+            self.command_manager,
+            body_names,
         )
-        assert matched_body_names, "No body names matched in tracking_body_names"
         self.body_indices_tracking = list(body_indices_tracking)
         self.body_names = list(matched_body_names)
         self.num_bodies = len(self.body_names)
@@ -115,10 +145,10 @@ class _tracking_joint(TrackReward, namespace="hdmi"):
             joint_names = self.command_manager.tracking_joint_names
 
         self.sigma = sigma
-        joint_indices_tracking, matched_joint_names = resolve_matching_names(
-            joint_names, self.command_manager.tracking_joint_names
+        joint_indices_tracking, matched_joint_names = _select_tracking_joint_names(
+            self.command_manager,
+            joint_names,
         )
-        assert matched_joint_names, "No joint names matched in tracking_joint_names"
         self.joint_indices_tracking = list(joint_indices_tracking)
         self.joint_names = list(matched_joint_names)
 
@@ -147,14 +177,24 @@ class feet_air_time_ref(TrackReward, namespace="hdmi"):
     def __init__(self, env, body_names: List[str] | str, thres: float, **kwargs):
         super().__init__(env, **kwargs)
         self.thres = thres
+        self.asset = self.command_manager.asset
         self.contact_sensor: "ContactSensor" = self.env.scene["feet_ground_contact"]
 
-        body_indices_tracking, matched_body_names = resolve_matching_names(
-            body_names, self.command_manager.tracking_body_names
+        body_indices_tracking, matched_body_names = _select_tracking_body_names(
+            self.command_manager,
+            body_names,
         )
-        assert matched_body_names, "feet_air_time_ref: no feet matched"
         self.body_indices_tracking = list(body_indices_tracking)
-        sensor_ids, _ = self.contact_sensor.find_bodies(matched_body_names)
+        sensor_ids, sensor_names = find_sensor_bodies(
+            self.asset,
+            self.contact_sensor,
+            matched_body_names,
+        )
+        if set(sensor_names) != set(matched_body_names):
+            missing = sorted(set(matched_body_names) - set(sensor_names))
+            raise RuntimeError(
+                f"feet_air_time_ref: missing feet in contact sensor: {missing}"
+            )
         self.sensor_body_ids = torch.tensor(sensor_ids, device=self.device)
 
         num_bodies = len(matched_body_names)

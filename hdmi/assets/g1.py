@@ -3,6 +3,7 @@ from active_adaptation.assets.asset_cfg import (
     AssetCfg,
     ContactSensorCfg,
     InitialStateCfg,
+    MjlabCollisionCfg,
 )
 from active_adaptation.assets.humanoid import G1_WAIST_UNLOCKED_CFG
 from active_adaptation.registry import Registry
@@ -254,6 +255,12 @@ def _build_g1_cfg(mode: int) -> AssetCfg:
                 reduce="none",
                 num_slots=1,
                 history_length=4,
+            ),
+        ],
+        mjlab_collisions=[
+            MjlabCollisionCfg(
+                geom_names_expr=(".*_collision",),
+                disable_other_geoms=False,
             ),
         ],
         joint_names_simulation=G1_WAIST_UNLOCKED_CFG.joint_names_simulation,

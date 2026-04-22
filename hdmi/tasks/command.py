@@ -1,8 +1,5 @@
 from active_adaptation.envs.mdp.commands.base import Command
-from active_adaptation.assets.asset_cfg import (
-    to_simulation_body_order,
-    to_simulation_joint_order,
-)
+from active_adaptation.envs.utils import find_bodies, find_joints
 from hdmi.tasks.motion import MotionData, create_dataset_from_path
 from hdmi.tasks.multi_dataset import (
     MotionDatasetConfig,
@@ -35,7 +32,15 @@ from active_adaptation.utils.math import (
     quat_from_yaw,
     batchify,
 )
+from active_adaptation.utils.profiling import ScopedTimer
 from tensordict import TensorDict
+
+PROFILE_SYNC_TIMERS = os.environ.get("AA_PROFILE_SYNC_TIMERS", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 def projected_yaw_quat(quat: torch.Tensor, x_axis_xy_threshold: float = 0.1) -> torch.Tensor:
     """Build a level yaw quaternion from horizontal axis projections.
@@ -369,42 +374,30 @@ class RobotTracking(Command, namespace="hdmi"):
         ).to(self.device)
 
         # Set tracking body and joint names for observation and termination
-        matched_tracking_body_names = self.asset.find_bodies(tracking_body_names)[1]
-        self.tracking_body_names = to_simulation_body_order(
-            matched_tracking_body_names,
-            self.asset.cfg,
+        tracking_body_indices_asset, self.tracking_body_names = find_bodies(
+            self.asset, tracking_body_names
         )
         self.tracking_body_indices_motion = [
             self.dataset.body_names.index(name) for name in self.tracking_body_names
         ]
-        self.tracking_body_indices_asset = [
-            self.asset.body_names.index(name) for name in self.tracking_body_names
-        ]
+        self.tracking_body_indices_asset = list(tracking_body_indices_asset)
 
         if obs_body_names is None:
             obs_body_names = self.tracking_body_names
-        matched_obs_body_names = self.asset.find_bodies(obs_body_names)[1]
-        self.obs_body_names = to_simulation_body_order(
-            matched_obs_body_names,
-            self.asset.cfg,
-        )
+        _, self.obs_body_names = find_bodies(self.asset, obs_body_names)
         self.obs_body_indices_tracking = torch.tensor(
             [self.tracking_body_names.index(name) for name in self.obs_body_names],
             dtype=torch.long,
             device=self.device,
         )
 
-        tracking_joint_names = self.asset.find_joints(tracking_joint_names)[1]
-        self.tracking_joint_names = to_simulation_joint_order(
-            tracking_joint_names,
-            self.asset.cfg,
+        tracking_joint_indices_asset, self.tracking_joint_names = find_joints(
+            self.asset, tracking_joint_names
         )
         self.tracking_joint_indices_motion = [
             self.dataset.joint_names.index(name) for name in self.tracking_joint_names
         ]
-        self.tracking_joint_indices_asset = [
-            self.asset.joint_names.index(name) for name in self.tracking_joint_names
-        ]
+        self.tracking_joint_indices_asset = list(tracking_joint_indices_asset)
 
         self.num_tracking_bodies = len(self.tracking_body_indices_asset)
         self.num_tracking_joints = len(self.tracking_joint_indices_asset)
@@ -424,6 +417,32 @@ class RobotTracking(Command, namespace="hdmi"):
         self.anchor_body_name = anchor_body_name
         self.anchor_body_idx_motion = self.dataset.body_names.index(anchor_body_name)
         self.anchor_body_idx_asset = self.asset.body_names.index(anchor_body_name)
+
+        if self.env.backend == "mjlab":
+            indexing = self.asset.data.indexing
+            tracking_body_indices_asset = torch.as_tensor(
+                self.tracking_body_indices_asset,
+                dtype=torch.long,
+                device=indexing.body_ids.device,
+            )
+            tracking_joint_indices_asset = torch.as_tensor(
+                self.tracking_joint_indices_asset,
+                dtype=torch.long,
+                device=indexing.joint_q_adr.device,
+            )
+            self._mjlab_tracking_body_ids = torch.index_select(
+                indexing.body_ids, 0, tracking_body_indices_asset
+            )
+            self._mjlab_tracking_joint_q_adr = torch.index_select(
+                indexing.joint_q_adr, 0, tracking_joint_indices_asset
+            )
+            self._mjlab_tracking_joint_v_adr = torch.index_select(
+                indexing.joint_v_adr, 0, tracking_joint_indices_asset
+            )
+            self._mjlab_root_body_id = indexing.root_body_id
+            self._mjlab_anchor_body_id = int(
+                indexing.body_ids[self.anchor_body_idx_asset].item()
+            )
 
         with torch.device(self.device):
             self.is_standing_env = torch.zeros(self.num_envs, 1, dtype=bool)
@@ -696,6 +715,10 @@ class RobotTracking(Command, namespace="hdmi"):
         breakpoint()
 
     def _read_current_robot_state(self):
+        if self.env.backend == "mjlab":
+            self._read_current_robot_state_mjlab()
+            return
+
         self.robot_body_link_pos_w = self.asset.data.body_link_pos_w[
             :, self.tracking_body_indices_asset
         ]
@@ -725,6 +748,41 @@ class RobotTracking(Command, namespace="hdmi"):
         self.robot_anchor_quat_w = self.asset.data.body_link_quat_w[
             :, self.anchor_body_idx_asset
         ]
+
+    def _read_current_robot_state_mjlab(self):
+        from mjlab.entity.data import compute_velocity_from_cvel
+
+        asset_data = self.asset.data
+        sim_data = asset_data.data
+
+        body_ids = self._mjlab_tracking_body_ids
+        root_body_id = self._mjlab_root_body_id
+        anchor_body_id = self._mjlab_anchor_body_id
+
+        body_link_pos_w = sim_data.xpos[:, body_ids]
+        body_link_quat_w = sim_data.xquat[:, body_ids]
+        body_cvel = sim_data.cvel[:, body_ids]
+        body_com_pos_w = sim_data.xipos[:, body_ids]
+        root_subtree_com = sim_data.subtree_com[:, root_body_id].unsqueeze(1)
+        body_com_vel_w = compute_velocity_from_cvel(
+            body_com_pos_w,
+            root_subtree_com,
+            body_cvel,
+        )
+
+        self.robot_body_link_pos_w = body_link_pos_w
+        self.robot_body_lin_vel_w = body_com_vel_w[..., 0:3]
+        self.robot_body_link_quat_w = body_link_quat_w
+        self.robot_body_ang_vel_w = body_cvel[..., 0:3]
+
+        self.robot_joint_pos = sim_data.qpos[:, self._mjlab_tracking_joint_q_adr]
+        self.robot_joint_vel = sim_data.qvel[:, self._mjlab_tracking_joint_v_adr]
+
+        self.robot_root_pos_w = sim_data.xpos[:, root_body_id]
+        self.robot_root_quat_w = sim_data.xquat[:, root_body_id]
+
+        self.robot_anchor_pos_w = sim_data.xpos[:, anchor_body_id]
+        self.robot_anchor_quat_w = sim_data.xquat[:, anchor_body_id]
 
     def _refresh_future_buffers(self):
         # `self.t` anchors the future-motion buffer used by observations.
@@ -823,73 +881,80 @@ class RobotTracking(Command, namespace="hdmi"):
 
     def update(self):
         if hasattr(self, "motion_frames"):
-            motion_frame = {}
-            motion_frame["body_pos_w"] = self.asset.data.body_link_pos_w.cpu()
-            motion_frame["body_quat_w"] = self.asset.data.body_link_quat_w.cpu()
-            motion_frame["body_lin_vel_w"] = self.asset.data.body_com_lin_vel_w.cpu()
-            motion_frame["body_ang_vel_w"] = self.asset.data.body_com_ang_vel_w.cpu()
-            motion_frame["joint_pos"] = self.asset.data.joint_pos.cpu()
-            motion_frame["joint_vel"] = self.asset.data.joint_vel.cpu()
-            self.motion_frames.append(TensorDict(motion_frame, batch_size=[1]))
+            with ScopedTimer("command_update.record_motion", sync=False):
+                motion_frame = {}
+                motion_frame["body_pos_w"] = self.asset.data.body_link_pos_w.cpu()
+                motion_frame["body_quat_w"] = self.asset.data.body_link_quat_w.cpu()
+                motion_frame["body_lin_vel_w"] = self.asset.data.body_com_lin_vel_w.cpu()
+                motion_frame["body_ang_vel_w"] = self.asset.data.body_com_ang_vel_w.cpu()
+                motion_frame["joint_pos"] = self.asset.data.joint_pos.cpu()
+                motion_frame["joint_vel"] = self.asset.data.joint_vel.cpu()
+                self.motion_frames.append(TensorDict(motion_frame, batch_size=[1]))
 
-        self._read_current_robot_state()
+        with ScopedTimer("command_update.read_current_robot_state", sync=False):
+            self._read_current_robot_state()
         # if not hasattr(self, "future_ref_motion")
         #     self._refresh_future_buffers()
 
         # Reward / termination: consume the current frame from the previously
         # prepared future-motion buffer.
-        self.current_ref_motion = self.future_ref_motion[:, self.reward_current_step_index]
-        self.ref_body_pos_w = self.ref_body_pos_future_w[:, self.reward_current_step_index]
-        self.ref_body_lin_vel_w = self.ref_body_lin_vel_future_w[:, self.reward_current_step_index]
-        self.ref_body_quat_w = self.ref_body_quat_future_w[:, self.reward_current_step_index]
-        self.ref_body_ang_vel_w = self.ref_body_ang_vel_future_w[:, self.reward_current_step_index]
-        self.ref_joint_pos = self.ref_joint_pos_future_[:, self.reward_current_step_index]
-        self.ref_joint_vel = self.ref_joint_vel_future_[:, self.reward_current_step_index]
-        self.ref_anchor_pos_w = self.ref_anchor_pos_future_w[:, self.reward_current_step_index]
-        self.ref_anchor_quat_w = self.ref_anchor_quat_future_w[:, self.reward_current_step_index]
-        (
-            self.ref_body_pos_local,
-            self.ref_body_quat_local,
-            self.robot_body_pos_local,
-            self.robot_body_quat_local,
-        ) = _compute_current_tracking_state(
-            self.ref_anchor_pos_w,
-            self.ref_anchor_quat_w,
-            self.robot_anchor_pos_w,
-            self.robot_anchor_quat_w,
-            self.ref_body_pos_w,
-            self.ref_body_quat_w,
-            self.robot_body_link_pos_w,
-            self.robot_body_link_quat_w,
-        )
+        with ScopedTimer("command_update.select_current_reference", sync=False):
+            self.current_ref_motion = self.future_ref_motion[:, self.reward_current_step_index]
+            self.ref_body_pos_w = self.ref_body_pos_future_w[:, self.reward_current_step_index]
+            self.ref_body_lin_vel_w = self.ref_body_lin_vel_future_w[:, self.reward_current_step_index]
+            self.ref_body_quat_w = self.ref_body_quat_future_w[:, self.reward_current_step_index]
+            self.ref_body_ang_vel_w = self.ref_body_ang_vel_future_w[:, self.reward_current_step_index]
+            self.ref_joint_pos = self.ref_joint_pos_future_[:, self.reward_current_step_index]
+            self.ref_joint_vel = self.ref_joint_vel_future_[:, self.reward_current_step_index]
+            self.ref_anchor_pos_w = self.ref_anchor_pos_future_w[:, self.reward_current_step_index]
+            self.ref_anchor_quat_w = self.ref_anchor_quat_future_w[:, self.reward_current_step_index]
+        with ScopedTimer(
+            "command_update.current_tracking_state", sync=PROFILE_SYNC_TIMERS
+        ):
+            (
+                self.ref_body_pos_local,
+                self.ref_body_quat_local,
+                self.robot_body_pos_local,
+                self.robot_body_quat_local,
+            ) = _compute_current_tracking_state(
+                self.ref_anchor_pos_w,
+                self.ref_anchor_quat_w,
+                self.robot_anchor_pos_w,
+                self.robot_anchor_quat_w,
+                self.ref_body_pos_w,
+                self.ref_body_quat_w,
+                self.robot_body_link_pos_w,
+                self.robot_body_link_quat_w,
+            )
 
-        (
-            self.body_pos_error,
-            self.body_pos_error_local,
-            self.body_ori_error,
-            self.body_ori_error_local,
-            self.body_lin_vel_error,
-            self.body_ang_vel_error,
-            self.joint_pos_error,
-            self.joint_vel_error,
-        ) = _compute_tracking_errors(
-            self.ref_body_pos_w,
-            self.ref_body_quat_w,
-            self.ref_body_lin_vel_w,
-            self.ref_body_ang_vel_w,
-            self.ref_body_pos_local,
-            self.ref_body_quat_local,
-            self.robot_body_link_pos_w,
-            self.robot_body_link_quat_w,
-            self.robot_body_lin_vel_w,
-            self.robot_body_ang_vel_w,
-            self.robot_body_pos_local,
-            self.robot_body_quat_local,
-            self.ref_joint_pos,
-            self.ref_joint_vel,
-            self.robot_joint_pos,
-            self.robot_joint_vel,
-        )
+        with ScopedTimer("command_update.tracking_errors", sync=PROFILE_SYNC_TIMERS):
+            (
+                self.body_pos_error,
+                self.body_pos_error_local,
+                self.body_ori_error,
+                self.body_ori_error_local,
+                self.body_lin_vel_error,
+                self.body_ang_vel_error,
+                self.joint_pos_error,
+                self.joint_vel_error,
+            ) = _compute_tracking_errors(
+                self.ref_body_pos_w,
+                self.ref_body_quat_w,
+                self.ref_body_lin_vel_w,
+                self.ref_body_ang_vel_w,
+                self.ref_body_pos_local,
+                self.ref_body_quat_local,
+                self.robot_body_link_pos_w,
+                self.robot_body_link_quat_w,
+                self.robot_body_lin_vel_w,
+                self.robot_body_ang_vel_w,
+                self.robot_body_pos_local,
+                self.robot_body_quat_local,
+                self.ref_joint_pos,
+                self.ref_joint_vel,
+                self.robot_joint_pos,
+                self.robot_joint_vel,
+            )
 
         # print(
         #     f"body lin vel error: {self.body_lin_vel_error.norm(dim=-1)}"
