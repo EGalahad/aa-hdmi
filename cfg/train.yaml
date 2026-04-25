@@ -33,12 +33,12 @@ camera_follow: true
 wandb:
   name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
   job_type: train
-  project: ${oc.select:task.project,active_adaptation}
+  project: hdmi
   mode: online # set to 'disabled' when debugging locally
   id: null
   tags: []
 
 defaults:
-  - task: Velocity
-  - algo: ppo
+  - task: lafan_100style_real
+  - algo: hdmi_ppo
   - _self_

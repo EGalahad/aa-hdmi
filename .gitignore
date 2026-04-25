@@ -1,5 +1,6 @@
 .vscode
 scripts/exports/
+scripts/experiments/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,6 +1,6 @@
 # @package task
 defaults:
-  - command/future_steps: long
+  - command/future_steps: short
   - observation/priv: root_body_actions
   - observation/command: joint
   - observation/command_short: joint

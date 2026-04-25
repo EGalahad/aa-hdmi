@@ -20,8 +20,9 @@ camera_follow: true
 
 
 defaults:
-  - task: Velocity
-  - algo: ppo
+  - task: lafan_100style_real
+  - algo: hdmi_ppo
+  - override /task/command/future_steps: short
   - _self_
 
 task:

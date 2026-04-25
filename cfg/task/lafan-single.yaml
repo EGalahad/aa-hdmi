@@ -8,13 +8,10 @@ name: lafan
 command:
   motion_cfgs:
     lafan:
-      path: "../lafan-process/output_motion_chunks/jumps1_subject2/0-1000/"
-  #     path: "../lafan-process/output_motion_chunks/fight1_subject5/0-1000/"
-  #     path: "../lafan-process/output_motion_chunks/walk1_subject1/0-1000/"
-  #     path: "../lafan-process/output_motion_chunks/dance1_subject1/3000-3945/" # cartwheel
-  #     path: "../lafan-process/output_motion_chunks/dance1_subject2/0-1000/"
-  #     path: "../lafan-process/output_motion_chunks/sprint1_subject4/0-1000/"
-  #     path: "../lafan-process/output_motion_chunks/fallAndGetUp2_subject3/0-1000/"
-  #     path: "../lafan-process/output_motion_chunks/fallAndGetUp1_subject1/0-1000/"
+      path: ../any4hdmi/output/lafan/motions/fight1_subject5
+      # path: ../any4hdmi/output/lafan/motions/jumps1_subject2
+      # path: ../any4hdmi/output/lafan/motions/dance1_subject1
+      # path: ../any4hdmi/output/lafan/motions/sprint1_subject4
+      # path: ../any4hdmi/output/lafan/motions/fallAndGetUp2_subject3
       weight: 1.0
       full_motion: true

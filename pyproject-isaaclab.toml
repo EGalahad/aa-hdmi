@@ -1,0 +1,19 @@
+[project]
+name = "aa-isaaclab-env"
+version = "0.1.0"
+requires-python = "==3.11.*"
+dependencies = [
+    "active_adaptation[isaaclab]",
+    "hdmi",
+]
+
+[tool.uv.sources]
+active_adaptation = { path = "../..", editable = true }
+hdmi = { path = "../../projects/hdmi", editable = true }
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+
+[tool.uv]
+package = false

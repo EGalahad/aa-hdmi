@@ -73,7 +73,7 @@ class ObsOODDetector(TensorDictModuleBase):
         for in_key in self.in_keys:
             obs = tensordict.get(in_key, None)
             if obs is not None:
-                ood_ratio = (obs.abs() > self.sigma).float().mean().unsqueeze(0)
+                ood_ratio = (obs.abs() > self.sigma).float().mean(dim=-1, keepdim=True)
                 tensordict.set(("next", f"{in_key}_ood_ratio"), ood_ratio)
                 tensordict.set(("next", in_key), obs)
         return tensordict

@@ -243,7 +243,7 @@ def main(cfg: DictConfig):
             info["performance/iter_time"] = time.perf_counter() - rollout_start
 
             if aa.is_main_process() and run is not None:
-                ScopedTimer.print_summary(clear=True, depth=5)
+                # ScopedTimer.print_summary(clear=True, depth=5)
                 # print(
                 #     OmegaConf.to_yaml(
                 #         {k: v for k, v in info.items() if isinstance(v, (float, int))}

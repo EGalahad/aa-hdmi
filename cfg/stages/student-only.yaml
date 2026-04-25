@@ -6,7 +6,6 @@ stages:
       - +exp=finetune
       - total_iters=5000
       - algo.freeze_vecnorm=false
-      - algo.finetune_student_encoder=true
       - algo.entropy_coef_start=0.012
       - algo.entropy_coef_end=0.001
       - algo.entropy_decay_start=3000

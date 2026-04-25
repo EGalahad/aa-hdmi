@@ -750,8 +750,6 @@ class RobotTracking(Command, namespace="hdmi"):
         ]
 
     def _read_current_robot_state_mjlab(self):
-        from mjlab.entity.data import compute_velocity_from_cvel
-
         asset_data = self.asset.data
         sim_data = asset_data.data
 
@@ -759,20 +757,11 @@ class RobotTracking(Command, namespace="hdmi"):
         root_body_id = self._mjlab_root_body_id
         anchor_body_id = self._mjlab_anchor_body_id
 
-        body_link_pos_w = sim_data.xpos[:, body_ids]
-        body_link_quat_w = sim_data.xquat[:, body_ids]
         body_cvel = sim_data.cvel[:, body_ids]
-        body_com_pos_w = sim_data.xipos[:, body_ids]
-        root_subtree_com = sim_data.subtree_com[:, root_body_id].unsqueeze(1)
-        body_com_vel_w = compute_velocity_from_cvel(
-            body_com_pos_w,
-            root_subtree_com,
-            body_cvel,
-        )
 
-        self.robot_body_link_pos_w = body_link_pos_w
-        self.robot_body_lin_vel_w = body_com_vel_w[..., 0:3]
-        self.robot_body_link_quat_w = body_link_quat_w
+        self.robot_body_link_pos_w = sim_data.xpos[:, body_ids]
+        self.robot_body_lin_vel_w = body_cvel[..., 3:6]
+        self.robot_body_link_quat_w = sim_data.xquat[:, body_ids]
         self.robot_body_ang_vel_w = body_cvel[..., 0:3]
 
         self.robot_joint_pos = sim_data.qpos[:, self._mjlab_tracking_joint_q_adr]
@@ -893,8 +882,6 @@ class RobotTracking(Command, namespace="hdmi"):
 
         with ScopedTimer("command_update.read_current_robot_state", sync=False):
             self._read_current_robot_state()
-        # if not hasattr(self, "future_ref_motion")
-        #     self._refresh_future_buffers()
 
         # Reward / termination: consume the current frame from the previously
         # prepared future-motion buffer.
@@ -955,13 +942,6 @@ class RobotTracking(Command, namespace="hdmi"):
                 self.robot_joint_pos,
                 self.robot_joint_vel,
             )
-
-        # print(
-        #     f"body lin vel error: {self.body_lin_vel_error.norm(dim=-1)}"
-        # )
-        # print(
-        #     f"body ang vel error: {self.body_ang_vel_error.norm(dim=-1)}"
-        # )
 
     def debug_draw(self):
         if not hasattr(self, "current_ref_motion"):
