@@ -17,7 +17,22 @@ mkdir -p venv/mjlab
 cp projects/hdmi/pyproject-mjlab.toml venv/mjlab/
 
 mkdir -p venv/isaaclab
-cp projects/hdmi/pyproject-isaaclab.toml venv/isaac
+cp projects/hdmi/pyproject-isaaclab.toml venv/isaaclab/
+```
+
+The repository should now look like this:
+
+```text
+active-adaptation/
+├── venv/
+│   ├── mjlab/
+│   │   └── pyproject.toml
+│   └── isaaclab/
+│       └── pyproject.toml
+├── active_adaptation/
+├── projects/
+│   └── hdmi/
+└─ scripts/
 ```
 
 Refresh project discovery:
@@ -37,27 +52,32 @@ export HF_TOKEN=<your_huggingface_token>
 
 ## Train
 
-Run the new single-stage HDMI PPO with short command horizons:
+Run the new single-stage HDMI PPO:
 
 ```bash
-uv --project venv/mjlab run projects/hdmi/scripts/train.py \
-  backend=mjlab
+uv --project venv/mjlab run torchrun --nproc_per_node=8 projects/hdmi/scripts/train.py \
+  task=lafan_100style_real +exp=train-hdmi backend=mjlab
 ```
 
-Run the sequential ROA training pipeline with the Lafan dataset:
+Run the sequential ROA training pipeline:
 
 ```bash
 uv --project venv/mjlab run projects/hdmi/scripts/train_sequential.py \
-  nproc_per_node=8 task=lafan_100style_real stages=student-only backend=mjlab
+  nproc_per_node=8 task=lafan_100style_real stages=normal backend=mjlab
 ```
 
-To play ROA checkpoints, keep the long command horizon:
+To play checkpoints:
 
 ```bash
 uv --project venv/mjlab run projects/hdmi/scripts/play.py \
-    task=lafan_100style_real algo=ppo_roa_finetune \
-    task/command/future_steps=long backend=mjlab \
+    task=lafan task/command/future_steps=long \
+    algo=ppo_roa_finetune backend=mjlab \
     checkpoint_path=run:elijahgalahad/hdmi/runs/a03f770b_lafan_100style_finetune
+
+uv --project venv/mjlab run projects/hdmi/scripts/play.py \
+    task=lafan \
+    +exp=train-hdmi backend=mjlab \
+    checkpoint_path=run:elijahgalahad/hdmi/runs/kr0vxm4n
 ```
 
 ## Troubleshooting
