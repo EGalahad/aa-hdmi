@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModule as Mod, TensorDictSequential as Seq
-from torchrl.data import Composite as CompositeSpec, LazyTensorStorage, TensorDictReplayBuffer, TensorSpec
+from torchrl.data import CompositeSpec, LazyTensorStorage, TensorDictReplayBuffer, TensorSpec
 from torchrl.envs.transforms import TensorDictPrimer
 from torchrl.modules import ProbabilisticActor
 
@@ -541,12 +541,17 @@ class FastSAC(PPOBase):
         return reward.squeeze(-1)
 
     def _discount(self, tensordict: TensorDictBase) -> tuple[torch.Tensor, torch.Tensor]:
+        terminated = tensordict["next"].get("terminated", None)
+        if terminated is None:
+            terminated = tensordict[DONE_KEY]
+        terminated = terminated.float().squeeze(-1)
+
         discount = tensordict["next"].get("discount", None)
         if discount is None:
-            bootstrap = (1.0 - tensordict[DONE_KEY].float()).squeeze(-1)
+            bootstrap = 1.0 - terminated
             discount = torch.full_like(bootstrap, self.cfg.gamma)
             return bootstrap, discount
-        bootstrap = discount.float().squeeze(-1)
+        bootstrap = (1.0 - terminated) * discount.float().squeeze(-1)
         return bootstrap, torch.full_like(bootstrap, self.cfg.gamma)
 
     def _get_inputs(
@@ -581,6 +586,9 @@ class FastSAC(PPOBase):
             OBS_PRIV_KEY,
             ACTION_KEY,
             DONE_KEY,
+            ("next", "done"),
+            ("next", "terminated"),
+            ("next", "truncated"),
             ("next", "discount"),
             REWARD_KEY,
             ("next", OBS_KEY),
@@ -594,7 +602,11 @@ class FastSAC(PPOBase):
     def observe(self, tensordict: TensorDictBase) -> None:
         self.replay_buffer.extend(self._collect_replay_data(tensordict).reshape(-1).cpu())
 
-    def _update_critic(self, tensordict: TensorDictBase, mask: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _update_critic(
+        self,
+        tensordict: TensorDictBase,
+        mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         actor_input, critic_prefix, _, _ = self._get_inputs(tensordict)
         next_actor_input, next_critic_prefix = self._get_next_inputs(tensordict)
         rewards = self._reward_total(tensordict)
@@ -618,9 +630,35 @@ class FastSAC(PPOBase):
         critic_losses = -torch.sum(target_distributions * critic_log_probs, dim=-1)
         q_loss = sum(_masked_mean(critic_losses[i], mask) for i in range(critic_losses.shape[0]))
 
-        return q_loss, target_values.mean(dim=0).detach(), next_log_probs.detach()
+        reward_mean = _masked_mean(rewards.detach(), mask)
+        reward_max = rewards.detach().max()
+        reward_min = rewards.detach().min()
+        target_q_mean = _masked_mean(target_values.mean(dim=0).detach(), mask)
+        target_q_max = target_values.detach().max()
+        target_q_min = target_values.detach().min()
+        target_clamp_hi = (target_values.detach() >= (self.cfg.v_max - 1e-4)).float().mean()
+        target_clamp_lo = (target_values.detach() <= (self.cfg.v_min + 1e-4)).float().mean()
+        diagnostics = {
+            "reward/mean": reward_mean.detach(),
+            "reward/max": reward_max.detach(),
+            "reward/min": reward_min.detach(),
+            "critic/target_q_mean": target_q_mean.detach(),
+            "critic/target_q_max": target_q_max.detach(),
+            "critic/target_q_min": target_q_min.detach(),
+            "critic/target_vmax_frac": target_clamp_hi.detach(),
+            "critic/target_vmin_frac": target_clamp_lo.detach(),
+            "policy/next_log_prob_mean": next_log_probs.detach().mean(),
+            "policy/next_log_prob_min": next_log_probs.detach().min(),
+            "policy/next_log_prob_max": next_log_probs.detach().max(),
+        }
 
-    def _update_actor(self, tensordict: TensorDictBase, mask: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return q_loss, target_values.mean(dim=0).detach(), next_log_probs.detach(), diagnostics
+
+    def _update_actor(
+        self,
+        tensordict: TensorDictBase,
+        mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         actor_input, critic_prefix, _, _ = self._get_inputs(tensordict)
         actions, log_probs, log_std = self.actor_core.sample_actions_and_log_probs(actor_input)
         critic_input = torch.cat([critic_prefix, actions], dim=-1)
@@ -630,7 +668,13 @@ class FastSAC(PPOBase):
         q_mean = q_values.mean(dim=0)
         actor_loss = _masked_mean(self.log_alpha.exp().detach() * log_probs - q_mean, mask)
         action_std = log_std.exp().mean(dim=-1)
-        return actor_loss, (-log_probs).detach(), action_std.detach()
+        diagnostics = {
+            "actor/q_mean": _masked_mean(q_mean.detach(), mask),
+            "policy/log_prob_mean": _masked_mean(log_probs.detach(), mask),
+            "policy/log_prob_min": log_probs.detach().min(),
+            "policy/log_prob_max": log_probs.detach().max(),
+        }
+        return actor_loss, (-log_probs).detach(), action_std.detach(), diagnostics
 
     def _update_alpha(self, next_log_probs: torch.Tensor) -> torch.Tensor:
         alpha_loss = -(
@@ -655,37 +699,52 @@ class FastSAC(PPOBase):
             valid = ~tensordict["is_init"].squeeze(-1)
             mask = valid if valid.any() else None
 
-        q_loss, target_values, next_log_probs = self._update_critic(tensordict, mask)
+        q_loss, target_values, next_log_probs, critic_diag = self._update_critic(tensordict, mask)
         self.q_optimizer.zero_grad(set_to_none=True)
         q_loss.backward()
         if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
             self._all_reduce_grads(self.qnet)
-        q_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnet.parameters(), self.cfg.max_grad_norm)
+        if self.cfg.max_grad_norm > 0:
+            q_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.qnet.parameters(),
+                self.cfg.max_grad_norm,
+            )
+        else:
+            q_grad_norm = torch.zeros((), device=self.device)
         self.q_optimizer.step()
 
         actor_updated = self.gradient_step % self.cfg.policy_frequency == 0
         if actor_updated:
-            actor_loss, entropy, action_std = self._update_actor(tensordict, mask)
+            actor_loss, entropy, action_std, actor_diag = self._update_actor(tensordict, mask)
             self.actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
             if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
                 self._all_reduce_grads(self.actor_core)
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.actor_core.parameters(),
-                self.cfg.max_grad_norm,
-            )
+            if self.cfg.max_grad_norm > 0:
+                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actor_core.parameters(),
+                    self.cfg.max_grad_norm,
+                )
+            else:
+                actor_grad_norm = torch.zeros((), device=self.device)
             self.actor_optimizer.step()
         else:
             actor_loss = torch.zeros((), device=self.device)
             entropy = torch.zeros_like(actor_loss)
             action_std = torch.zeros_like(actor_loss)
             actor_grad_norm = torch.zeros_like(actor_loss)
+            actor_diag = {
+                "actor/q_mean": torch.zeros((), device=self.device),
+                "policy/log_prob_mean": torch.zeros((), device=self.device),
+                "policy/log_prob_min": torch.zeros((), device=self.device),
+                "policy/log_prob_max": torch.zeros((), device=self.device),
+            }
 
         alpha_loss = self._update_alpha(next_log_probs)
         self._soft_update_target()
         self.gradient_step += 1
 
-        return {
+        metrics = {
             "critic/loss": q_loss.detach(),
             "critic/grad_norm": q_grad_norm.detach(),
             "critic/target_q_mean": target_values.mean().detach(),
@@ -697,6 +756,9 @@ class FastSAC(PPOBase):
             "alpha/loss": alpha_loss.detach(),
             "alpha/value": self.log_alpha.exp().detach(),
         }
+        metrics.update(critic_diag)
+        metrics.update(actor_diag)
+        return metrics
 
     def update(self) -> dict[str, float]:
         info: dict[str, float] = {
