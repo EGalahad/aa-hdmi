@@ -354,6 +354,7 @@ class RobotTracking(Command, namespace="hdmi"):
         record_motion: bool = False,
         rewind_prob: float = 0.0,
         rewind_steps_range: Tuple[int, int] = (25, 125),
+        init_start_t_zero: bool = False,
         viz: VizCfg | Dict | None = None,
     ):
         for module_name in (".observations", ".rewards", ".terminations"):
@@ -466,6 +467,7 @@ class RobotTracking(Command, namespace="hdmi"):
         self.rewind_steps_range: Tuple[int, int] = tuple(rewind_steps_range)
         assert self.rewind_steps_range[0] >= 0
         assert self.rewind_steps_range[1] > self.rewind_steps_range[0]
+        self.init_start_t_zero = bool(init_start_t_zero)
 
         if replay_motion:
             raise NotImplementedError(
@@ -521,6 +523,8 @@ class RobotTracking(Command, namespace="hdmi"):
             rewind_mask=rewind_mask,
             rewind_steps=rewind_steps,
         )
+        if self.init_start_t_zero:
+            sampled_motion.start_t.zero_()
         self.motion_ids[env_ids] = sampled_motion.motion_id
         self.motion_len[env_ids] = sampled_motion.motion_len
         self.t[env_ids] = sampled_motion.start_t
