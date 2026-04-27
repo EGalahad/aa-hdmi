@@ -216,7 +216,7 @@ def main(cfg: DictConfig):
     with (
         env.get_recorder(output_path, enabled=render_enabled) as recorder,
         torch.inference_mode(),
-        set_exploration_type(ExplorationType.MODE),
+        set_exploration_type(ExplorationType.DETERMINISTIC),
     ):
         for i in progress:
             with ScopedTimer("inference", sync=False):

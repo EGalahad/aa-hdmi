@@ -65,6 +65,24 @@ PROFILE_SYNC_TIMERS = os.environ.get("AA_PROFILE_SYNC_TIMERS", "0").lower() in {
 LATENT_KEY = "latent"
 
 
+class ResidualActorFeatureGate(nn.Module):
+    def __init__(self, alpha_init: float) -> None:
+        super().__init__()
+        self.alpha_raw = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return torch.sigmoid(self.alpha_raw)
+
+    def forward(
+        self,
+        base_feature: torch.Tensor,
+        residual_feature: torch.Tensor,
+    ) -> torch.Tensor:
+        alpha = self.alpha.to(dtype=base_feature.dtype)
+        return base_feature + alpha * residual_feature
+
+
 @dataclass
 class PPOConfig:
     _target_: str = f"{__package__}.ppo.PPOPolicy"
@@ -97,6 +115,8 @@ class PPOConfig:
     latent_dim: int = 512
     encoder_hidden_dims: Tuple[int, ...] = (512, 512)
     actor_hidden_dims: Tuple[int, ...] = (512, 512, 512)
+    res_actor_hidden_dims: Tuple[int, ...] = ()
+    actor_residual_alpha_init: float = -4.0
     critic_hidden_dims: Tuple[int, ...] = (512, 256, 128)
     policy_shortcut: bool = True
     max_grad_norm: float = 1.0
@@ -127,6 +147,11 @@ class PPOConfig:
             raise ValueError(
                 "grad_sync_mode must be one of {'ddp', 'manual', None}, "
                 f"got {self.grad_sync_mode!r}"
+            )
+
+        if self.res_actor_hidden_dims and not self.actor_hidden_dims:
+            raise ValueError(
+                "actor_hidden_dims must be non-empty when res_actor_hidden_dims is enabled."
             )
 
 
@@ -267,16 +292,55 @@ class PPOPolicy(PPOBase):
         ).to(self.device)
 
     def _build_actor(self, in_keys: list[str]) -> ProbabilisticActor:
-        actor_modules = [
-            CatTensors(in_keys, "_actor_input", del_keys=False, sort=False),
-            Mod(
-                make_mlp(
-                    list(self.cfg.actor_hidden_dims),
-                    norm=self.cfg.layer_norm,
+        actor_modules = [CatTensors(in_keys, "_actor_input", del_keys=False, sort=False)]
+
+        if self.cfg.res_actor_hidden_dims:
+            actor_feature_dim = self.cfg.actor_hidden_dims[-1]
+            self.actor_residual_gate = ResidualActorFeatureGate(
+                self.cfg.actor_residual_alpha_init
+            )
+            actor_modules.extend(
+                [
+                    Mod(
+                        make_mlp(
+                            list(self.cfg.actor_hidden_dims),
+                            norm=self.cfg.layer_norm,
+                        ),
+                        ["_actor_input"],
+                        ["_actor_feature_base"],
+                    ),
+                    Mod(
+                        nn.Sequential(
+                            make_mlp(
+                                list(self.cfg.res_actor_hidden_dims),
+                                norm=self.cfg.layer_norm,
+                            ),
+                            nn.LazyLinear(actor_feature_dim),
+                        ),
+                        ["_actor_input"],
+                        ["_actor_feature_residual"],
+                    ),
+                    Mod(
+                        self.actor_residual_gate,
+                        ["_actor_feature_base", "_actor_feature_residual"],
+                        ["_actor_feature"],
+                    ),
+                ]
+            )
+        else:
+            self.actor_residual_gate = None
+            actor_modules.append(
+                Mod(
+                    make_mlp(
+                        list(self.cfg.actor_hidden_dims),
+                        norm=self.cfg.layer_norm,
+                    ),
+                    ["_actor_input"],
+                    ["_actor_feature"],
                 ),
-                ["_actor_input"],
-                ["_actor_feature"],
-            ),
+            )
+
+        actor_modules.append(
             Mod(
                 ActorROA(
                     self.action_dim,
@@ -286,16 +350,18 @@ class PPOPolicy(PPOBase):
                 ["_actor_feature"],
                 ["loc", "scale"],
             ),
-        ]
+        )
         self.dist_cls = IndependentNormal
         self.dist_keys = ["loc", "scale"]
-        return ProbabilisticActor(
+        actor = ProbabilisticActor(
             module=Seq(*actor_modules),
             in_keys=["loc", "scale"],
             out_keys=[ACTION_KEY],
             distribution_class=IndependentNormal,
             return_log_prob=True,
         ).to(self.device)
+        actor.actor_residual_gate = self.actor_residual_gate
+        return actor
 
     def _build_vecnorm_modules(self, observation_spec: CompositeSpec):
         modules = []
@@ -426,6 +492,10 @@ class PPOPolicy(PPOBase):
                     info[f"actor_std/{joint_name}"] = std
                 info["actor_std/mean"] = action_std.mean()
 
+            residual_alpha = self._get_actor_residual_alpha(self.actor)
+            if residual_alpha is not None:
+                info["actor/alpha"] = residual_alpha
+
         return info
 
     def _get_actor_std(self, actor_module):
@@ -434,6 +504,13 @@ class PPOPolicy(PPOBase):
             if param.ndim == 1 and param.shape[0] == self.action_dim:
                 return param.detach()
         return None
+
+    def _get_actor_residual_alpha(self, actor_module):
+        module = actor_module.module if isinstance(actor_module, DDP) else actor_module
+        gate = getattr(module, "actor_residual_gate", None)
+        if gate is None:
+            return None
+        return gate.alpha.detach().item()
 
     def train_policy(self, tensordict: TensorDict):
         infos = []
