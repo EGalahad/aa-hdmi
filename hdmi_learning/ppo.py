@@ -62,7 +62,6 @@ PROFILE_SYNC_TIMERS = os.environ.get("AA_PROFILE_SYNC_TIMERS", "0").lower() in {
     "yes",
     "on",
 }
-LATENT_KEY = "latent"
 
 
 class ResidualActorFeatureGate(nn.Module):
@@ -112,13 +111,10 @@ class PPOConfig:
     layer_norm: Union[str, None] = "before"
     value_norm: bool = False
 
-    latent_dim: int = 512
-    encoder_hidden_dims: Tuple[int, ...] = (512, 512)
     actor_hidden_dims: Tuple[int, ...] = (512, 512, 512)
     res_actor_hidden_dims: Tuple[int, ...] = ()
     actor_residual_alpha_init: float = -4.0
-    critic_hidden_dims: Tuple[int, ...] = (512, 256, 128)
-    policy_shortcut: bool = True
+    critic_hidden_dims: Tuple[int, ...] = (1024, 512, 256)
     max_grad_norm: float = 1.0
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, OBS_PRIV_KEY)
 
@@ -149,9 +145,9 @@ class PPOConfig:
                 f"got {self.grad_sync_mode!r}"
             )
 
-        if self.res_actor_hidden_dims and not self.actor_hidden_dims:
+        if not self.actor_hidden_dims:
             raise ValueError(
-                "actor_hidden_dims must be non-empty when res_actor_hidden_dims is enabled."
+                "actor_hidden_dims must be non-empty."
             )
 
 
@@ -202,13 +198,9 @@ class PPOPolicy(PPOBase):
         if missing_keys:
             raise KeyError(f"Missing required observation keys: {missing_keys}")
 
-        encoder_in_keys = [OBS_KEY, CMD_KEY]
-        actor_in_keys = [LATENT_KEY]
-        if self.cfg.policy_shortcut:
-            actor_in_keys.append(OBS_KEY)
+        actor_in_keys = [OBS_KEY, CMD_KEY]
         critic_in_keys = [OBS_PRIV_KEY, OBS_KEY, CMD_KEY]
 
-        self.encoder = self._build_encoder(encoder_in_keys)
         self.actor = self._build_actor(actor_in_keys)
         self.critic = Seq(
             CatTensors(critic_in_keys, "_critic_input", del_keys=False, sort=False),
@@ -229,7 +221,6 @@ class PPOPolicy(PPOBase):
         fake_input = observation_spec.zero()
         with VecNorm.freeze():
             self.vecnorm(fake_input)
-        self.encoder(fake_input)
         self.actor(fake_input)
         self.critic(fake_input)
 
@@ -247,9 +238,7 @@ class PPOPolicy(PPOBase):
             self._broadcast_parameters()
 
         self.lr_policy = self.cfg.lr
-        self.opt_policy = self._make_optimizer(
-            [self.encoder, self.actor], lr=self.lr_policy
-        )
+        self.opt_policy = self._make_optimizer([self.actor], lr=self.lr_policy)
         self.opt_critic = self._make_optimizer([self.critic], lr=self.cfg.lr)
 
         self.update_ppo = self._update_ppo
@@ -273,23 +262,6 @@ class PPOPolicy(PPOBase):
                 lr=lr,
                 weight_decay=0.01,
             )
-
-    def _build_encoder(self, in_keys: list[str]) -> Seq:
-        return Seq(
-            CatTensors(in_keys, "_encoder_input", del_keys=False, sort=False),
-            Mod(
-                nn.Sequential(
-                    make_mlp(
-                        list(self.cfg.encoder_hidden_dims),
-                        norm=self.cfg.layer_norm,
-                    ),
-                    nn.LazyLinear(self.cfg.latent_dim),
-                ),
-                ["_encoder_input"],
-                [LATENT_KEY],
-            ),
-            selected_out_keys=[LATENT_KEY],
-        ).to(self.device)
 
     def _build_actor(self, in_keys: list[str]) -> ProbabilisticActor:
         actor_modules = [CatTensors(in_keys, "_actor_input", del_keys=False, sort=False)]
@@ -403,13 +375,12 @@ class PPOPolicy(PPOBase):
         def wrap_td_module(module):
             return DDPWithAttr(module, **ddp_kwargs)
 
-        self.encoder = wrap_td_module(self.encoder)
         self.actor = wrap_td_module(self.actor)
         self.critic = wrap_td_module(self.critic)
 
     @torch.no_grad()
     def _broadcast_parameters(self):
-        for module in (self.encoder, self.actor, self.critic):
+        for module in (self.actor, self.critic):
             for param in module.parameters():
                 dist.broadcast(param, src=0)
 
@@ -432,18 +403,18 @@ class PPOPolicy(PPOBase):
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         if mode == "deploy":
-            in_keys = set(self.encoder.in_keys).union(set(self.actor.in_keys))
+            in_keys = set(self.actor.in_keys)
             in_keys = [key for key in in_keys if key in self.vecnorms]
             vecnorm = Seq(
                 *(Mod(self.vecnorms[key], [key], [key]) for key in in_keys)
             ).to(self.device)
             ood_detector = ObsOODDetector(list(in_keys), sigma=5.0)
-            modules = [vecnorm, ood_detector, self.encoder, self.actor]
+            modules = [vecnorm, ood_detector, self.actor]
             modules[-1] = modules[-1].module[0]
             modules.append(MeanAction())
             out_keys = [ACTION_KEY]
         else:
-            modules = [self.vecnorm, self.encoder, self.actor]
+            modules = [self.vecnorm, self.actor]
             out_keys = [f"{ACTION_KEY}_log_prob", ACTION_KEY] + self.dist_keys
 
         rollout_policy = Seq(*modules, selected_out_keys=out_keys)
@@ -660,9 +631,6 @@ class PPOPolicy(PPOBase):
     def _update_ppo(self, tensordict: TensorDict):
         dist_kwargs_old = tensordict.select(*self.dist_keys)
 
-        with ScopedTimer("training.policy.ppo.encode", sync=PROFILE_SYNC_TIMERS):
-            self.encoder(tensordict)
-
         [tensordict.pop(key) for key in self.dist_keys]
         action_old = tensordict.pop(ACTION_KEY)
         logp_old = tensordict.pop(f"{ACTION_KEY}_log_prob")
@@ -707,11 +675,8 @@ class PPOPolicy(PPOBase):
             loss.backward()
         if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
             with ScopedTimer("training.policy.ppo.grad_sync", sync=PROFILE_SYNC_TIMERS):
-                self._all_reduce_grads(self.encoder, self.actor, self.critic)
+                self._all_reduce_grads(self.actor, self.critic)
         with ScopedTimer("training.policy.ppo.clip_grad", sync=PROFILE_SYNC_TIMERS):
-            encoder_grad_norm = nn.utils.clip_grad_norm_(
-                self.encoder.parameters(), self.cfg.max_grad_norm
-            )
             actor_grad_norm = nn.utils.clip_grad_norm_(
                 self.actor.parameters(), self.cfg.max_grad_norm
             )
@@ -739,7 +704,6 @@ class PPOPolicy(PPOBase):
             "actor/entropy": entropy.detach(),
             "actor/mean_std": tensordict["scale"].detach().mean(),
             "actor/kl": kl.detach(),
-            "opt/grad_norm.encoder": encoder_grad_norm.detach(),
             "opt/grad_norm.actor": actor_grad_norm.detach(),
             "opt/grad_norm.critic": critic_grad_norm.detach(),
         }

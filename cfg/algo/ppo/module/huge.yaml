@@ -1,5 +1,3 @@
 # @package algo
 
-encoder_hidden_dims: [1024, 1024]
 actor_hidden_dims: [1024, 1024, 1024]
-latent_dim: 1024

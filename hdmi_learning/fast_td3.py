@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import warnings
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Tuple, Union
 
 import torch
@@ -11,8 +12,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 from tensordict import TensorDictBase
-from tensordict.nn import TensorDictModule as Mod, TensorDictSequential as Seq
-from torchrl.data import CompositeSpec, LazyTensorStorage, TensorDictReplayBuffer, TensorSpec
+from tensordict.nn import (
+    TensorDictModule as Mod,
+    TensorDictModuleBase,
+    TensorDictSequential as Seq,
+)
+from torchrl.data import (
+    Composite as CompositeSpec,
+    LazyTensorStorage,
+    TensorDictReplayBuffer,
+    TensorSpec,
+)
 from torchrl.envs.transforms import TensorDictPrimer
 
 import active_adaptation as aa
@@ -28,34 +38,70 @@ from active_adaptation.learning.ppo.common import (
 )
 from active_adaptation.learning.ppo.ppo_base import PPOBase
 
+from .action_bounds import (
+    coerce_action_bounds_config,
+    default_action_bounds,
+    resolve_action_bounds,
+)
 from .common import NullVecNorm
 from .fast_sac import (
-    DistributionalCritic,
+    ACTOR_INPUT_KEY,
+    BOOTSTRAP_KEY,
+    DistributionalCriticTD,
+    Q_LOGITS_KEY,
     _build_mlp,
     _masked_mean,
-    _safe_shape,
 )
+
+
+Q_VALUES_KEY = "_q_values"
 
 
 class ScalarDoubleCritic(nn.Module):
     def __init__(
         self,
-        input_dim: int,
         *,
         hidden_dim: int = 512,
         use_layer_norm: bool = True,
     ) -> None:
         super().__init__()
         hidden_dims = [hidden_dim, hidden_dim // 2, hidden_dim // 4]
-        self.q1_net = _build_mlp(input_dim, hidden_dims, use_layer_norm=use_layer_norm)
+        self.q1_net = _build_mlp(None, hidden_dims, use_layer_norm=use_layer_norm)
         self.q1_out = nn.Linear(hidden_dims[-1], 1)
-        self.q2_net = _build_mlp(input_dim, hidden_dims, use_layer_norm=use_layer_norm)
+        self.q2_net = _build_mlp(None, hidden_dims, use_layer_norm=use_layer_norm)
         self.q2_out = nn.Linear(hidden_dims[-1], 1)
 
     def forward(self, critic_input: torch.Tensor) -> torch.Tensor:
         q1 = self.q1_out(self.q1_net(critic_input)).squeeze(-1)
         q2 = self.q2_out(self.q2_net(critic_input)).squeeze(-1)
-        return torch.stack([q1, q2], dim=0)
+        return torch.stack([q1, q2], dim=1)
+
+
+class ScalarDoubleCriticTD(TensorDictModuleBase):
+    def __init__(
+        self,
+        *,
+        hidden_dim: int = 512,
+        use_layer_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        self.in_keys = [OBS_KEY, CMD_KEY, OBS_PRIV_KEY, ACTION_KEY]
+        self.out_keys = [Q_VALUES_KEY]
+        self.cat_tensors = CatTensors(
+            self.in_keys,
+            "_critic_input",
+            del_keys=False,
+            sort=False,
+        )
+        self.model = ScalarDoubleCritic(
+            hidden_dim=hidden_dim,
+            use_layer_norm=use_layer_norm,
+        )
+
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        self.cat_tensors(tensordict)
+        tensordict.set(self.out_keys[0], self.model(tensordict["_critic_input"]))
+        return tensordict
 
 
 class FastTD3ActorCore(nn.Module):
@@ -66,7 +112,6 @@ class FastTD3ActorCore(nn.Module):
 
     def __init__(
         self,
-        input_dim: int,
         action_dim: int,
         *,
         hidden_dim: int = 256,
@@ -77,7 +122,7 @@ class FastTD3ActorCore(nn.Module):
     ) -> None:
         super().__init__()
         hidden_dims = [hidden_dim, hidden_dim // 2, hidden_dim // 4]
-        self.net = _build_mlp(input_dim, hidden_dims, use_layer_norm=use_layer_norm)
+        self.net = _build_mlp(None, hidden_dims, use_layer_norm=use_layer_norm)
         self.fc_action = nn.Linear(hidden_dims[-1], action_dim)
         nn.init.normal_(self.fc_action.weight, 0.0, init_scale)
         nn.init.constant_(self.fc_action.bias, 0.0)
@@ -115,8 +160,14 @@ class TD3ExplorationNoise(nn.Module):
         self.action_dim = action_dim
         self.register_buffer("action_min", action_min.to(dtype=torch.float32))
         self.register_buffer("action_max", action_max.to(dtype=torch.float32))
-        self.register_buffer("log_std_min", torch.tensor(log_std_min, dtype=torch.float32))
-        self.register_buffer("log_std_max", torch.tensor(log_std_max, dtype=torch.float32))
+        self.register_buffer(
+            "log_std_min",
+            torch.tensor(log_std_min, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "log_std_max",
+            torch.tensor(log_std_max, dtype=torch.float32),
+        )
         self.register_buffer("noise_scales", torch.empty(0, 1))
 
     def _sample_scales(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -125,7 +176,10 @@ class TD3ExplorationNoise(nn.Module):
         return torch.rand(batch_size, 1, device=device) * (std_max - std_min) + std_min
 
     def _ensure_noise_scales(self, batch_size: int, device: torch.device) -> None:
-        if self.noise_scales.shape != (batch_size, 1) or self.noise_scales.device != device:
+        if (
+            self.noise_scales.shape != (batch_size, 1)
+            or self.noise_scales.device != device
+        ):
             self.noise_scales = self._sample_scales(batch_size, device)
 
     def forward(
@@ -140,11 +194,15 @@ class TD3ExplorationNoise(nn.Module):
             reset_mask = is_init.reshape(batch_size, -1).any(dim=-1, keepdim=True)
             if reset_mask.any():
                 new_scales = self._sample_scales(batch_size, action.device)
-                self.noise_scales = torch.where(reset_mask, new_scales, self.noise_scales)
+                self.noise_scales = torch.where(
+                    reset_mask,
+                    new_scales,
+                    self.noise_scales,
+                )
 
         noise = torch.randn_like(action) * self.noise_scales
-        noisy_action = torch.max(
-            torch.min(action + noise, self.action_max),
+        noisy_action = torch.maximum(
+            torch.minimum(action + noise, self.action_max),
             self.action_min,
         )
         return (noisy_action,)
@@ -156,10 +214,8 @@ class FastTD3Config:
 
     name: str = "fast_td3"
     collect_steps: int = 1
-    # Effective replay capacity = buffer_size * collect_steps * num_envs.
     buffer_size: int = 1024
     replay_batch_size: int = 32768
-    # Effective transition warmup = warm_up_steps * collect_steps * num_envs.
     warm_up_steps: int = 128
     updates_per_step: int = 4
     policy_frequency: int = 2
@@ -168,14 +224,16 @@ class FastTD3Config:
     tau: float = 0.1
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
-    # critic_lr: float = 1e-3
     weight_decay: float = 1e-3
 
     actor_hidden_dim: int = 512
     critic_hidden_dim: int = 1024
     init_scale: float = 0.01
-    action_min: float = -1.0
-    action_max: float = 1.0
+    action_bounds: dict[str, list[float]] = field(
+        default_factory=default_action_bounds
+    )
+    action_min: float | None = None
+    action_max: float | None = None
     num_atoms: int = 101
     v_min: float = -100.0
     v_max: float = 400.0
@@ -211,6 +269,11 @@ class FastTD3Config:
                 "critic_type must be one of {'distributional', 'scalar'}, "
                 f"got {self.critic_type!r}"
             )
+        self.action_bounds = coerce_action_bounds_config(
+            self.action_bounds,
+            action_min=self.action_min,
+            action_max=self.action_max,
+        )
 
 
 cs = ConfigStore.instance()
@@ -236,10 +299,13 @@ class FastTD3(PPOBase):
         self.observation_spec = observation_spec
         self.action_spec = action_spec
         object.__setattr__(self, "env", env)
+        del reward_spec
 
-        self.obs_dim = _safe_shape(observation_spec, OBS_KEY)
-        self.cmd_dim = _safe_shape(observation_spec, CMD_KEY)
-        self.priv_dim = _safe_shape(observation_spec, OBS_PRIV_KEY)
+        observation_keys = set(observation_spec.keys(True, True))
+        missing_keys = sorted({OBS_KEY, CMD_KEY, OBS_PRIV_KEY}.difference(observation_keys))
+        if missing_keys:
+            raise KeyError(f"Missing required observation keys: {missing_keys}")
+
         self.num_envs = int(getattr(env, "num_envs", observation_spec.shape[0]))
         self.action_dim = int(env.action_manager.action_dim)
         self.joint_names = env.action_manager.joint_names
@@ -247,55 +313,38 @@ class FastTD3(PPOBase):
 
         self._build_vecnorm_modules(observation_spec)
 
-        actor_input_dim = self.obs_dim + self.cmd_dim
-        critic_input_dim = self.obs_dim + self.cmd_dim + self.priv_dim + self.action_dim
-        action_min = torch.full(
-            (self.action_dim,),
-            float(self.cfg.action_min),
-            device=self.device,
-            dtype=torch.float32,
+        action_min, action_max = resolve_action_bounds(
+            self.cfg.action_bounds,
+            self.joint_names,
+            self.device,
         )
-        action_max = torch.full(
-            (self.action_dim,),
-            float(self.cfg.action_max),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        if not torch.all(action_max > action_min):
-            raise ValueError(
-                f"action_max must be greater than action_min, got {self.cfg.action_min} and {self.cfg.action_max}"
-            )
+        self.register_buffer("action_min", action_min.clone())
+        self.register_buffer("action_max", action_max.clone())
 
-        actor_core = FastTD3ActorCore(
-            actor_input_dim,
-            self.action_dim,
-            hidden_dim=self.cfg.actor_hidden_dim,
-            init_scale=self.cfg.init_scale,
-            use_layer_norm=self.cfg.use_layer_norm,
-            action_min=action_min,
-            action_max=action_max,
-        ).to(self.device)
-        object.__setattr__(self, "actor_core", actor_core)
         self.actor = Seq(
-            CatTensors([OBS_KEY, CMD_KEY], "_actor_input", del_keys=False, sort=False),
-            Mod(actor_core, ["_actor_input"], [ACTION_KEY]),
+            CatTensors(
+                [OBS_KEY, CMD_KEY],
+                ACTOR_INPUT_KEY,
+                del_keys=False,
+                sort=False,
+            ),
+            Mod(
+                FastTD3ActorCore(
+                    self.action_dim,
+                    hidden_dim=self.cfg.actor_hidden_dim,
+                    init_scale=self.cfg.init_scale,
+                    use_layer_norm=self.cfg.use_layer_norm,
+                    action_min=action_min,
+                    action_max=action_max,
+                ),
+                [ACTOR_INPUT_KEY],
+                [ACTION_KEY],
+            ),
+            selected_out_keys=[ACTION_KEY],
         ).to(self.device)
-
-        self.actor_target = FastTD3ActorCore(
-            actor_input_dim,
-            self.action_dim,
-            hidden_dim=self.cfg.actor_hidden_dim,
-            init_scale=self.cfg.init_scale,
-            use_layer_norm=self.cfg.use_layer_norm,
-            action_min=action_min,
-            action_max=action_max,
-        ).to(self.device)
-        self.actor_target.load_state_dict(actor_core.state_dict())
-        self.actor_target.requires_grad_(False)
 
         if self.cfg.critic_type == "distributional":
-            self.qnet = DistributionalCritic(
-                critic_input_dim,
+            self.qnet = DistributionalCriticTD(
                 num_atoms=self.cfg.num_atoms,
                 v_min=self.cfg.v_min,
                 v_max=self.cfg.v_max,
@@ -303,27 +352,31 @@ class FastTD3(PPOBase):
                 use_layer_norm=self.cfg.use_layer_norm,
                 device=self.device,
             ).to(self.device)
-            self.qnet_target = DistributionalCritic(
-                critic_input_dim,
-                num_atoms=self.cfg.num_atoms,
-                v_min=self.cfg.v_min,
-                v_max=self.cfg.v_max,
-                hidden_dim=self.cfg.critic_hidden_dim,
-                use_layer_norm=self.cfg.use_layer_norm,
-                device=self.device,
-            ).to(self.device)
+            self._critic_out_key = Q_LOGITS_KEY
         else:
-            self.qnet = ScalarDoubleCritic(
-                critic_input_dim,
+            self.qnet = ScalarDoubleCriticTD(
                 hidden_dim=self.cfg.critic_hidden_dim,
                 use_layer_norm=self.cfg.use_layer_norm,
             ).to(self.device)
-            self.qnet_target = ScalarDoubleCritic(
-                critic_input_dim,
-                hidden_dim=self.cfg.critic_hidden_dim,
-                use_layer_norm=self.cfg.use_layer_norm,
-            ).to(self.device)
-        self.qnet_target.load_state_dict(self.qnet.state_dict())
+            self._critic_out_key = Q_VALUES_KEY
+
+        fake_input = observation_spec.zero()
+        fake_critic_input = fake_input.copy()
+        fake_critic_input.set(
+            ACTION_KEY,
+            torch.zeros(
+                (*fake_input.batch_size, self.action_dim),
+                device=self.device,
+            ),
+        )
+        with VecNorm.freeze():
+            self.vecnorm(fake_input)
+            self.actor(fake_input.copy())
+            self.qnet(fake_critic_input)
+
+        self.actor_target = deepcopy(self.actor).to(self.device)
+        self.actor_target.requires_grad_(False)
+        self.qnet_target = deepcopy(self.qnet).to(self.device)
         self.qnet_target.requires_grad_(False)
 
         self.exploration = Mod(
@@ -331,8 +384,8 @@ class FastTD3(PPOBase):
                 action_dim=self.action_dim,
                 log_std_min=self.cfg.log_std_min,
                 log_std_max=self.cfg.log_std_max,
-                action_min=action_min,
-                action_max=action_max,
+                action_min=self.action_min,
+                action_max=self.action_max,
             ),
             [ACTION_KEY, "is_init"],
             [ACTION_KEY],
@@ -340,7 +393,7 @@ class FastTD3(PPOBase):
 
         fused = str(self.device).startswith("cuda")
         self.actor_optimizer = torch.optim.AdamW(
-            self.actor_core.parameters(),
+            self.actor.parameters(),
             lr=self.cfg.actor_lr,
             weight_decay=self.cfg.weight_decay,
             fused=fused,
@@ -409,18 +462,33 @@ class FastTD3(PPOBase):
         for vecnorm in self.vecnorms.values():
             vecnorm.synchronize(mode="broadcast")
 
-    def _get_current_iter(self) -> int:
-        return int(getattr(self.env, "current_iter", 0))
+    def _run_frozen_vecnorm(self, tensordict: TensorDictBase) -> TensorDictBase:
+        if not self.cfg.vecnorm:
+            return tensordict
+        with VecNorm.freeze():
+            self.vecnorm(tensordict)
+            bootstrap_td = tensordict.get(BOOTSTRAP_KEY, None)
+            if bootstrap_td is not None:
+                self.vecnorm(bootstrap_td)
+        return tensordict
 
-    def get_next_saved_keys(self) -> tuple[str, ...]:
-        return (OBS_KEY, CMD_KEY, OBS_PRIV_KEY)
+    @torch.no_grad()
+    def _update_vecnorm_from_batch(self, tensordict: TensorDictBase) -> None:
+        if not self.cfg.vecnorm:
+            return
+        bootstrap_td = tensordict.get(BOOTSTRAP_KEY, None)
+        for key, vecnorm in self.vecnorms.items():
+            values = [tensordict[key].reshape(-1, tensordict[key].shape[-1])]
+            if bootstrap_td is not None:
+                values.append(
+                    bootstrap_td[key].reshape(-1, bootstrap_td[key].shape[-1])
+                )
+            vecnorm._update(torch.cat(values, dim=0))
 
-    def make_tensordict_primer(self):
-        return TensorDictPrimer({}, reset_key="done", expand_specs=False)
-
-    def on_stage_start(self, stage: str) -> None:
-        del stage
-        return None
+    def _reduce_q_values(self, q_values: torch.Tensor) -> torch.Tensor:
+        if self.cfg.use_cdq:
+            return torch.minimum(q_values[:, 0], q_values[:, 1])
+        return q_values.mean(dim=1)
 
     def _reward_total(self, tensordict: TensorDictBase) -> torch.Tensor:
         reward = tensordict[REWARD_KEY]
@@ -429,7 +497,11 @@ class FastTD3(PPOBase):
         return reward.squeeze(-1)
 
     def _discount(self, tensordict: TensorDictBase) -> tuple[torch.Tensor, torch.Tensor]:
-        terminated = tensordict["next", "terminated"].float().squeeze(-1)
+        terminated = tensordict["next"].get("terminated", None)
+        if terminated is None:
+            terminated = tensordict[DONE_KEY]
+        terminated = terminated.float().squeeze(-1)
+
         discount = tensordict["next"].get("discount", None)
         if discount is None:
             bootstrap = 1.0 - terminated
@@ -437,25 +509,6 @@ class FastTD3(PPOBase):
             return bootstrap, discount
         bootstrap = (1.0 - terminated) * discount.float().squeeze(-1)
         return bootstrap, torch.full_like(bootstrap, self.cfg.gamma)
-
-    def _encode_inputs(self, tensordict: TensorDictBase) -> tuple[torch.Tensor, torch.Tensor]:
-        with VecNorm.freeze():
-            features = []
-            for key in (OBS_KEY, CMD_KEY, OBS_PRIV_KEY):
-                value = tensordict[key]
-                if key in self.vecnorms:
-                    value = self.vecnorms[key](value)
-                features.append(value)
-
-        obs, cmd, priv = features
-        actor_input = torch.cat([obs, cmd], dim=-1)
-        critic_prefix = torch.cat([obs, cmd, priv], dim=-1)
-        return actor_input, critic_prefix
-
-    def _reduce_q_values(self, q_values: torch.Tensor) -> torch.Tensor:
-        if self.cfg.use_cdq:
-            return torch.minimum(q_values[0], q_values[1])
-        return q_values.mean(dim=0)
 
     def _collect_replay_data(self, tensordict: TensorDictBase) -> TensorDictBase:
         keys: list[Union[str, tuple[str, str]]] = [
@@ -469,20 +522,21 @@ class FastTD3(PPOBase):
             ("next", "truncated"),
             ("next", "discount"),
             REWARD_KEY,
-            ("next", OBS_KEY),
-            ("next", CMD_KEY),
-            ("next", OBS_PRIV_KEY),
         ]
         if "is_init" in tensordict.keys(True, True):
             keys.append("is_init")
-        return tensordict.select(*keys, strict=False)
+        replay_td = tensordict.select(*keys, strict=False)
+        next_td = tensordict["next"]
+        for key in (OBS_KEY, CMD_KEY, OBS_PRIV_KEY):
+            replay_td.set((BOOTSTRAP_KEY, key), next_td[key])
+        return replay_td
 
     def observe(self, tensordict: TensorDictBase) -> None:
         self.replay_buffer.extend(self._collect_replay_data(tensordict).reshape(-1).cpu())
 
     def _soft_update_target(self) -> None:
         with torch.no_grad():
-            for target_param, param in zip(self.actor_target.parameters(), self.actor_core.parameters()):
+            for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
                 target_param.data.mul_(1.0 - self.cfg.tau).add_(param.data, alpha=self.cfg.tau)
             for target_param, param in zip(self.qnet_target.parameters(), self.qnet.parameters()):
                 target_param.data.mul_(1.0 - self.cfg.tau).add_(param.data, alpha=self.cfg.tau)
@@ -490,26 +544,27 @@ class FastTD3(PPOBase):
     def _update_critic(
         self,
         tensordict: TensorDictBase,
-        critic_prefix: torch.Tensor,
-        next_actor_input: torch.Tensor,
-        next_critic_prefix: torch.Tensor,
         mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         rewards = self._reward_total(tensordict)
         bootstrap, discount = self._discount(tensordict)
 
         with torch.no_grad():
-            next_actions = self.actor_target(next_actor_input)
+            next_td = tensordict[BOOTSTRAP_KEY].copy()
+            self.actor_target(next_td)
+            next_actions = next_td[ACTION_KEY]
             target_noise = torch.randn_like(next_actions) * self.cfg.policy_noise
             target_noise = target_noise.clamp(-self.cfg.noise_clip, self.cfg.noise_clip)
-            next_actions = torch.maximum(
-                torch.minimum(next_actions + target_noise, self.actor_target.action_max),
-                self.actor_target.action_min,
+            next_td.set(
+                ACTION_KEY,
+                torch.maximum(
+                    torch.minimum(next_actions + target_noise, self.action_max),
+                    self.action_min,
+                ),
             )
-            next_critic_input = torch.cat([next_critic_prefix, next_actions], dim=-1)
             if self.cfg.critic_type == "distributional":
                 target_distributions = self.qnet_target.projection(
-                    next_critic_input,
+                    next_td,
                     rewards,
                     bootstrap,
                     discount,
@@ -517,45 +572,69 @@ class FastTD3(PPOBase):
                 target_values = self.qnet_target.get_value(target_distributions)
                 if self.cfg.use_cdq:
                     min_distribution = torch.where(
-                        (target_values[0] < target_values[1]).unsqueeze(-1),
-                        target_distributions[0],
-                        target_distributions[1],
+                        (target_values[:, 0] < target_values[:, 1]).unsqueeze(-1),
+                        target_distributions[:, 0],
+                        target_distributions[:, 1],
                     )
-                    target_distributions = torch.stack([min_distribution, min_distribution], dim=0)
+                    target_distributions = torch.stack(
+                        [min_distribution, min_distribution],
+                        dim=1,
+                    )
                 target_summary = self._reduce_q_values(target_values).detach()
             else:
-                target_qs = self.qnet_target(next_critic_input)
-                target_summary = rewards + bootstrap * discount * self._reduce_q_values(target_qs)
+                self.qnet_target(next_td)
+                target_qs = next_td[self._critic_out_key]
+                target_summary = (
+                    rewards + bootstrap * discount * self._reduce_q_values(target_qs)
+                )
                 target_distributions = None
 
-        critic_input = torch.cat([critic_prefix, tensordict[ACTION_KEY]], dim=-1)
-        critic_output = self.qnet(critic_input)
+        critic_td = tensordict.copy()
+        self.qnet(critic_td)
+        critic_output = critic_td[self._critic_out_key]
         if self.cfg.critic_type == "distributional":
             critic_log_probs = F.log_softmax(critic_output, dim=-1).clamp(min=-30.0)
             critic_losses = -torch.sum(target_distributions * critic_log_probs, dim=-1)
-            critic_loss = sum(_masked_mean(loss, mask) for loss in critic_losses.unbind(0))
+            critic_loss = sum(
+                _masked_mean(critic_losses[:, i], mask)
+                for i in range(critic_losses.shape[1])
+            )
         else:
-            critic_losses = (critic_output - target_summary.unsqueeze(0)).square()
-            critic_loss = sum(_masked_mean(loss, mask) for loss in critic_losses.unbind(0))
+            critic_losses = (critic_output - target_summary.unsqueeze(-1)).square()
+            critic_loss = sum(
+                _masked_mean(critic_losses[:, i], mask)
+                for i in range(critic_losses.shape[1])
+            )
 
         self.q_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
             self._all_reduce_grads(self.qnet)
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.qnet.parameters(), self.cfg.max_grad_norm)
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.qnet.parameters(),
+            self.cfg.max_grad_norm,
+        )
         self.q_optimizer.step()
-        return critic_loss, critic_grad_norm, target_summary.mean().detach(), target_summary.detach()
+        return (
+            critic_loss.detach(),
+            critic_grad_norm.detach(),
+            target_summary.mean().detach(),
+            target_summary.detach(),
+        )
 
     def _update_actor(
         self,
-        actor_input: torch.Tensor,
-        critic_prefix: torch.Tensor,
+        tensordict: TensorDictBase,
         mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        actions = self.actor_core(actor_input)
-        actor_output = self.qnet(torch.cat([critic_prefix, actions], dim=-1))
+        actor_td = tensordict.copy()
+        self.actor(actor_td)
+        self.qnet(actor_td)
+        actor_output = actor_td[self._critic_out_key]
         if self.cfg.critic_type == "distributional":
-            actor_values = self._reduce_q_values(self.qnet.get_value(F.softmax(actor_output, dim=-1)))
+            actor_values = self._reduce_q_values(
+                self.qnet.get_value(F.softmax(actor_output, dim=-1))
+            )
         else:
             actor_values = self._reduce_q_values(actor_output)
         actor_loss = _masked_mean(-actor_values, mask)
@@ -563,9 +642,9 @@ class FastTD3(PPOBase):
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
-            self._all_reduce_grads(self.actor_core)
+            self._all_reduce_grads(self.actor)
         actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.actor_core.parameters(),
+            self.actor.parameters(),
             self.cfg.max_grad_norm,
         )
         self.actor_optimizer.step()
@@ -574,22 +653,20 @@ class FastTD3(PPOBase):
             actor_loss.detach(),
             actor_grad_norm.detach(),
             actor_values.mean().detach(),
-            actions.abs().mean().detach(),
+            actor_td[ACTION_KEY].abs().mean().detach(),
         )
 
     def _update_step(self, tensordict: TensorDictBase) -> dict[str, torch.Tensor]:
+        tensordict = tensordict.copy()
+        self._update_vecnorm_from_batch(tensordict)
+        self._run_frozen_vecnorm(tensordict)
         mask = None
         if "is_init" in tensordict.keys(True, True):
             valid = ~tensordict["is_init"].squeeze(-1)
             mask = valid if valid.any() else None
 
-        actor_input, critic_prefix = self._encode_inputs(tensordict)
-        next_actor_input, next_critic_prefix = self._encode_inputs(tensordict["next"])
         q_loss, q_grad_norm, target_q_mean, target_summary = self._update_critic(
             tensordict,
-            critic_prefix,
-            next_actor_input,
-            next_critic_prefix,
             mask,
         )
 
@@ -597,8 +674,7 @@ class FastTD3(PPOBase):
         actor_updated = self.gradient_step % self.cfg.policy_frequency == 0
         if actor_updated:
             actor_loss, actor_grad_norm, actor_q_mean, action_abs = self._update_actor(
-                actor_input,
-                critic_prefix,
+                tensordict,
                 mask,
             )
         else:
@@ -610,24 +686,25 @@ class FastTD3(PPOBase):
         self.gradient_step += 1
 
         return {
-            "critic/loss": q_loss.detach(),
-            "critic/grad_norm": q_grad_norm.detach(),
+            "critic/loss": q_loss,
+            "critic/grad_norm": q_grad_norm,
             "critic/target_q_mean": target_q_mean,
             "critic/q_min": target_summary.min().detach(),
             "critic/q_max": target_summary.max().detach(),
-            "actor/loss": actor_loss.detach(),
+            "actor/loss": actor_loss,
             "actor/q_mean": actor_q_mean,
             "actor/action_abs": action_abs,
-            "actor/grad_norm": actor_grad_norm.detach(),
+            "actor/grad_norm": actor_grad_norm,
             "actor/updated": torch.tensor(float(actor_updated), device=self.device),
         }
 
     def update(self) -> dict[str, float]:
-        info: dict[str, float] = {
-            "rb_size": float(len(self.replay_buffer)),
-        }
+        info: dict[str, float] = {"rb_size": float(len(self.replay_buffer))}
         warmup_transitions = self.cfg.warm_up_steps * self.cfg.collect_steps * self.num_envs
-        if len(self.replay_buffer) < min(warmup_transitions, self.replay_buffer.storage.max_size):
+        if len(self.replay_buffer) < min(
+            warmup_transitions,
+            self.replay_buffer.storage.max_size,
+        ):
             self._sync_vecnorms()
             self.num_updates += 1
             return info
@@ -647,14 +724,26 @@ class FastTD3(PPOBase):
         self.num_updates += 1
         return info
 
+    def _get_current_iter(self) -> int:
+        return int(getattr(self.env, "current_iter", 0))
+
+    def get_next_saved_keys(self) -> tuple[str, ...]:
+        return (OBS_KEY, CMD_KEY, OBS_PRIV_KEY)
+
+    def make_tensordict_primer(self):
+        return TensorDictPrimer({}, reset_key="done", expand_specs=False)
+
+    def on_stage_start(self, stage: str) -> None:
+        del stage
+        return None
+
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         del critic
         modules = [self.vecnorm, self.actor]
         if mode == "train":
             modules.append(self.exploration)
         rollout_policy = Seq(*modules, selected_out_keys=[ACTION_KEY])
-        if self.cfg.freeze_vecnorm:
-            rollout_policy.forward = VecNorm.freeze()(rollout_policy.forward)
+        rollout_policy.forward = VecNorm.freeze()(rollout_policy.forward)
         return rollout_policy
 
     def train_op(self, tensordict: TensorDictBase) -> dict[str, float]:
@@ -662,11 +751,17 @@ class FastTD3(PPOBase):
         return self.update()
 
     def compute_value(self, tensordict: TensorDictBase) -> TensorDictBase:
-        actor_input, critic_prefix = self._encode_inputs(tensordict)
+        work_td = tensordict.copy()
         with torch.no_grad():
-            action = self.actor_core(actor_input)
-            q_probs = F.softmax(self.qnet(torch.cat([critic_prefix, action], dim=-1)), dim=-1)
-            q_value = self._reduce_q_values(self.qnet.get_value(q_probs)).unsqueeze(-1)
+            self._run_frozen_vecnorm(work_td)
+            self.actor(work_td)
+            self.qnet(work_td)
+            critic_output = work_td[self._critic_out_key]
+            if self.cfg.critic_type == "distributional":
+                q_values = self.qnet.get_value(F.softmax(critic_output, dim=-1))
+            else:
+                q_values = critic_output
+            q_value = self._reduce_q_values(q_values).unsqueeze(-1)
         tensordict.set("state_value", q_value)
         return tensordict
 

@@ -1,8 +1,5 @@
 # @package algo
 
-encoder_hidden_dims: [512, 512]
-actor_hidden_dims: [256, 256]
+actor_hidden_dims: [256, 256, 256]
 res_actor_hidden_dims: [1024, 1024, 1024]
 actor_residual_alpha_init: -4.0
-latent_dim: 256
-critic_hidden_dims: [1024, 512, 256]
