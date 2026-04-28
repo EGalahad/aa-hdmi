@@ -339,6 +339,7 @@ class FastSACConfig:
     num_atoms: int = 501
     v_min: float = -50.0
     v_max: float = 200.0
+    actor_q_reduce: str = "min"
     log_std_max: float = 0.0
     log_std_min: float = -4.0
     use_layer_norm: bool = True
@@ -351,6 +352,13 @@ class FastSACConfig:
     grad_sync_mode: str | None = "manual"
 
     def __post_init__(self) -> None:
+        self.actor_q_reduce = str(self.actor_q_reduce).lower()
+        if self.actor_q_reduce not in {"min", "mean", "q0", "q1"}:
+            raise ValueError(
+                "actor_q_reduce must be one of {'min', 'mean', 'q0', 'q1'}, "
+                f"got {self.actor_q_reduce!r}"
+            )
+
         if isinstance(self.grad_sync_mode, str):
             self.grad_sync_mode = self.grad_sync_mode.lower()
             if self.grad_sync_mode in {"none", "null"}:
@@ -581,6 +589,19 @@ class FastSAC(PPOBase):
         tensordict.set(f"{ACTION_KEY}_log_prob", log_prob)
         return tensordict, dist
 
+    def _reduce_actor_q_values(self, q_values: torch.Tensor) -> torch.Tensor:
+        if self.cfg.actor_q_reduce == "min":
+            return q_values.min(dim=1).values
+        if self.cfg.actor_q_reduce == "mean":
+            return q_values.mean(dim=1)
+        if self.cfg.actor_q_reduce == "q0":
+            return q_values[:, 0]
+        if q_values.shape[1] < 2:
+            raise ValueError(
+                "actor_q_reduce='q1' requires at least two Q heads."
+            )
+        return q_values[:, 1]
+
     def _get_current_iter(self) -> int:
         return int(getattr(self.env, "current_iter", 0))
 
@@ -710,15 +731,15 @@ class FastSAC(PPOBase):
         q_outputs = actor_td[Q_LOGITS_KEY]
         q_probs = F.softmax(q_outputs, dim=-1)
         q_values = self.qnet.get_value(q_probs)
-        q_mean = q_values.mean(dim=1)
+        q_value = self._reduce_actor_q_values(q_values)
         log_probs = actor_td[f"{ACTION_KEY}_log_prob"]
         actor_loss = _masked_mean(
-            self.log_alpha.exp().detach() * log_probs - q_mean,
+            self.log_alpha.exp().detach() * log_probs - q_value,
             mask,
         )
         action_std = actor_td["scale"].mean(dim=-1)
         diagnostics = {
-            "actor/q_mean": _masked_mean(q_mean.detach(), mask),
+            "actor/q_value": _masked_mean(q_value.detach(), mask),
             "policy/log_prob_mean": _masked_mean(log_probs.detach(), mask),
             "policy/log_prob_min": log_probs.detach().min(),
             "policy/log_prob_max": log_probs.detach().max(),
@@ -785,7 +806,7 @@ class FastSAC(PPOBase):
             action_std = torch.zeros_like(actor_loss)
             actor_grad_norm = torch.zeros_like(actor_loss)
             actor_diag = {
-                "actor/q_mean": torch.zeros((), device=self.device),
+                "actor/q_value": torch.zeros((), device=self.device),
                 "policy/log_prob_mean": torch.zeros((), device=self.device),
                 "policy/log_prob_min": torch.zeros((), device=self.device),
                 "policy/log_prob_max": torch.zeros((), device=self.device),
@@ -861,7 +882,8 @@ class FastSAC(PPOBase):
             work_td, _ = self._sample_actor(work_td)
             self.qnet(work_td)
             q_probs = F.softmax(work_td[Q_LOGITS_KEY], dim=-1)
-            q_value = self.qnet.get_value(q_probs).mean(dim=1).unsqueeze(-1)
+            q_values = self.qnet.get_value(q_probs)
+            q_value = self._reduce_actor_q_values(q_values).unsqueeze(-1)
         tensordict.set("state_value", q_value)
         return tensordict
 

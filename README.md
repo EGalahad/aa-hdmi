@@ -14,10 +14,10 @@ Setup uv venv directories and install dependencies:
 
 ```bash
 mkdir -p venv/mjlab
-cp projects/hdmi/pyproject-mjlab.toml venv/mjlab/
+cp projects/hdmi/pyproject-mjlab.toml venv/mjlab/pyproject.toml
 
 mkdir -p venv/isaaclab
-cp projects/hdmi/pyproject-isaaclab.toml venv/isaaclab/
+cp projects/hdmi/pyproject-isaaclab.toml venv/isaaclab/pyproject.toml
 ```
 
 The repository should now look like this:
