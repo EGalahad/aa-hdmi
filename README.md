@@ -66,18 +66,29 @@ uv --project venv/mjlab run projects/hdmi/scripts/train_sequential.py \
   nproc_per_node=8 task=lafan_100style_real stages=normal backend=mjlab
 ```
 
+Run fast sac training:
+
+```bash
+uv --project venv/mjlab run projects/hdmi/scripts/train-off_policy.py \
+  task=lafan-single +exp=fast-sac-train backend=mjlab algo.vecnorm=false
+```
+
 To play checkpoints:
 
 ```bash
 uv --project venv/mjlab run projects/hdmi/scripts/play.py \
-    task=lafan task/command/future_steps=long \
-    algo=ppo_roa_finetune backend=mjlab \
-    checkpoint_path=run:elijahgalahad/hdmi/runs/a03f770b_lafan_100style_finetune
+  task=lafan task/command/future_steps=long \
+  algo=ppo_roa_finetune backend=mjlab \
+  checkpoint_path=run:elijahgalahad/hdmi/runs/a03f770b_lafan_100style_finetune
 
 uv --project venv/mjlab run projects/hdmi/scripts/play.py \
-    task=lafan \
-    +exp=train-hdmi backend=mjlab \
-    checkpoint_path=run:elijahgalahad/hdmi/runs/kr0vxm4n
+  task=lafan \
+  +exp=train-hdmi backend=mjlab \
+  checkpoint_path=run:elijahgalahad/hdmi/runs/kr0vxm4n
+
+uv --project venv/mjlab run projects/hdmi/scripts/play.py \
+  task=lafan-single +exp=fast-sac-train backend=mjlab algo.vecnorm=false \
+  checkpoint_path=run:elijahgalahad/hdmi/runs/ffjg0e9k task.num_envs=4
 ```
 
 ## Troubleshooting
