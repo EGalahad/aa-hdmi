@@ -47,10 +47,13 @@ from .common import NullVecNorm
 from .fast_sac import (
     ACTOR_INPUT_KEY,
     BOOTSTRAP_KEY,
-    DistributionalCriticTD,
+    CRITIC_INPUT_KEY,
+    DistributionalCritic,
     Q_LOGITS_KEY,
     _build_mlp,
     _masked_mean,
+    distributional_q_value,
+    project_distributional_q,
 )
 
 
@@ -342,16 +345,29 @@ class FastTD3(PPOBase):
             ),
             selected_out_keys=[ACTION_KEY],
         ).to(self.device)
-
         if self.cfg.critic_type == "distributional":
-            self.qnet = DistributionalCriticTD(
-                num_atoms=self.cfg.num_atoms,
-                v_min=self.cfg.v_min,
-                v_max=self.cfg.v_max,
-                hidden_dim=self.cfg.critic_hidden_dim,
-                use_layer_norm=self.cfg.use_layer_norm,
-                device=self.device,
+            self.qnet = Seq(
+                CatTensors(
+                    [OBS_KEY, CMD_KEY, OBS_PRIV_KEY, ACTION_KEY],
+                    CRITIC_INPUT_KEY,
+                    del_keys=False,
+                    sort=False,
+                ),
+                DistributionalCritic(
+                    num_atoms=self.cfg.num_atoms,
+                    hidden_dim=self.cfg.critic_hidden_dim,
+                    use_layer_norm=self.cfg.use_layer_norm,
+                ),
             ).to(self.device)
+            self.register_buffer(
+                "q_support",
+                torch.linspace(
+                    self.cfg.v_min,
+                    self.cfg.v_max,
+                    self.cfg.num_atoms,
+                    device=self.device,
+                ),
+            )
             self._critic_out_key = Q_LOGITS_KEY
         else:
             self.qnet = ScalarDoubleCriticTD(
@@ -562,14 +578,16 @@ class FastTD3(PPOBase):
                     self.action_min,
                 ),
             )
+            self.qnet_target(next_td)
             if self.cfg.critic_type == "distributional":
-                target_distributions = self.qnet_target.projection(
-                    next_td,
+                target_distributions = project_distributional_q(
+                    next_td[Q_LOGITS_KEY],
                     rewards,
                     bootstrap,
                     discount,
+                    self.q_support,
                 )
-                target_values = self.qnet_target.get_value(target_distributions)
+                target_values = distributional_q_value(target_distributions, self.q_support)
                 if self.cfg.use_cdq:
                     min_distribution = torch.where(
                         (target_values[:, 0] < target_values[:, 1]).unsqueeze(-1),
@@ -582,7 +600,6 @@ class FastTD3(PPOBase):
                     )
                 target_summary = self._reduce_q_values(target_values).detach()
             else:
-                self.qnet_target(next_td)
                 target_qs = next_td[self._critic_out_key]
                 target_summary = (
                     rewards + bootstrap * discount * self._reduce_q_values(target_qs)
@@ -633,7 +650,7 @@ class FastTD3(PPOBase):
         actor_output = actor_td[self._critic_out_key]
         if self.cfg.critic_type == "distributional":
             actor_values = self._reduce_q_values(
-                self.qnet.get_value(F.softmax(actor_output, dim=-1))
+                distributional_q_value(F.softmax(actor_output, dim=-1), self.q_support)
             )
         else:
             actor_values = self._reduce_q_values(actor_output)
@@ -758,7 +775,7 @@ class FastTD3(PPOBase):
             self.qnet(work_td)
             critic_output = work_td[self._critic_out_key]
             if self.cfg.critic_type == "distributional":
-                q_values = self.qnet.get_value(F.softmax(critic_output, dim=-1))
+                q_values = distributional_q_value(F.softmax(critic_output, dim=-1), self.q_support)
             else:
                 q_values = critic_output
             q_value = self._reduce_q_values(q_values).unsqueeze(-1)

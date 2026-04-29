@@ -3,6 +3,9 @@
 defaults:
   - override /algo: fast_sac
 
-total_iters: 4000
-checkpoint_interval: 1000
-upload_interval: 1000
+total_iters: 10000
+checkpoint_interval: 2000
+upload_interval: 2000
+
+task:
+  num_envs: 2048
