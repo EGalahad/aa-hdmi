@@ -258,8 +258,8 @@ class FastSACConfig:
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
-    alpha_init: float = 1e-3
-    target_entropy_ratio: float | None = 1.0
+    alpha_init: float = 4e-3
+    target_entropy_ratio: float | None = None # 1.0
     weight_decay: float = 1e-3
 
     actor_hidden_dim: int = 512
