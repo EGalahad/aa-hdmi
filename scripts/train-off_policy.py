@@ -49,7 +49,8 @@ def main(cfg: DictConfig):
 
     checkpoint_interval = cfg.checkpoint_interval
     upload_interval = cfg.upload_interval
-    log_interval = (env.max_episode_length // cfg.algo.collect_steps) + 1
+    max_episode_length = cfg.task.max_episode_length
+    log_interval = (max_episode_length // cfg.algo.collect_steps) + 1
     logging.info(f"Log interval: {log_interval} steps")
 
     stats_keys = [
