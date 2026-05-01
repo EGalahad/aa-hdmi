@@ -8,7 +8,7 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence, Tuple, Union
+from typing import Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -19,7 +19,6 @@ from tensordict import TensorDictBase
 from tensordict.nn import (
     TensorDictModule as Mod,
     TensorDictModuleBase,
-    TensorDictSequential as Seq,
 )
 from torchrl.data import Composite as CompositeSpec, LazyTensorStorage, TensorDictReplayBuffer, TensorSpec
 from torchrl.data.replay_buffers.samplers import SliceSampler
@@ -28,7 +27,6 @@ from torchrl.modules import ProbabilisticActor
 
 import active_adaptation as aa
 from active_adaptation.learning.modules.distributions import TanhNormalWithEntropy
-from active_adaptation.learning.modules.vecnorm import VecNorm
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
     CMD_KEY,
@@ -37,11 +35,10 @@ from active_adaptation.learning.ppo.common import (
     OBS_KEY,
     OBS_PRIV_KEY,
     REWARD_KEY,
-    CatTensors,
 )
 from active_adaptation.learning.ppo.ppo_base import PPOBase
 
-from .common import NullVecNorm
+from .common import EmpiricalNormalizer
 from .action_bounds import (
     coerce_action_bounds_config,
     default_action_bounds,
@@ -50,6 +47,7 @@ from .action_bounds import (
 
 BOOTSTRAP_KEY = "bootstrap"
 ACTOR_INPUT_KEY = "_actor_input"
+CRITIC_OBS_KEY = "_critic_obs"
 CRITIC_INPUT_KEY = "_critic_input"
 Q_LOGITS_KEY = "_q_logits"
 ENV_ID_KEY = "_env_id"
@@ -520,6 +518,17 @@ class WarmupUniformRolloutPolicy:
         return tensordict
 
 
+class FastSACRolloutPolicy(TensorDictModuleBase):
+    def __init__(self, policy: "FastSAC") -> None:
+        super().__init__()
+        object.__setattr__(self, "_policy", policy)
+
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        policy = self._policy
+        policy._prepare_actor_input(tensordict, update_normalizer=False)
+        return policy.actor(tensordict)
+
+
 @dataclass
 class FastSACConfig:
     _target_: str = f"{__package__}.fast_sac.FastSAC"
@@ -664,7 +673,13 @@ class FastSAC(PPOBase):
         self.joint_names = env.action_manager.joint_names
         self.gradient_step = 0
 
-        self._build_vecnorm_modules(observation_spec)
+        self.actor_obs_keys: Tuple[str, ...] = (OBS_KEY, CMD_KEY)
+        self.critic_obs_keys: Tuple[str, ...] = (OBS_KEY, CMD_KEY, OBS_PRIV_KEY)
+        self.actor_obs_dim = sum(int(observation_spec[key].shape[-1]) for key in self.actor_obs_keys)
+        self.critic_obs_dim = sum(
+            int(observation_spec[key].shape[-1]) for key in self.critic_obs_keys
+        )
+        self._build_obs_normalizers()
 
         action_min, action_max = resolve_action_bounds(
             self.cfg.action_bounds,
@@ -677,24 +692,16 @@ class FastSAC(PPOBase):
         self.action_max: torch.Tensor
 
         self.actor: ProbabilisticActor = ProbabilisticActor(
-            module=Seq(
-                CatTensors(
-                    [OBS_KEY, CMD_KEY],
-                    ACTOR_INPUT_KEY,
-                    del_keys=False,
-                    sort=False,
+            module=Mod(
+                FastSACActorCore(
+                    self.action_dim,
+                    hidden_dim=self.cfg.actor_hidden_dim,
+                    log_std_max=self.cfg.log_std_max,
+                    log_std_min=self.cfg.log_std_min,
+                    use_layer_norm=self.cfg.use_layer_norm,
                 ),
-                Mod(
-                    FastSACActorCore(
-                        self.action_dim,
-                        hidden_dim=self.cfg.actor_hidden_dim,
-                        log_std_max=self.cfg.log_std_max,
-                        log_std_min=self.cfg.log_std_min,
-                        use_layer_norm=self.cfg.use_layer_norm,
-                    ),
-                    [ACTOR_INPUT_KEY],
-                    ["loc", "scale"],
-                ),
+                [ACTOR_INPUT_KEY],
+                ["loc", "scale"],
             ),
             in_keys=["loc", "scale"],
             out_keys=[ACTION_KEY],
@@ -707,18 +714,10 @@ class FastSAC(PPOBase):
             return_log_prob=True,
         ).to(self.device)
 
-        self.qnet = Seq(
-            CatTensors(
-                [OBS_KEY, CMD_KEY, OBS_PRIV_KEY, ACTION_KEY],
-                CRITIC_INPUT_KEY,
-                del_keys=False,
-                sort=False,
-            ),
-            DistributionalCritic(
-                num_atoms=self.cfg.num_atoms,
-                hidden_dim=self.cfg.critic_hidden_dim,
-                use_layer_norm=self.cfg.use_layer_norm,
-            ),
+        self.qnet = DistributionalCritic(
+            num_atoms=self.cfg.num_atoms,
+            hidden_dim=self.cfg.critic_hidden_dim,
+            use_layer_norm=self.cfg.use_layer_norm,
         ).to(self.device)
         self.register_buffer(
             "q_support",
@@ -740,9 +739,11 @@ class FastSAC(PPOBase):
                 device=self.device,
             ),
         )
-        with VecNorm.freeze():
-            self.vecnorm(fake_input)
+        with torch.no_grad():
+            self._prepare_actor_input(fake_input, update_normalizer=False)
             self.actor.get_dist(fake_input)
+            self._prepare_critic_obs(fake_critic_input, update_normalizer=False)
+            self._prepare_critic_input(fake_critic_input)
             self.qnet(fake_critic_input)
 
         self.qnet_target = deepcopy(self.qnet).to(self.device)
@@ -846,24 +847,33 @@ class FastSAC(PPOBase):
         if self.cfg.debug_timing and str(self.device).startswith("cuda"):
             torch.cuda.synchronize(self.device)
 
-    def _build_vecnorm_modules(self, observation_spec: CompositeSpec) -> None:
-        modules = []
-        self.vecnorms: Mapping[str, VecNorm] = nn.ModuleDict()
-        vecnorm_cls = VecNorm if self.cfg.vecnorm else NullVecNorm
-        for key in (OBS_KEY, CMD_KEY, OBS_PRIV_KEY):
-            if key not in observation_spec.keys(True, True):
-                continue
-            shape = observation_spec[key].shape[-1:]
-            vecnorm = vecnorm_cls(input_shape=shape, stats_shape=shape, decay=0.9999)
-            self.vecnorms[key] = vecnorm
-            modules.append(Mod(vecnorm, [key], [key]))
-        self.vecnorm = Seq(*modules).to(self.device)
+    def _build_obs_normalizers(self) -> None:
+        self.use_obs_normalization = bool(self.cfg.vecnorm)
+        self.update_obs_normalization = bool(self.cfg.vecnorm) and not self.cfg.freeze_vecnorm
+        if self.use_obs_normalization:
+            self.actor_obs_normalizer: nn.Module = EmpiricalNormalizer(
+                self.actor_obs_dim,
+                self.device,
+            )
+            self.critic_obs_normalizer: nn.Module = EmpiricalNormalizer(
+                self.critic_obs_dim,
+                self.device,
+            )
+        else:
+            self.actor_obs_normalizer = nn.Identity()
+            self.critic_obs_normalizer = nn.Identity()
 
     def _broadcast_parameters(self) -> None:
         with torch.no_grad():
             dist.broadcast(self.log_alpha.data, src=0)
             dist.broadcast(self.q_support, src=0)
-            for module in (self.vecnorm, self.actor, self.qnet, self.qnet_target):
+            for module in (
+                self.actor_obs_normalizer,
+                self.critic_obs_normalizer,
+                self.actor,
+                self.qnet,
+                self.qnet_target,
+            ):
                 for param in module.parameters():
                     dist.broadcast(param, src=0)
                 for buf in module.buffers():
@@ -883,15 +893,83 @@ class FastSAC(PPOBase):
             dist.all_reduce(param.grad.data, op=dist.ReduceOp.AVG)
 
     def _sync_vecnorms(self) -> None:
-        if not aa.is_distributed() or not self.cfg.vecnorm:
-            return
-        for vecnorm in self.vecnorms.values():
-            vecnorm.synchronize(mode="broadcast")
+        return None
+
+    def _cat_obs(self, tensordict: TensorDictBase, keys: Sequence[str]) -> torch.Tensor:
+        return torch.cat([tensordict[key].float() for key in keys], dim=-1)
+
+    def normalize_actor_obs(self, obs: torch.Tensor, *, update: bool = False) -> torch.Tensor:
+        if not self.use_obs_normalization:
+            return obs.float()
+        flat = obs.reshape(-1, obs.shape[-1]).float()
+        normed = self.actor_obs_normalizer(
+            flat,
+            update=bool(update and self.update_obs_normalization),
+        )
+        return normed.reshape_as(obs)
+
+    def normalize_critic_obs(self, obs: torch.Tensor, *, update: bool = False) -> torch.Tensor:
+        if not self.use_obs_normalization:
+            return obs.float()
+        flat = obs.reshape(-1, obs.shape[-1]).float()
+        normed = self.critic_obs_normalizer(
+            flat,
+            update=bool(update and self.update_obs_normalization),
+        )
+        return normed.reshape_as(obs)
+
+    def _prepare_actor_input(
+        self,
+        tensordict: TensorDictBase,
+        *,
+        update_normalizer: bool,
+    ) -> TensorDictBase:
+        actor_obs = self._cat_obs(tensordict, self.actor_obs_keys)
+        tensordict.set(
+            ACTOR_INPUT_KEY,
+            self.normalize_actor_obs(actor_obs, update=update_normalizer),
+        )
+        return tensordict
+
+    def _prepare_critic_obs(
+        self,
+        tensordict: TensorDictBase,
+        *,
+        update_normalizer: bool,
+    ) -> TensorDictBase:
+        critic_obs = self._cat_obs(tensordict, self.critic_obs_keys)
+        tensordict.set(
+            CRITIC_OBS_KEY,
+            self.normalize_critic_obs(critic_obs, update=update_normalizer),
+        )
+        return tensordict
+
+    def _prepare_critic_input(self, tensordict: TensorDictBase) -> TensorDictBase:
+        tensordict.set(
+            CRITIC_INPUT_KEY,
+            torch.cat([tensordict[CRITIC_OBS_KEY], tensordict[ACTION_KEY]], dim=-1),
+        )
+        return tensordict
+
+    def _prepare_batch_inputs(
+        self,
+        tensordict: TensorDictBase,
+        *,
+        update_normalizers: bool,
+    ) -> TensorDictBase:
+        self._prepare_actor_input(tensordict, update_normalizer=update_normalizers)
+        self._prepare_critic_obs(tensordict, update_normalizer=update_normalizers)
+        bootstrap_td = tensordict.get(BOOTSTRAP_KEY, None)
+        if bootstrap_td is not None:
+            self._prepare_actor_input(bootstrap_td, update_normalizer=update_normalizers)
+            self._prepare_critic_obs(bootstrap_td, update_normalizer=update_normalizers)
+        return tensordict
 
     def _sample_actor(
         self,
         tensordict: TensorDictBase,
     ) -> TensorDictBase:
+        self._prepare_actor_input(tensordict, update_normalizer=False)
         dist = self.actor.get_dist(tensordict)
         action = dist.rsample()
         log_prob = dist.log_prob(action)
@@ -1021,6 +1099,7 @@ class FastSAC(PPOBase):
                 -bootstrap_discount * self.log_alpha.exp().detach() * next_log_probs,
                 torch.zeros_like(adjusted_rewards),
             )
+            self._prepare_critic_input(bootstrap_td)
             self._sync_if_timing()
             t0 = time.perf_counter()
             self.qnet_target(bootstrap_td)
@@ -1130,6 +1209,7 @@ class FastSAC(PPOBase):
                 -bootstrap_discount * alpha * bootstrap_log_probs,
                 torch.zeros_like(adjusted_rewards),
             )
+            self._prepare_critic_input(bootstrap_td)
             next_log_probs = bootstrap_log_probs
         self._sync_if_timing()
         t0 = time.perf_counter()
@@ -1181,6 +1261,7 @@ class FastSAC(PPOBase):
 
         self._sync_if_timing()
         t0 = time.perf_counter()
+        self._prepare_critic_input(critic_td)
         self.qnet(critic_td)
         self._sync_if_timing()
         if timing:
@@ -1249,6 +1330,7 @@ class FastSAC(PPOBase):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         actor_td = tensordict.copy()
         actor_td = self._sample_actor(actor_td)
+        self._prepare_critic_input(actor_td)
         self.qnet(actor_td)
         q_probs = F.softmax(actor_td[Q_LOGITS_KEY], dim=-1)
         q_values = distributional_q_value(q_probs, self.q_support)
@@ -1311,9 +1393,10 @@ class FastSAC(PPOBase):
         self._sync_if_timing()
         t0 = time.perf_counter()
         tensordict = tensordict.copy()
-        self.vecnorm(tensordict)
-        if tensordict.get(BOOTSTRAP_KEY, None) is not None:
-            self.vecnorm(tensordict[BOOTSTRAP_KEY])
+        self._prepare_batch_inputs(
+            tensordict,
+            update_normalizers=self.update_obs_normalization,
+        )
         self._sync_if_timing()
         if timing:
             timing_data["vecnorm_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -1465,12 +1548,7 @@ class FastSAC(PPOBase):
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         del critic
-        rollout_policy = Seq(
-            self.vecnorm,
-            self.actor,
-            selected_out_keys=[f"{ACTION_KEY}_log_prob", ACTION_KEY, "loc", "scale"],
-        )
-        rollout_policy.forward = VecNorm.freeze()(rollout_policy.forward)
+        rollout_policy = FastSACRolloutPolicy(self)
         if mode == "train":
             return WarmupUniformRolloutPolicy(self, rollout_policy)
         return rollout_policy
@@ -1481,11 +1559,10 @@ class FastSAC(PPOBase):
 
     def compute_value(self, tensordict: TensorDictBase) -> TensorDictBase:
         work_td = tensordict.copy()
-        with torch.no_grad(), VecNorm.freeze():
-            self.vecnorm(work_td)
-            if work_td.get(BOOTSTRAP_KEY, None) is not None:
-                self.vecnorm(work_td[BOOTSTRAP_KEY])
+        with torch.no_grad():
+            self._prepare_batch_inputs(work_td, update_normalizers=False)
             work_td = self._sample_actor(work_td)
+            self._prepare_critic_input(work_td)
             self.qnet(work_td)
             q_probs = F.softmax(work_td[Q_LOGITS_KEY], dim=-1)
             q_values = distributional_q_value(q_probs, self.q_support)
