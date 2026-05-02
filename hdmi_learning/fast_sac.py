@@ -557,6 +557,8 @@ class FastSACConfig:
 
     actor_hidden_dim: int = 512
     critic_hidden_dim: int = 768
+    action_space_mode: str = "manual"
+    holosoma_action_scale: float = 0.25
     action_bounds: dict[str, list[float]] = field(
         default_factory=default_action_bounds
     )
@@ -633,6 +635,12 @@ class FastSACConfig:
                 "grad_sync_mode must be one of {'manual', None, 'ddp'}, "
                 f"got {self.grad_sync_mode!r}"
             )
+        self.action_space_mode = str(self.action_space_mode).lower()
+        if self.action_space_mode not in {"manual", "holosoma"}:
+            raise ValueError(
+                "action_space_mode must be one of {'manual', 'holosoma'}, "
+                f"got {self.action_space_mode!r}"
+            )
         self.action_bounds = coerce_action_bounds_config(
             self.action_bounds,
             action_min=self.action_min,
@@ -681,11 +689,7 @@ class FastSAC(PPOBase):
         )
         self._build_obs_normalizers()
 
-        action_min, action_max = resolve_action_bounds(
-            self.cfg.action_bounds,
-            self.joint_names,
-            self.device,
-        )
+        action_min, action_max = self._resolve_action_space_bounds()
         self.register_buffer("action_min", action_min.clone())
         self.register_buffer("action_max", action_max.clone())
         self.action_min: torch.Tensor
@@ -862,6 +866,89 @@ class FastSAC(PPOBase):
         else:
             self.actor_obs_normalizer = nn.Identity()
             self.critic_obs_normalizer = nn.Identity()
+
+    def _resolve_action_space_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.cfg.action_space_mode == "holosoma":
+            return self._configure_holosoma_action_space()
+        return resolve_action_bounds(
+            self.cfg.action_bounds,
+            self.joint_names,
+            self.device,
+        )
+
+    def _configure_holosoma_action_space(self) -> tuple[torch.Tensor, torch.Tensor]:
+        manager = getattr(self.env, "action_manager", None)
+        if manager is None:
+            raise RuntimeError("Holosoma action scaling requires env.action_manager.")
+
+        env_action_scale = self._compute_holosoma_env_action_scale(manager)
+        if env_action_scale.numel() != self.action_dim:
+            raise ValueError(
+                f"FastSAC env action scale has {env_action_scale.numel()} entries, "
+                f"expected action_dim={self.action_dim}."
+            )
+
+        manager.action_scaling = env_action_scale.to(manager.device)
+        actor_boundary = self._compute_action_boundary_from_limits(
+            manager,
+            env_action_scale,
+        )
+        print(
+            "[Info] FastSAC Holosoma action scaling: "
+            f"env_scale_min={env_action_scale.min().item():.4f}, "
+            f"env_scale_max={env_action_scale.max().item():.4f}, "
+            f"actor_boundary_min={actor_boundary.min().item():.4f}, "
+            f"actor_boundary_max={actor_boundary.max().item():.4f}, "
+            f"boundary_logsum={actor_boundary.log().sum().item():.4f}",
+            flush=True,
+        )
+        return -actor_boundary, actor_boundary
+
+    def _compute_holosoma_env_action_scale(self, manager) -> torch.Tensor:
+        asset = manager.asset
+        actuator_names = list(asset.actuator_names)
+        ctrl_ids = torch.as_tensor(
+            asset.indexing.ctrl_ids,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if len(actuator_names) != int(ctrl_ids.numel()):
+            raise RuntimeError(
+                f"Expected one actuator name per control id, got {len(actuator_names)} names "
+                f"and {int(ctrl_ids.numel())} control ids."
+            )
+        name_to_ctrl_id = {name: ctrl_ids[i] for i, name in enumerate(actuator_names)}
+        missing = [name for name in manager.joint_names if name not in name_to_ctrl_id]
+        if missing:
+            raise RuntimeError(
+                f"Cannot compute Holosoma action scale; missing actuators for joints: {missing}"
+            )
+
+        selected_ctrl_ids = torch.stack([name_to_ctrl_id[name] for name in manager.joint_names])
+        force_range = manager.env.sim.get_default_field("actuator_forcerange").to(self.device)
+        gainprm = manager.env.sim.get_default_field("actuator_gainprm").to(self.device)
+        effort_limit = force_range[selected_ctrl_ids].abs().max(dim=-1).values
+        stiffness = gainprm[selected_ctrl_ids, 0].abs().clamp_min(1.0e-6)
+        return (
+            float(self.cfg.holosoma_action_scale) * effort_limit / stiffness
+        ).clamp_min(1.0e-6)
+
+    def _compute_action_boundary_from_limits(
+        self,
+        manager,
+        env_action_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if not hasattr(manager.asset.data, "joint_pos_limits"):
+            raise RuntimeError(
+                "FastSAC Holosoma action boundary requires asset.data.joint_pos_limits."
+            )
+
+        limits = manager.asset.data.joint_pos_limits[0, manager.joint_ids].to(self.device)
+        default_pos = manager.default_joint_pos[0, manager.joint_ids].to(self.device)
+        lower = limits[..., 0]
+        upper = limits[..., 1]
+        max_offset = torch.maximum((default_pos - lower).abs(), (upper - default_pos).abs())
+        return (max_offset / env_action_scale.abs().clamp_min(1.0e-6)).clamp_min(1.0e-6)
 
     def _broadcast_parameters(self) -> None:
         with torch.no_grad():
