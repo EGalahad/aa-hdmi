@@ -31,6 +31,7 @@ from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
     CMD_KEY,
     DONE_KEY,
+    GAE,
     TERM_KEY,
     OBS_KEY,
     OBS_PRIV_KEY,
@@ -495,6 +496,24 @@ class DistributionalCritic(TensorDictModuleBase):
         return tensordict
 
 
+class ValueProbe(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_dim: int = 768,
+        use_layer_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        hidden_dims = [hidden_dim, hidden_dim // 2, hidden_dim // 4]
+        self.net = nn.Sequential(
+            _build_mlp(None, hidden_dims, use_layer_norm=use_layer_norm),
+            nn.Linear(hidden_dims[-1], 1),
+        )
+
+    def forward(self, critic_obs: torch.Tensor) -> torch.Tensor:
+        return self.net(critic_obs)
+
+
 class WarmupUniformRolloutPolicy:
     def __init__(self, policy: "FastSAC", actor_rollout_policy: TensorDictModuleBase) -> None:
         object.__setattr__(self, "_policy", policy)
@@ -559,6 +578,7 @@ class FastSACConfig:
     critic_hidden_dim: int = 768
     action_space_mode: str = "manual"
     holosoma_action_scale: float = 0.25
+    holosoma_use_actor_boundary: bool = False
     action_bounds: dict[str, list[float]] = field(
         default_factory=default_action_bounds
     )
@@ -580,6 +600,14 @@ class FastSACConfig:
 
     vecnorm: bool = True
     freeze_vecnorm: bool = False
+    enable_value_probe: bool = True
+    value_probe_hidden_dim: int | None = None
+    value_probe_lr: float | None = None
+    value_probe_update_every: int = 32
+    value_probe_trace_steps: int = 32
+    value_probe_inner: int = 2
+    gae_lambda: float = 0.95
+    action_bound_epsilon_ratio: float = 0.02
     checkpoint_path: Union[str, None] = None
     in_keys: Tuple[str, ...] = (OBS_KEY, CMD_KEY, OBS_PRIV_KEY)
     grad_sync_mode: str | None = "manual"
@@ -624,6 +652,27 @@ class FastSACConfig:
             raise ValueError(
                 f"debug_timing_interval must be >= 1, got {self.debug_timing_interval}."
             )
+        self.value_probe_update_every = int(self.value_probe_update_every)
+        if self.value_probe_update_every < 1:
+            raise ValueError(
+                "value_probe_update_every must be >= 1, "
+                f"got {self.value_probe_update_every}."
+            )
+        self.value_probe_trace_steps = int(self.value_probe_trace_steps)
+        if self.value_probe_trace_steps < 2:
+            raise ValueError(
+                "value_probe_trace_steps must be >= 2, "
+                f"got {self.value_probe_trace_steps}."
+            )
+        self.value_probe_inner = int(self.value_probe_inner)
+        if self.value_probe_inner < 1:
+            raise ValueError(
+                f"value_probe_inner must be >= 1, got {self.value_probe_inner}."
+            )
+        if self.value_probe_hidden_dim is None:
+            self.value_probe_hidden_dim = self.critic_hidden_dim
+        if self.value_probe_lr is None:
+            self.value_probe_lr = self.critic_lr
 
         if isinstance(self.grad_sync_mode, str):
             self.grad_sync_mode = self.grad_sync_mode.lower()
@@ -752,6 +801,26 @@ class FastSAC(PPOBase):
 
         self.qnet_target = deepcopy(self.qnet).to(self.device)
         self.qnet_target.requires_grad_(False)
+        fused = str(self.device).startswith("cuda")
+        self.gae = GAE(self.cfg.gamma, self.cfg.gae_lambda).to(self.device)
+        self.enable_value_probe = bool(self.cfg.enable_value_probe)
+        self.value_probe = None
+        self.value_optimizer = None
+        self.value_trace: deque[TensorDictBase] = deque(
+            maxlen=self.cfg.value_probe_trace_steps
+        )
+        if self.enable_value_probe:
+            self.value_probe = ValueProbe(
+                hidden_dim=int(self.cfg.value_probe_hidden_dim),
+                use_layer_norm=self.cfg.use_layer_norm,
+            ).to(self.device)
+            self.value_optimizer = torch.optim.AdamW(
+                self.value_probe.parameters(),
+                lr=float(self.cfg.value_probe_lr),
+                weight_decay=self.cfg.weight_decay,
+                fused=fused,
+                betas=(0.9, 0.95),
+            )
 
         self.log_alpha = nn.Parameter(
             torch.tensor(math.log(self.cfg.alpha_init), device=self.device)
@@ -764,7 +833,6 @@ class FastSAC(PPOBase):
         )
         self.log_alpha.requires_grad_(not self.fixed_alpha)
 
-        fused = str(self.device).startswith("cuda")
         self.actor_optimizer = torch.optim.AdamW(
             self.actor.parameters(),
             lr=self.cfg.actor_lr,
@@ -889,20 +957,34 @@ class FastSAC(PPOBase):
             )
 
         manager.action_scaling = env_action_scale.to(manager.device)
-        actor_boundary = self._compute_action_boundary_from_limits(
-            manager,
-            env_action_scale,
-        )
+        if self.cfg.holosoma_use_actor_boundary:
+            actor_low, actor_high = self._compute_action_bounds_from_limits(
+                manager,
+                env_action_scale,
+            )
+            actor_scale = 0.5 * (actor_high - actor_low)
+            actor_bias = 0.5 * (actor_high + actor_low)
+            print(
+                "[Info] FastSAC Holosoma action scaling: "
+                f"env_scale_min={env_action_scale.min().item():.4f}, "
+                f"env_scale_max={env_action_scale.max().item():.4f}, "
+                f"actor_low_min={actor_low.min().item():.4f}, "
+                f"actor_high_max={actor_high.max().item():.4f}, "
+                f"actor_scale_min={actor_scale.min().item():.4f}, "
+                f"actor_scale_max={actor_scale.max().item():.4f}, "
+                f"actor_bias_absmax={actor_bias.abs().max().item():.4f}",
+                flush=True,
+            )
+            return actor_low, actor_high
+
         print(
             "[Info] FastSAC Holosoma action scaling: "
             f"env_scale_min={env_action_scale.min().item():.4f}, "
             f"env_scale_max={env_action_scale.max().item():.4f}, "
-            f"actor_boundary_min={actor_boundary.min().item():.4f}, "
-            f"actor_boundary_max={actor_boundary.max().item():.4f}, "
-            f"boundary_logsum={actor_boundary.log().sum().item():.4f}",
+            "actor_boundary_mode=fixed_unit",
             flush=True,
         )
-        return -actor_boundary, actor_boundary
+        return -torch.ones_like(env_action_scale), torch.ones_like(env_action_scale)
 
     def _compute_holosoma_env_action_scale(self, manager) -> torch.Tensor:
         asset = manager.asset
@@ -933,11 +1015,11 @@ class FastSAC(PPOBase):
             float(self.cfg.holosoma_action_scale) * effort_limit / stiffness
         ).clamp_min(1.0e-6)
 
-    def _compute_action_boundary_from_limits(
+    def _compute_action_bounds_from_limits(
         self,
         manager,
         env_action_scale: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if not hasattr(manager.asset.data, "joint_pos_limits"):
             raise RuntimeError(
                 "FastSAC Holosoma action boundary requires asset.data.joint_pos_limits."
@@ -947,8 +1029,10 @@ class FastSAC(PPOBase):
         default_pos = manager.default_joint_pos[0, manager.joint_ids].to(self.device)
         lower = limits[..., 0]
         upper = limits[..., 1]
-        max_offset = torch.maximum((default_pos - lower).abs(), (upper - default_pos).abs())
-        return (max_offset / env_action_scale.abs().clamp_min(1.0e-6)).clamp_min(1.0e-6)
+        scale = env_action_scale.abs().clamp_min(1.0e-6)
+        actor_low = (lower - default_pos) / scale
+        actor_high = (upper - default_pos) / scale
+        return actor_low, actor_high
 
     def _broadcast_parameters(self) -> None:
         with torch.no_grad():
@@ -960,7 +1044,10 @@ class FastSAC(PPOBase):
                 self.actor,
                 self.qnet,
                 self.qnet_target,
+                self.value_probe,
             ):
+                if module is None:
+                    continue
                 for param in module.parameters():
                     dist.broadcast(param, src=0)
                 for buf in module.buffers():
@@ -1147,7 +1234,25 @@ class FastSAC(PPOBase):
         replay_td.set(ENV_ID_KEY, env_id)
         return replay_td
 
+    def _collect_value_probe_data(self, tensordict: TensorDictBase) -> TensorDictBase:
+        keys: list[Union[str, tuple[str, str]]] = [
+            OBS_KEY,
+            CMD_KEY,
+            OBS_PRIV_KEY,
+            REWARD_KEY,
+            DONE_KEY,
+            TERM_KEY,
+            ("next", OBS_KEY),
+            ("next", CMD_KEY),
+            ("next", OBS_PRIV_KEY),
+        ]
+        if "is_init" in tensordict.keys(True, True):
+            keys.append("is_init")
+        return tensordict.select(*keys, strict=False).detach()
+
     def observe(self, tensordict: TensorDictBase) -> None:
+        if self.enable_value_probe:
+            self.value_trace.append(self._collect_value_probe_data(tensordict).cpu())
         replay_td = self._collect_replay_data(tensordict)
         if self.use_custom_replay_buffer:
             self.replay_buffer.extend(replay_td.cpu())
@@ -1423,6 +1528,15 @@ class FastSAC(PPOBase):
         q_values = distributional_q_value(q_probs, self.q_support)
         q_value = self._reduce_actor_q_values(q_values)
         log_probs = actor_td[f"{ACTION_KEY}_log_prob"]
+        action = actor_td[ACTION_KEY]
+        clamped_action = action.clamp(
+            self.action_min + 1.0e-6,
+            self.action_max - 1.0e-6,
+        )
+        action_span = (self.action_max - self.action_min).clamp_min(1.0e-6)
+        edge_margin = action_span * float(self.cfg.action_bound_epsilon_ratio)
+        near_low = (action - self.action_min) <= edge_margin
+        near_high = (self.action_max - action) <= edge_margin
         actor_loss = _masked_mean(
             self.log_alpha.exp().detach() * log_probs - q_value,
             mask,
@@ -1433,6 +1547,10 @@ class FastSAC(PPOBase):
             "policy/log_prob_mean": _masked_mean(log_probs.detach(), mask),
             "policy/log_prob_min": log_probs.detach().min(),
             "policy/log_prob_max": log_probs.detach().max(),
+            "policy/action_clamp_frac": (
+                (clamped_action - action).abs() > 1.0e-7
+            ).float().mean(),
+            "policy/action_bound_frac": (near_low | near_high).float().mean(),
         }
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -1473,6 +1591,82 @@ class FastSAC(PPOBase):
         with torch.no_grad():
             for target_param, param in zip(self.qnet_target.parameters(), self.qnet.parameters()):
                 target_param.data.mul_(1.0 - self.cfg.tau).add_(param.data, alpha=self.cfg.tau)
+
+    def _train_value_probe(self) -> dict[str, torch.Tensor]:
+        if (
+            not self.enable_value_probe
+            or self.value_probe is None
+            or self.value_optimizer is None
+            or len(self.value_trace) < self.cfg.value_probe_trace_steps
+        ):
+            return {}
+
+        batch = torch.stack(list(self.value_trace), dim=0).to(self.device)
+        critic_obs_tn = self._cat_obs(batch, self.critic_obs_keys)
+        next_critic_obs_tn = self._cat_obs(batch["next"], self.critic_obs_keys)
+        critic_obs_tn = self.normalize_critic_obs(critic_obs_tn, update=False)
+        next_critic_obs_tn = self.normalize_critic_obs(next_critic_obs_tn, update=False)
+        T, N = critic_obs_tn.shape[:2]
+        flat = T * N
+        values_tn = self.value_probe(critic_obs_tn.reshape(flat, -1)).reshape(T, N, 1)
+        next_values_tn = self.value_probe(next_critic_obs_tn.reshape(flat, -1)).reshape(T, N, 1)
+
+        rewards_nt = self._reward_total(batch).transpose(0, 1).unsqueeze(-1)
+        terms_nt = batch[TERM_KEY].transpose(0, 1).float()
+        dones_nt = batch[DONE_KEY].transpose(0, 1).float()
+        values_nt = values_tn.transpose(0, 1)
+        next_values_nt = next_values_tn.transpose(0, 1)
+        _, returns_nt = self.gae(
+            rewards_nt,
+            terms_nt,
+            dones_nt,
+            values_nt,
+            next_values_nt,
+        )
+        if "is_init" in batch.keys(True, True):
+            valid_mask = (~batch["is_init"].transpose(0, 1).bool()).squeeze(-1)
+        else:
+            valid_mask = torch.ones_like(rewards_nt[..., 0], dtype=torch.bool)
+        value_errors = (values_nt - returns_nt).square().squeeze(-1)
+        value_loss = _masked_mean(value_errors, valid_mask)
+
+        self.value_optimizer.zero_grad(set_to_none=True)
+        value_loss.backward()
+        if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
+            self._all_reduce_grads(self.value_probe)
+        if self.cfg.max_grad_norm > 0:
+            value_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.value_probe.parameters(),
+                self.cfg.max_grad_norm,
+            )
+        else:
+            value_grad_norm = torch.zeros((), device=self.device)
+        self.value_optimizer.step()
+
+        with torch.no_grad():
+            probe_td = batch.reshape(-1).copy()
+            self._prepare_batch_inputs(probe_td, update_normalizers=False)
+            probe_td = self._sample_actor(probe_td)
+            self._prepare_critic_input(probe_td)
+            self.qnet(probe_td)
+            q_probs = F.softmax(probe_td[Q_LOGITS_KEY], dim=-1)
+            q_values = distributional_q_value(q_probs, self.q_support)
+            q_pi = self._reduce_actor_q_values(q_values)
+            critic_obs_flat = probe_td[CRITIC_OBS_KEY]
+            value_pred = self.value_probe(critic_obs_flat).squeeze(-1)
+            if "is_init" in probe_td.keys(True, True):
+                flat_mask = ~probe_td["is_init"].bool().squeeze(-1)
+            else:
+                flat_mask = None
+            value_info = {
+                "value/loss": value_loss.detach(),
+                "value/grad_norm": value_grad_norm.detach(),
+                "value/pred_mean": _masked_mean(value_pred.detach(), flat_mask),
+                "value/return_mean": _masked_mean(returns_nt.detach().squeeze(-1), valid_mask),
+                "value/q_pi_mean": _masked_mean(q_pi.detach(), flat_mask),
+                "value/q_pi_gap": _masked_mean((q_pi - value_pred).detach(), flat_mask),
+            }
+        return value_info
 
     def _update_step(self, tensordict: TensorDictBase) -> dict[str, torch.Tensor]:
         timing = self.cfg.debug_timing
@@ -1544,6 +1738,11 @@ class FastSAC(PPOBase):
         self._sync_if_timing()
         if timing:
             timing_data["alpha_target_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        value_metrics: dict[str, torch.Tensor] = {}
+        if self.enable_value_probe and self.gradient_step % self.cfg.value_probe_update_every == 0:
+            for _ in range(self.cfg.value_probe_inner):
+                value_metrics = self._train_value_probe()
         self.gradient_step += 1
 
         metrics = {
@@ -1560,6 +1759,7 @@ class FastSAC(PPOBase):
         }
         metrics.update(critic_diag)
         metrics.update(actor_diag)
+        metrics.update(value_metrics)
         if timing:
             for key, value in timing_data.items():
                 metrics[f"debug_timing/{key}"] = torch.tensor(value, device=self.device)

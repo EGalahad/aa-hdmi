@@ -49,7 +49,11 @@ def main(cfg: DictConfig):
 
     checkpoint_interval = cfg.checkpoint_interval
     upload_interval = cfg.upload_interval
-    log_interval = (env.max_episode_length // cfg.algo.collect_steps) + 1
+    log_interval_raw = (env.max_episode_length // cfg.algo.collect_steps) + 1
+    if torch.is_tensor(log_interval_raw):
+        log_interval = int(log_interval_raw.max().item())
+    else:
+        log_interval = int(log_interval_raw)
     logging.info(f"Log interval: {log_interval} steps")
 
     stats_keys = [
