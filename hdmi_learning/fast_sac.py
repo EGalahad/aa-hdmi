@@ -8,7 +8,7 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence, Tuple, Union
+from typing import Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -19,7 +19,6 @@ from tensordict import TensorDictBase
 from tensordict.nn import (
     TensorDictModule as Mod,
     TensorDictModuleBase,
-    TensorDictSequential as Seq,
 )
 from torchrl.data import Composite as CompositeSpec, LazyTensorStorage, TensorDictReplayBuffer, TensorSpec
 from torchrl.data.replay_buffers.samplers import SliceSampler
@@ -28,20 +27,19 @@ from torchrl.modules import ProbabilisticActor
 
 import active_adaptation as aa
 from active_adaptation.learning.modules.distributions import TanhNormalWithEntropy
-from active_adaptation.learning.modules.vecnorm import VecNorm
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
     CMD_KEY,
     DONE_KEY,
+    GAE,
     TERM_KEY,
     OBS_KEY,
     OBS_PRIV_KEY,
     REWARD_KEY,
-    CatTensors,
 )
 from active_adaptation.learning.ppo.ppo_base import PPOBase
 
-from .common import NullVecNorm
+from .common import EmpiricalNormalizer
 from .action_bounds import (
     coerce_action_bounds_config,
     default_action_bounds,
@@ -50,6 +48,7 @@ from .action_bounds import (
 
 BOOTSTRAP_KEY = "bootstrap"
 ACTOR_INPUT_KEY = "_actor_input"
+CRITIC_OBS_KEY = "_critic_obs"
 CRITIC_INPUT_KEY = "_critic_input"
 Q_LOGITS_KEY = "_q_logits"
 ENV_ID_KEY = "_env_id"
@@ -497,6 +496,24 @@ class DistributionalCritic(TensorDictModuleBase):
         return tensordict
 
 
+class ValueProbe(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_dim: int = 768,
+        use_layer_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        hidden_dims = [hidden_dim, hidden_dim // 2, hidden_dim // 4]
+        self.net = nn.Sequential(
+            _build_mlp(None, hidden_dims, use_layer_norm=use_layer_norm),
+            nn.Linear(hidden_dims[-1], 1),
+        )
+
+    def forward(self, critic_obs: torch.Tensor) -> torch.Tensor:
+        return self.net(critic_obs)
+
+
 class WarmupUniformRolloutPolicy:
     def __init__(self, policy: "FastSAC", actor_rollout_policy: TensorDictModuleBase) -> None:
         object.__setattr__(self, "_policy", policy)
@@ -520,6 +537,17 @@ class WarmupUniformRolloutPolicy:
         return tensordict
 
 
+class FastSACRolloutPolicy(TensorDictModuleBase):
+    def __init__(self, policy: "FastSAC") -> None:
+        super().__init__()
+        object.__setattr__(self, "_policy", policy)
+
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        policy = self._policy
+        policy._prepare_actor_input(tensordict, update_normalizer=False)
+        return policy.actor(tensordict)
+
+
 @dataclass
 class FastSACConfig:
     _target_: str = f"{__package__}.fast_sac.FastSAC"
@@ -530,15 +558,15 @@ class FastSACConfig:
     buffer_size: int = 1024
     replay_batch_size: int = 4096
     # Effective transition warmup = warm_up_steps * collect_steps * num_envs.
-    warm_up_steps: int = 128
+    warm_up_steps: int = 10
     updates_per_step: int = 4
     policy_frequency: int = 2
-    n_step: int = 4
+    n_step: int = 1
     custom_replay_buffer: bool = True
     custom_replay_prefetch: int = 2
 
-    gamma: float = 0.99
-    tau: float = 0.05
+    gamma: float = 0.995
+    tau: float = 0.125
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -548,6 +576,9 @@ class FastSACConfig:
 
     actor_hidden_dim: int = 512
     critic_hidden_dim: int = 768
+    action_space_mode: str = "holosoma"
+    holosoma_action_scale: float = 0.25
+    holosoma_use_actor_boundary: bool = True
     action_bounds: dict[str, list[float]] = field(
         default_factory=default_action_bounds
     )
@@ -569,6 +600,14 @@ class FastSACConfig:
 
     vecnorm: bool = True
     freeze_vecnorm: bool = False
+    enable_value_probe: bool = True
+    value_probe_hidden_dim: int | None = None
+    value_probe_lr: float | None = None
+    value_probe_update_every: int = 32
+    value_probe_trace_steps: int = 32
+    value_probe_inner: int = 2
+    gae_lambda: float = 0.95
+    action_bound_epsilon_ratio: float = 0.02
     checkpoint_path: Union[str, None] = None
     in_keys: Tuple[str, ...] = (OBS_KEY, CMD_KEY, OBS_PRIV_KEY)
     grad_sync_mode: str | None = "manual"
@@ -613,6 +652,27 @@ class FastSACConfig:
             raise ValueError(
                 f"debug_timing_interval must be >= 1, got {self.debug_timing_interval}."
             )
+        self.value_probe_update_every = int(self.value_probe_update_every)
+        if self.value_probe_update_every < 1:
+            raise ValueError(
+                "value_probe_update_every must be >= 1, "
+                f"got {self.value_probe_update_every}."
+            )
+        self.value_probe_trace_steps = int(self.value_probe_trace_steps)
+        if self.value_probe_trace_steps < 2:
+            raise ValueError(
+                "value_probe_trace_steps must be >= 2, "
+                f"got {self.value_probe_trace_steps}."
+            )
+        self.value_probe_inner = int(self.value_probe_inner)
+        if self.value_probe_inner < 1:
+            raise ValueError(
+                f"value_probe_inner must be >= 1, got {self.value_probe_inner}."
+            )
+        if self.value_probe_hidden_dim is None:
+            self.value_probe_hidden_dim = self.critic_hidden_dim
+        if self.value_probe_lr is None:
+            self.value_probe_lr = self.critic_lr
 
         if isinstance(self.grad_sync_mode, str):
             self.grad_sync_mode = self.grad_sync_mode.lower()
@@ -623,6 +683,12 @@ class FastSACConfig:
             raise ValueError(
                 "grad_sync_mode must be one of {'manual', None, 'ddp'}, "
                 f"got {self.grad_sync_mode!r}"
+            )
+        self.action_space_mode = str(self.action_space_mode).lower()
+        if self.action_space_mode not in {"manual", "holosoma"}:
+            raise ValueError(
+                "action_space_mode must be one of {'manual', 'holosoma'}, "
+                f"got {self.action_space_mode!r}"
             )
         self.action_bounds = coerce_action_bounds_config(
             self.action_bounds,
@@ -664,37 +730,31 @@ class FastSAC(PPOBase):
         self.joint_names = env.action_manager.joint_names
         self.gradient_step = 0
 
-        self._build_vecnorm_modules(observation_spec)
-
-        action_min, action_max = resolve_action_bounds(
-            self.cfg.action_bounds,
-            self.joint_names,
-            self.device,
+        self.actor_obs_keys: Tuple[str, ...] = (OBS_KEY, CMD_KEY)
+        self.critic_obs_keys: Tuple[str, ...] = (OBS_KEY, CMD_KEY, OBS_PRIV_KEY)
+        self.actor_obs_dim = sum(int(observation_spec[key].shape[-1]) for key in self.actor_obs_keys)
+        self.critic_obs_dim = sum(
+            int(observation_spec[key].shape[-1]) for key in self.critic_obs_keys
         )
+        self._build_obs_normalizers()
+
+        action_min, action_max = self._resolve_action_space_bounds()
         self.register_buffer("action_min", action_min.clone())
         self.register_buffer("action_max", action_max.clone())
         self.action_min: torch.Tensor
         self.action_max: torch.Tensor
 
         self.actor: ProbabilisticActor = ProbabilisticActor(
-            module=Seq(
-                CatTensors(
-                    [OBS_KEY, CMD_KEY],
-                    ACTOR_INPUT_KEY,
-                    del_keys=False,
-                    sort=False,
+            module=Mod(
+                FastSACActorCore(
+                    self.action_dim,
+                    hidden_dim=self.cfg.actor_hidden_dim,
+                    log_std_max=self.cfg.log_std_max,
+                    log_std_min=self.cfg.log_std_min,
+                    use_layer_norm=self.cfg.use_layer_norm,
                 ),
-                Mod(
-                    FastSACActorCore(
-                        self.action_dim,
-                        hidden_dim=self.cfg.actor_hidden_dim,
-                        log_std_max=self.cfg.log_std_max,
-                        log_std_min=self.cfg.log_std_min,
-                        use_layer_norm=self.cfg.use_layer_norm,
-                    ),
-                    [ACTOR_INPUT_KEY],
-                    ["loc", "scale"],
-                ),
+                [ACTOR_INPUT_KEY],
+                ["loc", "scale"],
             ),
             in_keys=["loc", "scale"],
             out_keys=[ACTION_KEY],
@@ -707,18 +767,10 @@ class FastSAC(PPOBase):
             return_log_prob=True,
         ).to(self.device)
 
-        self.qnet = Seq(
-            CatTensors(
-                [OBS_KEY, CMD_KEY, OBS_PRIV_KEY, ACTION_KEY],
-                CRITIC_INPUT_KEY,
-                del_keys=False,
-                sort=False,
-            ),
-            DistributionalCritic(
-                num_atoms=self.cfg.num_atoms,
-                hidden_dim=self.cfg.critic_hidden_dim,
-                use_layer_norm=self.cfg.use_layer_norm,
-            ),
+        self.qnet = DistributionalCritic(
+            num_atoms=self.cfg.num_atoms,
+            hidden_dim=self.cfg.critic_hidden_dim,
+            use_layer_norm=self.cfg.use_layer_norm,
         ).to(self.device)
         self.register_buffer(
             "q_support",
@@ -740,13 +792,35 @@ class FastSAC(PPOBase):
                 device=self.device,
             ),
         )
-        with VecNorm.freeze():
-            self.vecnorm(fake_input)
+        with torch.no_grad():
+            self._prepare_actor_input(fake_input, update_normalizer=False)
             self.actor.get_dist(fake_input)
+            self._prepare_critic_obs(fake_critic_input, update_normalizer=False)
+            self._prepare_critic_input(fake_critic_input)
             self.qnet(fake_critic_input)
 
         self.qnet_target = deepcopy(self.qnet).to(self.device)
         self.qnet_target.requires_grad_(False)
+        fused = str(self.device).startswith("cuda")
+        self.gae = GAE(self.cfg.gamma, self.cfg.gae_lambda).to(self.device)
+        self.enable_value_probe = bool(self.cfg.enable_value_probe)
+        self.value_probe = None
+        self.value_optimizer = None
+        self.value_trace: deque[TensorDictBase] = deque(
+            maxlen=self.cfg.value_probe_trace_steps
+        )
+        if self.enable_value_probe:
+            self.value_probe = ValueProbe(
+                hidden_dim=int(self.cfg.value_probe_hidden_dim),
+                use_layer_norm=self.cfg.use_layer_norm,
+            ).to(self.device)
+            self.value_optimizer = torch.optim.AdamW(
+                self.value_probe.parameters(),
+                lr=float(self.cfg.value_probe_lr),
+                weight_decay=self.cfg.weight_decay,
+                fused=fused,
+                betas=(0.9, 0.95),
+            )
 
         self.log_alpha = nn.Parameter(
             torch.tensor(math.log(self.cfg.alpha_init), device=self.device)
@@ -759,7 +833,6 @@ class FastSAC(PPOBase):
         )
         self.log_alpha.requires_grad_(not self.fixed_alpha)
 
-        fused = str(self.device).startswith("cuda")
         self.actor_optimizer = torch.optim.AdamW(
             self.actor.parameters(),
             lr=self.cfg.actor_lr,
@@ -846,24 +919,135 @@ class FastSAC(PPOBase):
         if self.cfg.debug_timing and str(self.device).startswith("cuda"):
             torch.cuda.synchronize(self.device)
 
-    def _build_vecnorm_modules(self, observation_spec: CompositeSpec) -> None:
-        modules = []
-        self.vecnorms: Mapping[str, VecNorm] = nn.ModuleDict()
-        vecnorm_cls = VecNorm if self.cfg.vecnorm else NullVecNorm
-        for key in (OBS_KEY, CMD_KEY, OBS_PRIV_KEY):
-            if key not in observation_spec.keys(True, True):
-                continue
-            shape = observation_spec[key].shape[-1:]
-            vecnorm = vecnorm_cls(input_shape=shape, stats_shape=shape, decay=0.9999)
-            self.vecnorms[key] = vecnorm
-            modules.append(Mod(vecnorm, [key], [key]))
-        self.vecnorm = Seq(*modules).to(self.device)
+    def _build_obs_normalizers(self) -> None:
+        self.use_obs_normalization = bool(self.cfg.vecnorm)
+        self.update_obs_normalization = bool(self.cfg.vecnorm) and not self.cfg.freeze_vecnorm
+        if self.use_obs_normalization:
+            self.actor_obs_normalizer: nn.Module = EmpiricalNormalizer(
+                self.actor_obs_dim,
+                self.device,
+            )
+            self.critic_obs_normalizer: nn.Module = EmpiricalNormalizer(
+                self.critic_obs_dim,
+                self.device,
+            )
+        else:
+            self.actor_obs_normalizer = nn.Identity()
+            self.critic_obs_normalizer = nn.Identity()
+
+    def _resolve_action_space_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.cfg.action_space_mode == "holosoma":
+            return self._configure_holosoma_action_space()
+        return resolve_action_bounds(
+            self.cfg.action_bounds,
+            self.joint_names,
+            self.device,
+        )
+
+    def _configure_holosoma_action_space(self) -> tuple[torch.Tensor, torch.Tensor]:
+        manager = getattr(self.env, "action_manager", None)
+        if manager is None:
+            raise RuntimeError("Holosoma action scaling requires env.action_manager.")
+
+        env_action_scale = self._compute_holosoma_env_action_scale(manager)
+        if env_action_scale.numel() != self.action_dim:
+            raise ValueError(
+                f"FastSAC env action scale has {env_action_scale.numel()} entries, "
+                f"expected action_dim={self.action_dim}."
+            )
+
+        manager.action_scaling = env_action_scale.to(manager.device)
+        if self.cfg.holosoma_use_actor_boundary:
+            actor_low, actor_high = self._compute_action_bounds_from_limits(
+                manager,
+                env_action_scale,
+            )
+            actor_scale = 0.5 * (actor_high - actor_low)
+            actor_bias = 0.5 * (actor_high + actor_low)
+            print(
+                "[Info] FastSAC Holosoma action scaling: "
+                f"env_scale_min={env_action_scale.min().item():.4f}, "
+                f"env_scale_max={env_action_scale.max().item():.4f}, "
+                f"actor_low_min={actor_low.min().item():.4f}, "
+                f"actor_high_max={actor_high.max().item():.4f}, "
+                f"actor_scale_min={actor_scale.min().item():.4f}, "
+                f"actor_scale_max={actor_scale.max().item():.4f}, "
+                f"actor_bias_absmax={actor_bias.abs().max().item():.4f}",
+                flush=True,
+            )
+            return actor_low, actor_high
+
+        print(
+            "[Info] FastSAC Holosoma action scaling: "
+            f"env_scale_min={env_action_scale.min().item():.4f}, "
+            f"env_scale_max={env_action_scale.max().item():.4f}, "
+            "actor_boundary_mode=fixed_unit",
+            flush=True,
+        )
+        return -torch.ones_like(env_action_scale), torch.ones_like(env_action_scale)
+
+    def _compute_holosoma_env_action_scale(self, manager) -> torch.Tensor:
+        asset = manager.asset
+        actuator_names = list(asset.actuator_names)
+        ctrl_ids = torch.as_tensor(
+            asset.indexing.ctrl_ids,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if len(actuator_names) != int(ctrl_ids.numel()):
+            raise RuntimeError(
+                f"Expected one actuator name per control id, got {len(actuator_names)} names "
+                f"and {int(ctrl_ids.numel())} control ids."
+            )
+        name_to_ctrl_id = {name: ctrl_ids[i] for i, name in enumerate(actuator_names)}
+        missing = [name for name in manager.joint_names if name not in name_to_ctrl_id]
+        if missing:
+            raise RuntimeError(
+                f"Cannot compute Holosoma action scale; missing actuators for joints: {missing}"
+            )
+
+        selected_ctrl_ids = torch.stack([name_to_ctrl_id[name] for name in manager.joint_names])
+        force_range = manager.env.sim.get_default_field("actuator_forcerange").to(self.device)
+        gainprm = manager.env.sim.get_default_field("actuator_gainprm").to(self.device)
+        effort_limit = force_range[selected_ctrl_ids].abs().max(dim=-1).values
+        stiffness = gainprm[selected_ctrl_ids, 0].abs().clamp_min(1.0e-6)
+        return (
+            float(self.cfg.holosoma_action_scale) * effort_limit / stiffness
+        ).clamp_min(1.0e-6)
+
+    def _compute_action_bounds_from_limits(
+        self,
+        manager,
+        env_action_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not hasattr(manager.asset.data, "joint_pos_limits"):
+            raise RuntimeError(
+                "FastSAC Holosoma action boundary requires asset.data.joint_pos_limits."
+            )
+
+        limits = manager.asset.data.joint_pos_limits[0, manager.joint_ids].to(self.device)
+        default_pos = manager.default_joint_pos[0, manager.joint_ids].to(self.device)
+        lower = limits[..., 0]
+        upper = limits[..., 1]
+        scale = env_action_scale.abs().clamp_min(1.0e-6)
+        actor_low = (lower - default_pos) / scale
+        actor_high = (upper - default_pos) / scale
+        return actor_low, actor_high
 
     def _broadcast_parameters(self) -> None:
         with torch.no_grad():
             dist.broadcast(self.log_alpha.data, src=0)
             dist.broadcast(self.q_support, src=0)
-            for module in (self.vecnorm, self.actor, self.qnet, self.qnet_target):
+            for module in (
+                self.actor_obs_normalizer,
+                self.critic_obs_normalizer,
+                self.actor,
+                self.qnet,
+                self.qnet_target,
+                self.value_probe,
+            ):
+                if module is None:
+                    continue
                 for param in module.parameters():
                     dist.broadcast(param, src=0)
                 for buf in module.buffers():
@@ -883,15 +1067,83 @@ class FastSAC(PPOBase):
             dist.all_reduce(param.grad.data, op=dist.ReduceOp.AVG)
 
     def _sync_vecnorms(self) -> None:
-        if not aa.is_distributed() or not self.cfg.vecnorm:
-            return
-        for vecnorm in self.vecnorms.values():
-            vecnorm.synchronize(mode="broadcast")
+        return None
+
+    def _cat_obs(self, tensordict: TensorDictBase, keys: Sequence[str]) -> torch.Tensor:
+        return torch.cat([tensordict[key].float() for key in keys], dim=-1)
+
+    def normalize_actor_obs(self, obs: torch.Tensor, *, update: bool = False) -> torch.Tensor:
+        if not self.use_obs_normalization:
+            return obs.float()
+        flat = obs.reshape(-1, obs.shape[-1]).float()
+        normed = self.actor_obs_normalizer(
+            flat,
+            update=bool(update and self.update_obs_normalization),
+        )
+        return normed.reshape_as(obs)
+
+    def normalize_critic_obs(self, obs: torch.Tensor, *, update: bool = False) -> torch.Tensor:
+        if not self.use_obs_normalization:
+            return obs.float()
+        flat = obs.reshape(-1, obs.shape[-1]).float()
+        normed = self.critic_obs_normalizer(
+            flat,
+            update=bool(update and self.update_obs_normalization),
+        )
+        return normed.reshape_as(obs)
+
+    def _prepare_actor_input(
+        self,
+        tensordict: TensorDictBase,
+        *,
+        update_normalizer: bool,
+    ) -> TensorDictBase:
+        actor_obs = self._cat_obs(tensordict, self.actor_obs_keys)
+        tensordict.set(
+            ACTOR_INPUT_KEY,
+            self.normalize_actor_obs(actor_obs, update=update_normalizer),
+        )
+        return tensordict
+
+    def _prepare_critic_obs(
+        self,
+        tensordict: TensorDictBase,
+        *,
+        update_normalizer: bool,
+    ) -> TensorDictBase:
+        critic_obs = self._cat_obs(tensordict, self.critic_obs_keys)
+        tensordict.set(
+            CRITIC_OBS_KEY,
+            self.normalize_critic_obs(critic_obs, update=update_normalizer),
+        )
+        return tensordict
+
+    def _prepare_critic_input(self, tensordict: TensorDictBase) -> TensorDictBase:
+        tensordict.set(
+            CRITIC_INPUT_KEY,
+            torch.cat([tensordict[CRITIC_OBS_KEY], tensordict[ACTION_KEY]], dim=-1),
+        )
+        return tensordict
+
+    def _prepare_batch_inputs(
+        self,
+        tensordict: TensorDictBase,
+        *,
+        update_normalizers: bool,
+    ) -> TensorDictBase:
+        self._prepare_actor_input(tensordict, update_normalizer=update_normalizers)
+        self._prepare_critic_obs(tensordict, update_normalizer=update_normalizers)
+        bootstrap_td = tensordict.get(BOOTSTRAP_KEY, None)
+        if bootstrap_td is not None:
+            self._prepare_actor_input(bootstrap_td, update_normalizer=update_normalizers)
+            self._prepare_critic_obs(bootstrap_td, update_normalizer=update_normalizers)
+        return tensordict
 
     def _sample_actor(
         self,
         tensordict: TensorDictBase,
     ) -> TensorDictBase:
+        self._prepare_actor_input(tensordict, update_normalizer=False)
         dist = self.actor.get_dist(tensordict)
         action = dist.rsample()
         log_prob = dist.log_prob(action)
@@ -982,7 +1234,25 @@ class FastSAC(PPOBase):
         replay_td.set(ENV_ID_KEY, env_id)
         return replay_td
 
+    def _collect_value_probe_data(self, tensordict: TensorDictBase) -> TensorDictBase:
+        keys: list[Union[str, tuple[str, str]]] = [
+            OBS_KEY,
+            CMD_KEY,
+            OBS_PRIV_KEY,
+            REWARD_KEY,
+            DONE_KEY,
+            TERM_KEY,
+            ("next", OBS_KEY),
+            ("next", CMD_KEY),
+            ("next", OBS_PRIV_KEY),
+        ]
+        if "is_init" in tensordict.keys(True, True):
+            keys.append("is_init")
+        return tensordict.select(*keys, strict=False).detach()
+
     def observe(self, tensordict: TensorDictBase) -> None:
+        if self.enable_value_probe:
+            self.value_trace.append(self._collect_value_probe_data(tensordict).cpu())
         replay_td = self._collect_replay_data(tensordict)
         if self.use_custom_replay_buffer:
             self.replay_buffer.extend(replay_td.cpu())
@@ -1021,6 +1291,7 @@ class FastSAC(PPOBase):
                 -bootstrap_discount * self.log_alpha.exp().detach() * next_log_probs,
                 torch.zeros_like(adjusted_rewards),
             )
+            self._prepare_critic_input(bootstrap_td)
             self._sync_if_timing()
             t0 = time.perf_counter()
             self.qnet_target(bootstrap_td)
@@ -1130,6 +1401,7 @@ class FastSAC(PPOBase):
                 -bootstrap_discount * alpha * bootstrap_log_probs,
                 torch.zeros_like(adjusted_rewards),
             )
+            self._prepare_critic_input(bootstrap_td)
             next_log_probs = bootstrap_log_probs
         self._sync_if_timing()
         t0 = time.perf_counter()
@@ -1181,6 +1453,7 @@ class FastSAC(PPOBase):
 
         self._sync_if_timing()
         t0 = time.perf_counter()
+        self._prepare_critic_input(critic_td)
         self.qnet(critic_td)
         self._sync_if_timing()
         if timing:
@@ -1249,11 +1522,21 @@ class FastSAC(PPOBase):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         actor_td = tensordict.copy()
         actor_td = self._sample_actor(actor_td)
+        self._prepare_critic_input(actor_td)
         self.qnet(actor_td)
         q_probs = F.softmax(actor_td[Q_LOGITS_KEY], dim=-1)
         q_values = distributional_q_value(q_probs, self.q_support)
         q_value = self._reduce_actor_q_values(q_values)
         log_probs = actor_td[f"{ACTION_KEY}_log_prob"]
+        action = actor_td[ACTION_KEY]
+        clamped_action = action.clamp(
+            self.action_min + 1.0e-6,
+            self.action_max - 1.0e-6,
+        )
+        action_span = (self.action_max - self.action_min).clamp_min(1.0e-6)
+        edge_margin = action_span * float(self.cfg.action_bound_epsilon_ratio)
+        near_low = (action - self.action_min) <= edge_margin
+        near_high = (self.action_max - action) <= edge_margin
         actor_loss = _masked_mean(
             self.log_alpha.exp().detach() * log_probs - q_value,
             mask,
@@ -1264,6 +1547,10 @@ class FastSAC(PPOBase):
             "policy/log_prob_mean": _masked_mean(log_probs.detach(), mask),
             "policy/log_prob_min": log_probs.detach().min(),
             "policy/log_prob_max": log_probs.detach().max(),
+            "policy/action_clamp_frac": (
+                (clamped_action - action).abs() > 1.0e-7
+            ).float().mean(),
+            "policy/action_bound_frac": (near_low | near_high).float().mean(),
         }
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -1305,15 +1592,92 @@ class FastSAC(PPOBase):
             for target_param, param in zip(self.qnet_target.parameters(), self.qnet.parameters()):
                 target_param.data.mul_(1.0 - self.cfg.tau).add_(param.data, alpha=self.cfg.tau)
 
+    def _train_value_probe(self) -> dict[str, torch.Tensor]:
+        if (
+            not self.enable_value_probe
+            or self.value_probe is None
+            or self.value_optimizer is None
+            or len(self.value_trace) < self.cfg.value_probe_trace_steps
+        ):
+            return {}
+
+        batch = torch.stack(list(self.value_trace), dim=0).to(self.device)
+        critic_obs_tn = self._cat_obs(batch, self.critic_obs_keys)
+        next_critic_obs_tn = self._cat_obs(batch["next"], self.critic_obs_keys)
+        critic_obs_tn = self.normalize_critic_obs(critic_obs_tn, update=False)
+        next_critic_obs_tn = self.normalize_critic_obs(next_critic_obs_tn, update=False)
+        T, N = critic_obs_tn.shape[:2]
+        flat = T * N
+        values_tn = self.value_probe(critic_obs_tn.reshape(flat, -1)).reshape(T, N, 1)
+        next_values_tn = self.value_probe(next_critic_obs_tn.reshape(flat, -1)).reshape(T, N, 1)
+
+        rewards_nt = self._reward_total(batch).transpose(0, 1).unsqueeze(-1)
+        terms_nt = batch[TERM_KEY].transpose(0, 1).float()
+        dones_nt = batch[DONE_KEY].transpose(0, 1).float()
+        values_nt = values_tn.transpose(0, 1)
+        next_values_nt = next_values_tn.transpose(0, 1)
+        _, returns_nt = self.gae(
+            rewards_nt,
+            terms_nt,
+            dones_nt,
+            values_nt,
+            next_values_nt,
+        )
+        if "is_init" in batch.keys(True, True):
+            valid_mask = (~batch["is_init"].transpose(0, 1).bool()).squeeze(-1)
+        else:
+            valid_mask = torch.ones_like(rewards_nt[..., 0], dtype=torch.bool)
+        value_errors = (values_nt - returns_nt).square().squeeze(-1)
+        value_loss = _masked_mean(value_errors, valid_mask)
+
+        self.value_optimizer.zero_grad(set_to_none=True)
+        value_loss.backward()
+        if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
+            self._all_reduce_grads(self.value_probe)
+        if self.cfg.max_grad_norm > 0:
+            value_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.value_probe.parameters(),
+                self.cfg.max_grad_norm,
+            )
+        else:
+            value_grad_norm = torch.zeros((), device=self.device)
+        self.value_optimizer.step()
+
+        with torch.no_grad():
+            probe_td = batch.reshape(-1).copy()
+            self._prepare_batch_inputs(probe_td, update_normalizers=False)
+            probe_td = self._sample_actor(probe_td)
+            self._prepare_critic_input(probe_td)
+            self.qnet(probe_td)
+            q_probs = F.softmax(probe_td[Q_LOGITS_KEY], dim=-1)
+            q_values = distributional_q_value(q_probs, self.q_support)
+            q_pi = self._reduce_actor_q_values(q_values)
+            critic_obs_flat = probe_td[CRITIC_OBS_KEY]
+            value_pred = self.value_probe(critic_obs_flat).squeeze(-1)
+            if "is_init" in probe_td.keys(True, True):
+                flat_mask = ~probe_td["is_init"].bool().squeeze(-1)
+            else:
+                flat_mask = None
+            value_info = {
+                "value/loss": value_loss.detach(),
+                "value/grad_norm": value_grad_norm.detach(),
+                "value/pred_mean": _masked_mean(value_pred.detach(), flat_mask),
+                "value/return_mean": _masked_mean(returns_nt.detach().squeeze(-1), valid_mask),
+                "value/q_pi_mean": _masked_mean(q_pi.detach(), flat_mask),
+                "value/q_pi_gap": _masked_mean((q_pi - value_pred).detach(), flat_mask),
+            }
+        return value_info
+
     def _update_step(self, tensordict: TensorDictBase) -> dict[str, torch.Tensor]:
         timing = self.cfg.debug_timing
         timing_data: dict[str, float] = {}
         self._sync_if_timing()
         t0 = time.perf_counter()
         tensordict = tensordict.copy()
-        self.vecnorm(tensordict)
-        if tensordict.get(BOOTSTRAP_KEY, None) is not None:
-            self.vecnorm(tensordict[BOOTSTRAP_KEY])
+        self._prepare_batch_inputs(
+            tensordict,
+            update_normalizers=self.update_obs_normalization,
+        )
         self._sync_if_timing()
         if timing:
             timing_data["vecnorm_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -1374,6 +1738,11 @@ class FastSAC(PPOBase):
         self._sync_if_timing()
         if timing:
             timing_data["alpha_target_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        value_metrics: dict[str, torch.Tensor] = {}
+        if self.enable_value_probe and self.gradient_step % self.cfg.value_probe_update_every == 0:
+            for _ in range(self.cfg.value_probe_inner):
+                value_metrics = self._train_value_probe()
         self.gradient_step += 1
 
         metrics = {
@@ -1390,6 +1759,7 @@ class FastSAC(PPOBase):
         }
         metrics.update(critic_diag)
         metrics.update(actor_diag)
+        metrics.update(value_metrics)
         if timing:
             for key, value in timing_data.items():
                 metrics[f"debug_timing/{key}"] = torch.tensor(value, device=self.device)
@@ -1465,12 +1835,7 @@ class FastSAC(PPOBase):
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         del critic
-        rollout_policy = Seq(
-            self.vecnorm,
-            self.actor,
-            selected_out_keys=[f"{ACTION_KEY}_log_prob", ACTION_KEY, "loc", "scale"],
-        )
-        rollout_policy.forward = VecNorm.freeze()(rollout_policy.forward)
+        rollout_policy = FastSACRolloutPolicy(self)
         if mode == "train":
             return WarmupUniformRolloutPolicy(self, rollout_policy)
         return rollout_policy
@@ -1481,11 +1846,10 @@ class FastSAC(PPOBase):
 
     def compute_value(self, tensordict: TensorDictBase) -> TensorDictBase:
         work_td = tensordict.copy()
-        with torch.no_grad(), VecNorm.freeze():
-            self.vecnorm(work_td)
-            if work_td.get(BOOTSTRAP_KEY, None) is not None:
-                self.vecnorm(work_td[BOOTSTRAP_KEY])
+        with torch.no_grad():
+            self._prepare_batch_inputs(work_td, update_normalizers=False)
             work_td = self._sample_actor(work_td)
+            self._prepare_critic_input(work_td)
             self.qnet(work_td)
             q_probs = F.softmax(work_td[Q_LOGITS_KEY], dim=-1)
             q_values = distributional_q_value(q_probs, self.q_support)
