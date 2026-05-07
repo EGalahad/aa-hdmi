@@ -558,15 +558,15 @@ class FastSACConfig:
     buffer_size: int = 1024
     replay_batch_size: int = 4096
     # Effective transition warmup = warm_up_steps * collect_steps * num_envs.
-    warm_up_steps: int = 128
+    warm_up_steps: int = 10
     updates_per_step: int = 4
     policy_frequency: int = 2
-    n_step: int = 4
+    n_step: int = 1
     custom_replay_buffer: bool = True
     custom_replay_prefetch: int = 2
 
-    gamma: float = 0.99
-    tau: float = 0.05
+    gamma: float = 0.995
+    tau: float = 0.125
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -576,9 +576,9 @@ class FastSACConfig:
 
     actor_hidden_dim: int = 512
     critic_hidden_dim: int = 768
-    action_space_mode: str = "manual"
+    action_space_mode: str = "holosoma"
     holosoma_action_scale: float = 0.25
-    holosoma_use_actor_boundary: bool = False
+    holosoma_use_actor_boundary: bool = True
     action_bounds: dict[str, list[float]] = field(
         default_factory=default_action_bounds
     )
