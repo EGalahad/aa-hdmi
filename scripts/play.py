@@ -212,11 +212,11 @@ def main(cfg: DictConfig):
         progress = itertools.count()
     output_path = _make_render_output_path()
 
-    # with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
     with (
         env.get_recorder(output_path, enabled=render_enabled) as recorder,
         torch.inference_mode(),
         set_exploration_type(ExplorationType.DETERMINISTIC),
+        # set_exploration_type(ExplorationType.RANDOM),
     ):
         for i in progress:
             with ScopedTimer("inference", sync=False):
