@@ -584,9 +584,9 @@ class FastSACConfig:
     )
     action_min: float | None = None
     action_max: float | None = None
-    num_atoms: int = 1201
-    v_min: float = -10.0
-    v_max: float = 50.0
+    v_step: float = 0.05
+    v_min: float = -5.0
+    v_max: float = 15.0
     actor_q_reduce: str = "min"
     critic_q_reduce: str = "min"
     actor_update_scope: str = "first"
@@ -767,8 +767,9 @@ class FastSAC(PPOBase):
             return_log_prob=True,
         ).to(self.device)
 
+        num_atoms = int((self.cfg.v_max - self.cfg.v_min) / self.cfg.v_step) + 1
         self.qnet = DistributionalCritic(
-            num_atoms=self.cfg.num_atoms,
+            num_atoms=num_atoms,
             hidden_dim=self.cfg.critic_hidden_dim,
             use_layer_norm=self.cfg.use_layer_norm,
         ).to(self.device)
@@ -777,7 +778,7 @@ class FastSAC(PPOBase):
             torch.linspace(
                 self.cfg.v_min,
                 self.cfg.v_max,
-                self.cfg.num_atoms,
+                num_atoms,
                 device=self.device,
             ),
         )
