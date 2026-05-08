@@ -69,7 +69,7 @@ uv --project venv/mjlab run projects/hdmi/scripts/train_sequential.py \
 Run fast sac training:
 
 ```bash
-uv --project venv/mjlab run projects/hdmi/scripts/train-off_policy.py \
+uv --project venv/mjlab run projects/hdmi/scripts/train.py \
   task=lafan-single +exp=fast-sac-train backend=mjlab algo.vecnorm=false
 ```
 

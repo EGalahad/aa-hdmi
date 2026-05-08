@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from collections import OrderedDict, defaultdict, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections import OrderedDict, deque
+from contextlib import nullcontext
 from copy import deepcopy
 import math
-import threading
-import time
 import warnings
 from dataclasses import dataclass, field
-from typing import Sequence, Tuple, Union
+from typing import Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -18,15 +16,18 @@ from hydra.core.config_store import ConfigStore
 from tensordict import TensorDictBase
 from tensordict.nn import (
     TensorDictModule as Mod,
-    TensorDictModuleBase,
+    TensorDictSequential as Seq,
 )
 from torchrl.data import Composite as CompositeSpec, LazyTensorStorage, TensorDictReplayBuffer, TensorSpec
 from torchrl.data.replay_buffers.samplers import SliceSampler
 from torchrl.envs.transforms import TensorDictPrimer
 from torchrl.modules import ProbabilisticActor
+from torchrl.objectives import hold_out_net
 
 import active_adaptation as aa
 from active_adaptation.learning.modules.distributions import TanhNormalWithEntropy
+from active_adaptation.learning.modules.common import MLP
+from active_adaptation.learning.modules.vecnorm import VecNorm
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
     CMD_KEY,
@@ -36,44 +37,40 @@ from active_adaptation.learning.ppo.common import (
     OBS_KEY,
     OBS_PRIV_KEY,
     REWARD_KEY,
+    CatTensors,
 )
 from active_adaptation.learning.ppo.ppo_base import PPOBase
 
-from .common import EmpiricalNormalizer
+from .common import NullVecNorm
 from .action_bounds import (
     coerce_action_bounds_config,
     default_action_bounds,
-    resolve_action_bounds,
+    resolve_fast_sac_action_bounds,
+)
+from .offpolicy.actor import (
+    ACTOR_INPUT_KEY,
+    RolloutPolicy,
+    TanhActor,
+    WarmupUniformRolloutPolicy,
+)
+from .offpolicy.buffer import (
+    BOOTSTRAP_KEY,
+    ENV_ID_KEY,
+    N_STEP_BOOTSTRAP_KEY,
+    N_STEP_DISCOUNT_KEY,
+    N_STEP_REWARD_KEY,
+    CudaPrefetchNStepReplayBuffer,
+)
+from .offpolicy.critic import (
+    CRITIC_INPUT_KEY,
+    Q_LOGITS_KEY,
+    DistributionalCritic,
+    distributional_q_value,
+    project_distributional_q,
 )
 
-BOOTSTRAP_KEY = "bootstrap"
-ACTOR_INPUT_KEY = "_actor_input"
 CRITIC_OBS_KEY = "_critic_obs"
-CRITIC_INPUT_KEY = "_critic_input"
-Q_LOGITS_KEY = "_q_logits"
-ENV_ID_KEY = "_env_id"
-N_STEP_REWARD_KEY = "_n_step_reward"
-N_STEP_BOOTSTRAP_KEY = "_n_step_bootstrap"
-N_STEP_DISCOUNT_KEY = "_n_step_discount"
-
-
-def _build_mlp(
-    input_dim: int | None,
-    hidden_dims: Sequence[int],
-    *,
-    use_layer_norm: bool = True,
-) -> nn.Sequential:
-    layers: list[nn.Module] = []
-    last_dim = input_dim
-    for idx, dim in enumerate(hidden_dims):
-        if idx == 0 and last_dim is None:
-            layers.append(nn.LazyLinear(dim))
-        else:
-            layers.append(nn.Linear(last_dim, dim))
-        layers.append(nn.LayerNorm(dim) if use_layer_norm else nn.Identity())
-        layers.append(nn.SiLU())
-        last_dim = dim
-    return nn.Sequential(*layers)
+VALUE_PROBE_KEY = "_value_probe"
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -124,428 +121,27 @@ def _prefix_stats(prefix: str, value: torch.Tensor, mask: torch.Tensor | None) -
     }
 
 
-class CudaPrefetchNStepReplayBuffer:
-    def __init__(
-        self,
-        *,
-        capacity_per_env: int,
-        num_envs: int,
-        n_step: int,
-        batch_size: int,
-        gamma: float,
-        device: torch.device,
-        prefetch: int = 2,
-        compact: bool = True,
-    ) -> None:
-        self.capacity_per_env = int(capacity_per_env)
-        self.num_envs = int(num_envs)
-        self.n_step = int(n_step)
-        self.batch_size = int(batch_size)
-        self.gamma = float(gamma)
-        self.device = torch.device(device)
-        self.prefetch = max(0, int(prefetch))
-        self.compact = bool(compact)
-        self.storage: TensorDictBase | None = None
-        self.cursor = 0
-        self.length = 0
-        self.lock = threading.RLock()
-        self.prefetch_queue: deque[Future[TensorDictBase]] = deque()
-        self.executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="fast-sac-replay")
-            if self.prefetch > 0
-            else None
+def _valid_fraction(mask: torch.Tensor | None, *, device: torch.device) -> torch.Tensor:
+    if mask is None:
+        return torch.ones((), device=device)
+    return mask.float().mean()
+
+
+def _build_mlp(
+    input_dim: int | None,
+    hidden_dims: list[int],
+    *,
+    use_layer_norm: bool = True,
+) -> nn.Sequential:
+    layer_norm = "pre" if use_layer_norm else None
+    if input_dim is None:
+        return nn.Sequential(
+            nn.LazyLinear(hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]) if use_layer_norm else nn.Identity(),
+            nn.SiLU(),
+            MLP(hidden_dims, nn.SiLU, layer_norm=layer_norm),
         )
-        self.copy_stream = (
-            torch.cuda.Stream(device=self.device)
-            if self.device.type == "cuda"
-            else None
-        )
-
-    def __len__(self) -> int:
-        return self.length * self.num_envs
-
-    def close(self) -> None:
-        if self.executor is not None:
-            self.executor.shutdown(wait=False, cancel_futures=True)
-            self.executor = None
-
-    def __del__(self) -> None:
-        self.close()
-
-    def extend(self, data: TensorDictBase) -> None:
-        data = data.detach()
-        if data.device is not None and data.device.type != "cpu":
-            data = data.cpu()
-        if data.batch_dims == 1:
-            data = data.unsqueeze(0)
-        if data.batch_dims != 2 or data.batch_size[1] != self.num_envs:
-            raise ValueError(
-                "Expected replay data with batch size [T, num_envs] or [num_envs], "
-                f"got {tuple(data.batch_size)} for num_envs={self.num_envs}."
-            )
-
-        with self.lock:
-            if self.storage is None:
-                sample = data[0]
-                self.storage = sample.apply(
-                    lambda value: torch.empty(
-                        (self.capacity_per_env, *value.shape),
-                        dtype=value.dtype,
-                        device="cpu",
-                    ),
-                    batch_size=(self.capacity_per_env, *sample.batch_size),
-                )
-
-            num_steps = int(data.batch_size[0])
-            start = 0
-            while start < num_steps:
-                write_count = min(num_steps - start, self.capacity_per_env - self.cursor)
-                self.storage[self.cursor : self.cursor + write_count] = data[
-                    start : start + write_count
-                ]
-                self.cursor = (self.cursor + write_count) % self.capacity_per_env
-                self.length = min(self.capacity_per_env, self.length + write_count)
-                start += write_count
-
-        self._fill_prefetch()
-
-    def sample(self) -> TensorDictBase:
-        if self.executor is None:
-            return self._sample_to_device()
-
-        self._fill_prefetch()
-        if not self.prefetch_queue:
-            return self._sample_to_device()
-        future = self.prefetch_queue.popleft()
-        batch = future.result()
-        self._fill_prefetch()
-        return batch
-
-    def _fill_prefetch(self) -> None:
-        if self.executor is None or self.length < self.n_step:
-            return
-        while len(self.prefetch_queue) < self.prefetch:
-            self.prefetch_queue.append(self.executor.submit(self._sample_to_device))
-
-    def _sample_to_device(self) -> TensorDictBase:
-        if self.device.type == "cuda":
-            torch.cuda.set_device(self.device)
-
-        with self.lock:
-            if self.storage is None or self.length < self.n_step:
-                raise RuntimeError(
-                    f"Not enough replay data to sample n_step={self.n_step}: "
-                    f"length={self.length}."
-                )
-            length = self.length
-            cursor = self.cursor
-            oldest = cursor if length == self.capacity_per_env else 0
-            starts = torch.randint(
-                0,
-                length - self.n_step + 1,
-                (self.batch_size,),
-                dtype=torch.long,
-            )
-            envs = torch.randint(
-                0,
-                self.num_envs,
-                (self.batch_size, 1),
-                dtype=torch.long,
-            )
-            offsets = torch.arange(self.n_step, dtype=torch.long).unsqueeze(0)
-            time_idx = (oldest + starts.unsqueeze(1) + offsets) % self.capacity_per_env
-            env_idx = envs.expand(-1, self.n_step)
-            if self.compact:
-                batch = self._sample_compact_locked(time_idx, env_idx)
-            else:
-                batch = self.storage[time_idx, env_idx]
-
-        if self.device.type != "cuda":
-            return batch.to(self.device)
-
-        batch = batch.pin_memory()
-        assert self.copy_stream is not None
-        with torch.cuda.stream(self.copy_stream):
-            batch = batch.to(self.device, non_blocking=True)
-        self.copy_stream.synchronize()
-        return batch
-
-    def _sample_compact_locked(
-        self,
-        time_idx: torch.Tensor,
-        env_idx: torch.Tensor,
-    ) -> TensorDictBase:
-        assert self.storage is not None
-        batch_size, n_step = time_idx.shape
-        env_flat = env_idx[:, 0]
-        rewards = self.storage[REWARD_KEY][time_idx, env_idx]
-        if rewards.shape[-1] != 1:
-            rewards = rewards.sum(-1, keepdim=True)
-        rewards = rewards.squeeze(-1)
-        dones = self.storage[DONE_KEY][time_idx, env_idx].bool().squeeze(-1)
-        terminated = self.storage[TERM_KEY][time_idx, env_idx].bool().squeeze(-1)
-
-        adjusted_rewards = torch.zeros(batch_size, dtype=rewards.dtype)
-        bootstrap = torch.zeros(batch_size, dtype=rewards.dtype)
-        bootstrap_discount = torch.zeros(batch_size, dtype=rewards.dtype)
-        bootstrap_idx = torch.zeros(batch_size, dtype=torch.long)
-        discount = torch.ones(batch_size, dtype=rewards.dtype)
-        active = torch.ones(batch_size, dtype=torch.bool)
-
-        for step_idx in range(n_step):
-            step_active = active
-            if not step_active.any():
-                break
-
-            adjusted_rewards = adjusted_rewards + torch.where(
-                step_active,
-                discount * rewards[:, step_idx],
-                torch.zeros_like(adjusted_rewards),
-            )
-            can_bootstrap = step_active & ~terminated[:, step_idx]
-            next_discount = discount * self.gamma
-            boundary = can_bootstrap & dones[:, step_idx]
-            if boundary.any():
-                bootstrap_idx = torch.where(
-                    boundary,
-                    torch.full_like(bootstrap_idx, step_idx),
-                    bootstrap_idx,
-                )
-                bootstrap_discount = torch.where(boundary, next_discount, bootstrap_discount)
-                bootstrap = torch.where(boundary, torch.ones_like(bootstrap), bootstrap)
-
-            active = can_bootstrap & ~dones[:, step_idx]
-            discount = torch.where(active, next_discount, discount)
-
-        if active.any():
-            bootstrap_idx = torch.where(
-                active,
-                torch.full_like(bootstrap_idx, n_step - 1),
-                bootstrap_idx,
-            )
-            bootstrap_discount = torch.where(active, discount, bootstrap_discount)
-            bootstrap = torch.where(active, torch.ones_like(bootstrap), bootstrap)
-
-        batch_idx = torch.arange(batch_size)
-        compact = self.storage[time_idx[:, 0], env_flat].copy()
-        compact.set(
-            BOOTSTRAP_KEY,
-            self.storage[BOOTSTRAP_KEY][time_idx[batch_idx, bootstrap_idx], env_flat],
-        )
-        compact.set(N_STEP_REWARD_KEY, adjusted_rewards.unsqueeze(-1))
-        compact.set(N_STEP_BOOTSTRAP_KEY, bootstrap.unsqueeze(-1))
-        compact.set(N_STEP_DISCOUNT_KEY, bootstrap_discount.unsqueeze(-1))
-        return compact.unsqueeze(1)
-
-
-class FastSACActorCore(nn.Module):
-    def __init__(
-        self,
-        action_dim: int,
-        *,
-        hidden_dim: int = 512,
-        log_std_max: float = 0.0,
-        log_std_min: float = -5.0,
-        use_layer_norm: bool = True,
-    ) -> None:
-        super().__init__()
-        hidden_dims = [hidden_dim, hidden_dim // 2, hidden_dim // 4]
-        self.net = _build_mlp(None, hidden_dims, use_layer_norm=use_layer_norm)
-        last_dim = hidden_dims[-1]
-        self.fc_mu = nn.Linear(last_dim, action_dim)
-        self.fc_logstd = nn.Linear(last_dim, action_dim)
-        self.log_std_max = log_std_max
-        self.log_std_min = log_std_min
-
-        nn.init.constant_(self.fc_mu.weight, 0.0)
-        nn.init.constant_(self.fc_mu.bias, 0.0)
-        nn.init.constant_(self.fc_logstd.weight, 0.0)
-        nn.init.constant_(self.fc_logstd.bias, 0.0)
-
-    def forward(self, actor_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.net(actor_input)
-        loc = self.fc_mu(hidden)
-        log_std = self.fc_logstd(hidden)
-        log_std = torch.tanh(log_std)
-        log_std = self.log_std_min + 0.5 * (
-            self.log_std_max - self.log_std_min
-        ) * (log_std + 1)
-
-        # loc = torch.clamp(loc, -10.0, 10.0)
-        # loc = torch.nan_to_num(loc, nan=0.0)
-        # log_std = torch.nan_to_num(log_std, nan=self.log_std_min)
-        # scale = torch.nan_to_num(
-        #     log_std.exp(),
-        #     nan=math.exp(self.log_std_min),
-        # )
-        scale = log_std.exp()
-        return loc, scale
-
-
-def _column_like(
-    value: torch.Tensor | float,
-    reference: torch.Tensor,
-) -> torch.Tensor:
-    if torch.is_tensor(value):
-        value = value.to(device=reference.device, dtype=reference.dtype)
-        if value.ndim == 0:
-            value = value.expand_as(reference)
-    else:
-        value = torch.full_like(reference, float(value))
-    return value.reshape(-1, 1)
-
-
-def project_distributional_q(
-    q_logits: torch.Tensor,
-    rewards: torch.Tensor,
-    bootstrap: torch.Tensor,
-    discount: torch.Tensor | float,
-    q_support: torch.Tensor,
-) -> torch.Tensor:
-    q_support = q_support.to(device=q_logits.device, dtype=q_logits.dtype)
-    num_atoms = q_support.shape[0]
-    v_min = q_support[0]
-    v_max = q_support[-1]
-    delta_z = (v_max - v_min) / (num_atoms - 1)
-    batch_size = rewards.shape[0]
-
-    rewards = rewards.to(device=q_logits.device, dtype=q_logits.dtype).reshape(-1)
-    bootstrap = _column_like(bootstrap, rewards)
-    discount = _column_like(discount, rewards)
-    target_z = rewards.unsqueeze(1) + bootstrap * discount * q_support
-    target_z = target_z.clamp(v_min.item(), v_max.item())
-    b = (target_z - v_min) / delta_z
-    lower = torch.floor(b).long()
-    upper = torch.ceil(b).long()
-
-    is_integer = upper == lower
-    lower_mask = torch.logical_and((lower > 0), is_integer)
-    upper_mask = torch.logical_and((lower == 0), is_integer)
-    lower = torch.where(lower_mask, lower - 1, lower)
-    upper = torch.where(upper_mask, upper + 1, upper)
-
-    offset = (
-        torch.arange(batch_size, device=q_logits.device)
-        .mul(num_atoms)
-        .unsqueeze(1)
-        .expand(batch_size, num_atoms)
-        .long()
-    )
-    max_index = batch_size * num_atoms - 1
-    lower_indices = torch.clamp((lower + offset).reshape(-1), 0, max_index)
-    upper_indices = torch.clamp((upper + offset).reshape(-1), 0, max_index)
-    lower_weight = upper.to(dtype=q_logits.dtype) - b
-    upper_weight = b - lower.to(dtype=q_logits.dtype)
-
-    projections = []
-    for next_logits in q_logits.unbind(dim=1):
-        next_dist = F.softmax(next_logits, dim=-1)
-        proj_dist = torch.zeros_like(next_dist)
-        flat_proj = proj_dist.reshape(-1)
-        flat_proj.index_add_(
-            0,
-            lower_indices,
-            (next_dist * lower_weight).reshape(-1),
-        )
-        flat_proj.index_add_(
-            0,
-            upper_indices,
-            (next_dist * upper_weight).reshape(-1),
-        )
-        projections.append(proj_dist)
-    return torch.stack(projections, dim=1)
-
-
-def distributional_q_value(
-    probs: torch.Tensor,
-    q_support: torch.Tensor,
-) -> torch.Tensor:
-    q_support = q_support.to(device=probs.device, dtype=probs.dtype)
-    return torch.sum(probs * q_support, dim=-1)
-
-
-class DistributionalCritic(TensorDictModuleBase):
-    def __init__(
-        self,
-        *,
-        num_atoms: int = 101,
-        hidden_dim: int = 768,
-        use_layer_norm: bool = True,
-        num_q_networks: int = 2,
-    ) -> None:
-        super().__init__()
-        self.in_keys = [CRITIC_INPUT_KEY]
-        self.out_keys = [Q_LOGITS_KEY]
-        self.num_atoms = num_atoms
-
-        hidden_dims = [hidden_dim, hidden_dim // 2, hidden_dim // 4]
-        self.qnets = nn.ModuleList(
-            [
-                nn.Sequential(
-                    _build_mlp(None, hidden_dims, use_layer_norm=use_layer_norm),
-                    nn.Linear(hidden_dims[-1], num_atoms),
-                )
-                for _ in range(num_q_networks)
-            ]
-        )
-
-    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
-        critic_input = tensordict[CRITIC_INPUT_KEY]
-        outputs = [qnet(critic_input) for qnet in self.qnets]
-        tensordict.set(Q_LOGITS_KEY, torch.stack(outputs, dim=1))
-        return tensordict
-
-
-class ValueProbe(nn.Module):
-    def __init__(
-        self,
-        *,
-        hidden_dim: int = 768,
-        use_layer_norm: bool = True,
-    ) -> None:
-        super().__init__()
-        hidden_dims = [hidden_dim, hidden_dim // 2, hidden_dim // 4]
-        self.net = nn.Sequential(
-            _build_mlp(None, hidden_dims, use_layer_norm=use_layer_norm),
-            nn.Linear(hidden_dims[-1], 1),
-        )
-
-    def forward(self, critic_obs: torch.Tensor) -> torch.Tensor:
-        return self.net(critic_obs)
-
-
-class WarmupUniformRolloutPolicy:
-    def __init__(self, policy: "FastSAC", actor_rollout_policy: TensorDictModuleBase) -> None:
-        object.__setattr__(self, "_policy", policy)
-        self.actor_rollout_policy = actor_rollout_policy
-
-    def __call__(self, tensordict: TensorDictBase) -> TensorDictBase:
-        return self.forward(tensordict)
-
-    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
-        policy = self._policy
-        if len(policy.replay_buffer) >= policy.warmup_transition_threshold:
-            return self.actor_rollout_policy(tensordict)
-
-        action = torch.rand(
-            (*tensordict.batch_size, policy.action_dim),
-            device=policy.action_min.device,
-            dtype=policy.action_min.dtype,
-        )
-        action = policy.action_min + action * (policy.action_max - policy.action_min)
-        tensordict.set(ACTION_KEY, action)
-        return tensordict
-
-
-class FastSACRolloutPolicy(TensorDictModuleBase):
-    def __init__(self, policy: "FastSAC") -> None:
-        super().__init__()
-        object.__setattr__(self, "_policy", policy)
-
-    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
-        policy = self._policy
-        policy._prepare_actor_input(tensordict, update_normalizer=False)
-        return policy.actor(tensordict)
+    return MLP([input_dim, *hidden_dims], nn.SiLU, layer_norm=layer_norm)
 
 
 @dataclass
@@ -553,19 +149,20 @@ class FastSACConfig:
     _target_: str = f"{__package__}.fast_sac.FastSAC"
 
     name: str = "fast_sac"
-    collect_steps: int = 1
-    # Effective replay capacity = buffer_size * collect_steps * num_envs.
+    train_every: int = 16
+    # Effective replay capacity = buffer_size * num_envs.
     buffer_size: int = 1024
     replay_batch_size: int = 4096
-    # Effective transition warmup = warm_up_steps * collect_steps * num_envs.
-    warm_up_steps: int = 10
-    updates_per_step: int = 4
+    # Effective transition warmup = warm_up_steps * num_envs.
+    warm_up_steps: int = 256
+    utd_ratio: int = 4
     policy_frequency: int = 2
+
     n_step: int = 1
     custom_replay_buffer: bool = True
     custom_replay_prefetch: int = 2
 
-    gamma: float = 0.995
+    gamma: float = 0.97
     tau: float = 0.125
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
@@ -591,8 +188,6 @@ class FastSACConfig:
     critic_q_reduce: str = "min"
     actor_update_scope: str = "first"
     n_step_entropy_mode: str = "bootstrap"
-    debug_timing: bool = False
-    debug_timing_interval: int = 1
     log_std_max: float = 0.0
     log_std_min: float = -4.0
     use_layer_norm: bool = True
@@ -613,6 +208,17 @@ class FastSACConfig:
     grad_sync_mode: str | None = "manual"
 
     def __post_init__(self) -> None:
+        self.train_every = int(self.train_every)
+        if self.train_every < 1:
+            raise ValueError(f"train_every must be >= 1, got {self.train_every}.")
+        self.utd_ratio = int(self.utd_ratio)
+        if self.utd_ratio < 1:
+            raise ValueError(f"utd_ratio must be >= 1, got {self.utd_ratio}.")
+        self.policy_frequency = int(self.policy_frequency)
+        if self.policy_frequency < 1:
+            raise ValueError(
+                f"policy_frequency must be >= 1, got {self.policy_frequency}."
+            )
         self.n_step = int(self.n_step)
         if self.n_step < 1:
             raise ValueError(f"n_step must be >= 1, got {self.n_step}.")
@@ -646,11 +252,6 @@ class FastSACConfig:
             raise ValueError(
                 "n_step_entropy_mode must be one of {'bootstrap', 'all'}, "
                 f"got {self.n_step_entropy_mode!r}"
-            )
-        self.debug_timing_interval = int(self.debug_timing_interval)
-        if self.debug_timing_interval < 1:
-            raise ValueError(
-                f"debug_timing_interval must be >= 1, got {self.debug_timing_interval}."
             )
         self.value_probe_update_every = int(self.value_probe_update_every)
         if self.value_probe_update_every < 1:
@@ -713,6 +314,7 @@ class FastSAC(PPOBase):
     ) -> None:
         super().__init__()
         self.cfg = FastSACConfig(**cfg)
+        self.requires_rollout_value = False
         if aa.is_distributed() and self.cfg.grad_sync_mode == "ddp":
             raise NotImplementedError("FastSAC only supports manual gradient sync.")
 
@@ -732,29 +334,55 @@ class FastSAC(PPOBase):
 
         self.actor_obs_keys: Tuple[str, ...] = (OBS_KEY, CMD_KEY)
         self.critic_obs_keys: Tuple[str, ...] = (OBS_KEY, CMD_KEY, OBS_PRIV_KEY)
-        self.actor_obs_dim = sum(int(observation_spec[key].shape[-1]) for key in self.actor_obs_keys)
+        self.actor_input_dim = sum(
+            int(observation_spec[key].shape[-1]) for key in self.actor_obs_keys
+        )
         self.critic_obs_dim = sum(
             int(observation_spec[key].shape[-1]) for key in self.critic_obs_keys
         )
-        self._build_obs_normalizers()
+        self.critic_input_dim = self.critic_obs_dim + self.action_dim
+        vecnorm_cls = VecNorm if self.cfg.vecnorm else NullVecNorm
+        self.vecnorms = nn.ModuleDict()
+        vecnorm_modules = []
+        for key in self.cfg.in_keys:
+            shape = observation_spec[key].shape[-1:]
+            vecnorm = vecnorm_cls(input_shape=shape, stats_shape=shape, decay=0.99999)
+            self.vecnorms[key] = vecnorm
+            vecnorm_modules.append(Mod(vecnorm, [key], [key]))
+        self.vecnorm = Seq(*vecnorm_modules).to(self.device)
 
-        action_min, action_max = self._resolve_action_space_bounds()
+        action_min, action_max = resolve_fast_sac_action_bounds(
+            self.cfg,
+            self.env,
+            self.joint_names,
+            self.action_dim,
+            self.device,
+        )
         self.register_buffer("action_min", action_min.clone())
         self.register_buffer("action_max", action_max.clone())
         self.action_min: torch.Tensor
         self.action_max: torch.Tensor
 
         self.actor: ProbabilisticActor = ProbabilisticActor(
-            module=Mod(
-                FastSACActorCore(
-                    self.action_dim,
-                    hidden_dim=self.cfg.actor_hidden_dim,
-                    log_std_max=self.cfg.log_std_max,
-                    log_std_min=self.cfg.log_std_min,
-                    use_layer_norm=self.cfg.use_layer_norm,
+            module=Seq(
+                CatTensors(
+                    self.actor_obs_keys,
+                    ACTOR_INPUT_KEY,
+                    del_keys=False,
+                    sort=False,
                 ),
-                [ACTOR_INPUT_KEY],
-                ["loc", "scale"],
+                Mod(
+                    TanhActor(
+                        self.actor_input_dim,
+                        self.action_dim,
+                        hidden_dim=self.cfg.actor_hidden_dim,
+                        log_std_max=self.cfg.log_std_max,
+                        log_std_min=self.cfg.log_std_min,
+                        use_layer_norm=self.cfg.use_layer_norm,
+                    ),
+                    [ACTOR_INPUT_KEY],
+                    ["loc", "scale"],
+                ),
             ),
             in_keys=["loc", "scale"],
             out_keys=[ACTION_KEY],
@@ -768,10 +396,19 @@ class FastSAC(PPOBase):
         ).to(self.device)
 
         num_atoms = int((self.cfg.v_max - self.cfg.v_min) / self.cfg.v_step) + 1
-        self.qnet = DistributionalCritic(
-            num_atoms=num_atoms,
-            hidden_dim=self.cfg.critic_hidden_dim,
-            use_layer_norm=self.cfg.use_layer_norm,
+        self.qnet = Seq(
+            CatTensors(
+                (*self.critic_obs_keys, ACTION_KEY),
+                CRITIC_INPUT_KEY,
+                del_keys=False,
+                sort=False,
+            ),
+            DistributionalCritic(
+                input_dim=self.critic_input_dim,
+                num_atoms=num_atoms,
+                hidden_dim=self.cfg.critic_hidden_dim,
+                use_layer_norm=self.cfg.use_layer_norm,
+            ),
         ).to(self.device)
         self.register_buffer(
             "q_support",
@@ -794,10 +431,11 @@ class FastSAC(PPOBase):
             ),
         )
         with torch.no_grad():
-            self._prepare_actor_input(fake_input, update_normalizer=False)
+            with VecNorm.freeze():
+                self.vecnorm(fake_input)
             self.actor.get_dist(fake_input)
-            self._prepare_critic_obs(fake_critic_input, update_normalizer=False)
-            self._prepare_critic_input(fake_critic_input)
+            with VecNorm.freeze():
+                self.vecnorm(fake_critic_input)
             self.qnet(fake_critic_input)
 
         self.qnet_target = deepcopy(self.qnet).to(self.device)
@@ -811,10 +449,35 @@ class FastSAC(PPOBase):
             maxlen=self.cfg.value_probe_trace_steps
         )
         if self.enable_value_probe:
-            self.value_probe = ValueProbe(
-                hidden_dim=int(self.cfg.value_probe_hidden_dim),
-                use_layer_norm=self.cfg.use_layer_norm,
+            value_probe_hidden_dim = int(self.cfg.value_probe_hidden_dim)
+            value_probe_hidden_dims = [
+                value_probe_hidden_dim,
+                value_probe_hidden_dim // 2,
+                value_probe_hidden_dim // 4,
+            ]
+            layer_norm = "pre" if self.cfg.use_layer_norm else None
+            self.value_probe = Seq(
+                CatTensors(
+                    self.critic_obs_keys,
+                    CRITIC_OBS_KEY,
+                    del_keys=False,
+                    sort=False,
+                ),
+                Mod(
+                    nn.Sequential(
+                        MLP(
+                            [self.critic_obs_dim, *value_probe_hidden_dims],
+                            nn.SiLU,
+                            layer_norm=layer_norm,
+                        ),
+                        nn.Linear(value_probe_hidden_dims[-1], 1),
+                    ),
+                    [CRITIC_OBS_KEY],
+                    [VALUE_PROBE_KEY],
+                ),
             ).to(self.device)
+            with torch.no_grad():
+                self.value_probe(fake_input.copy())
             self.value_optimizer = torch.optim.AdamW(
                 self.value_probe.parameters(),
                 lr=float(self.cfg.value_probe_lr),
@@ -858,11 +521,11 @@ class FastSAC(PPOBase):
                 betas=(0.9, 0.95),
             )
 
-        self.replay_buffer_capacity_per_env = self.cfg.buffer_size * self.cfg.collect_steps
+        self.replay_buffer_capacity_per_env = self.cfg.buffer_size
         self.replay_buffer_capacity = self.replay_buffer_capacity_per_env * self.num_envs
-        warmup_transitions = self.cfg.warm_up_steps * self.cfg.collect_steps * self.num_envs
+        warmup_transitions = self.cfg.warm_up_steps * self.num_envs
         self.warmup_transition_threshold = min(
-            max(warmup_transitions, self.cfg.replay_batch_size),
+            warmup_transitions,
             self.replay_buffer_capacity,
         )
         self.min_replay_sample_transitions = max(
@@ -916,132 +579,12 @@ class FastSAC(PPOBase):
         else:
             self.world_size = 1
 
-    def _sync_if_timing(self) -> None:
-        if self.cfg.debug_timing and str(self.device).startswith("cuda"):
-            torch.cuda.synchronize(self.device)
-
-    def _build_obs_normalizers(self) -> None:
-        self.use_obs_normalization = bool(self.cfg.vecnorm)
-        self.update_obs_normalization = bool(self.cfg.vecnorm) and not self.cfg.freeze_vecnorm
-        if self.use_obs_normalization:
-            self.actor_obs_normalizer: nn.Module = EmpiricalNormalizer(
-                self.actor_obs_dim,
-                self.device,
-            )
-            self.critic_obs_normalizer: nn.Module = EmpiricalNormalizer(
-                self.critic_obs_dim,
-                self.device,
-            )
-        else:
-            self.actor_obs_normalizer = nn.Identity()
-            self.critic_obs_normalizer = nn.Identity()
-
-    def _resolve_action_space_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.cfg.action_space_mode == "holosoma":
-            return self._configure_holosoma_action_space()
-        return resolve_action_bounds(
-            self.cfg.action_bounds,
-            self.joint_names,
-            self.device,
-        )
-
-    def _configure_holosoma_action_space(self) -> tuple[torch.Tensor, torch.Tensor]:
-        manager = getattr(self.env, "action_manager", None)
-        if manager is None:
-            raise RuntimeError("Holosoma action scaling requires env.action_manager.")
-
-        env_action_scale = self._compute_holosoma_env_action_scale(manager)
-        if env_action_scale.numel() != self.action_dim:
-            raise ValueError(
-                f"FastSAC env action scale has {env_action_scale.numel()} entries, "
-                f"expected action_dim={self.action_dim}."
-            )
-
-        manager.action_scaling = env_action_scale.to(manager.device)
-        if self.cfg.holosoma_use_actor_boundary:
-            actor_low, actor_high = self._compute_action_bounds_from_limits(
-                manager,
-                env_action_scale,
-            )
-            actor_scale = 0.5 * (actor_high - actor_low)
-            actor_bias = 0.5 * (actor_high + actor_low)
-            print(
-                "[Info] FastSAC Holosoma action scaling: "
-                f"env_scale_min={env_action_scale.min().item():.4f}, "
-                f"env_scale_max={env_action_scale.max().item():.4f}, "
-                f"actor_low_min={actor_low.min().item():.4f}, "
-                f"actor_high_max={actor_high.max().item():.4f}, "
-                f"actor_scale_min={actor_scale.min().item():.4f}, "
-                f"actor_scale_max={actor_scale.max().item():.4f}, "
-                f"actor_bias_absmax={actor_bias.abs().max().item():.4f}",
-                flush=True,
-            )
-            return actor_low, actor_high
-
-        print(
-            "[Info] FastSAC Holosoma action scaling: "
-            f"env_scale_min={env_action_scale.min().item():.4f}, "
-            f"env_scale_max={env_action_scale.max().item():.4f}, "
-            "actor_boundary_mode=fixed_unit",
-            flush=True,
-        )
-        return -torch.ones_like(env_action_scale), torch.ones_like(env_action_scale)
-
-    def _compute_holosoma_env_action_scale(self, manager) -> torch.Tensor:
-        asset = manager.asset
-        actuator_names = list(asset.actuator_names)
-        ctrl_ids = torch.as_tensor(
-            asset.indexing.ctrl_ids,
-            device=self.device,
-            dtype=torch.long,
-        )
-        if len(actuator_names) != int(ctrl_ids.numel()):
-            raise RuntimeError(
-                f"Expected one actuator name per control id, got {len(actuator_names)} names "
-                f"and {int(ctrl_ids.numel())} control ids."
-            )
-        name_to_ctrl_id = {name: ctrl_ids[i] for i, name in enumerate(actuator_names)}
-        missing = [name for name in manager.joint_names if name not in name_to_ctrl_id]
-        if missing:
-            raise RuntimeError(
-                f"Cannot compute Holosoma action scale; missing actuators for joints: {missing}"
-            )
-
-        selected_ctrl_ids = torch.stack([name_to_ctrl_id[name] for name in manager.joint_names])
-        force_range = manager.env.sim.get_default_field("actuator_forcerange").to(self.device)
-        gainprm = manager.env.sim.get_default_field("actuator_gainprm").to(self.device)
-        effort_limit = force_range[selected_ctrl_ids].abs().max(dim=-1).values
-        stiffness = gainprm[selected_ctrl_ids, 0].abs().clamp_min(1.0e-6)
-        return (
-            float(self.cfg.holosoma_action_scale) * effort_limit / stiffness
-        ).clamp_min(1.0e-6)
-
-    def _compute_action_bounds_from_limits(
-        self,
-        manager,
-        env_action_scale: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not hasattr(manager.asset.data, "joint_pos_limits"):
-            raise RuntimeError(
-                "FastSAC Holosoma action boundary requires asset.data.joint_pos_limits."
-            )
-
-        limits = manager.asset.data.joint_pos_limits[0, manager.joint_ids].to(self.device)
-        default_pos = manager.default_joint_pos[0, manager.joint_ids].to(self.device)
-        lower = limits[..., 0]
-        upper = limits[..., 1]
-        scale = env_action_scale.abs().clamp_min(1.0e-6)
-        actor_low = (lower - default_pos) / scale
-        actor_high = (upper - default_pos) / scale
-        return actor_low, actor_high
-
     def _broadcast_parameters(self) -> None:
         with torch.no_grad():
             dist.broadcast(self.log_alpha.data, src=0)
             dist.broadcast(self.q_support, src=0)
             for module in (
-                self.actor_obs_normalizer,
-                self.critic_obs_normalizer,
+                self.vecnorm,
                 self.actor,
                 self.qnet,
                 self.qnet_target,
@@ -1067,84 +610,10 @@ class FastSAC(PPOBase):
         if param.grad is not None:
             dist.all_reduce(param.grad.data, op=dist.ReduceOp.AVG)
 
-    def _sync_vecnorms(self) -> None:
-        return None
-
-    def _cat_obs(self, tensordict: TensorDictBase, keys: Sequence[str]) -> torch.Tensor:
-        return torch.cat([tensordict[key].float() for key in keys], dim=-1)
-
-    def normalize_actor_obs(self, obs: torch.Tensor, *, update: bool = False) -> torch.Tensor:
-        if not self.use_obs_normalization:
-            return obs.float()
-        flat = obs.reshape(-1, obs.shape[-1]).float()
-        normed = self.actor_obs_normalizer(
-            flat,
-            update=bool(update and self.update_obs_normalization),
-        )
-        return normed.reshape_as(obs)
-
-    def normalize_critic_obs(self, obs: torch.Tensor, *, update: bool = False) -> torch.Tensor:
-        if not self.use_obs_normalization:
-            return obs.float()
-        flat = obs.reshape(-1, obs.shape[-1]).float()
-        normed = self.critic_obs_normalizer(
-            flat,
-            update=bool(update and self.update_obs_normalization),
-        )
-        return normed.reshape_as(obs)
-
-    def _prepare_actor_input(
-        self,
-        tensordict: TensorDictBase,
-        *,
-        update_normalizer: bool,
-    ) -> TensorDictBase:
-        actor_obs = self._cat_obs(tensordict, self.actor_obs_keys)
-        tensordict.set(
-            ACTOR_INPUT_KEY,
-            self.normalize_actor_obs(actor_obs, update=update_normalizer),
-        )
-        return tensordict
-
-    def _prepare_critic_obs(
-        self,
-        tensordict: TensorDictBase,
-        *,
-        update_normalizer: bool,
-    ) -> TensorDictBase:
-        critic_obs = self._cat_obs(tensordict, self.critic_obs_keys)
-        tensordict.set(
-            CRITIC_OBS_KEY,
-            self.normalize_critic_obs(critic_obs, update=update_normalizer),
-        )
-        return tensordict
-
-    def _prepare_critic_input(self, tensordict: TensorDictBase) -> TensorDictBase:
-        tensordict.set(
-            CRITIC_INPUT_KEY,
-            torch.cat([tensordict[CRITIC_OBS_KEY], tensordict[ACTION_KEY]], dim=-1),
-        )
-        return tensordict
-
-    def _prepare_batch_inputs(
-        self,
-        tensordict: TensorDictBase,
-        *,
-        update_normalizers: bool,
-    ) -> TensorDictBase:
-        self._prepare_actor_input(tensordict, update_normalizer=update_normalizers)
-        self._prepare_critic_obs(tensordict, update_normalizer=update_normalizers)
-        bootstrap_td = tensordict.get(BOOTSTRAP_KEY, None)
-        if bootstrap_td is not None:
-            self._prepare_actor_input(bootstrap_td, update_normalizer=update_normalizers)
-            self._prepare_critic_obs(bootstrap_td, update_normalizer=update_normalizers)
-        return tensordict
-
     def _sample_actor(
         self,
         tensordict: TensorDictBase,
     ) -> TensorDictBase:
-        self._prepare_actor_input(tensordict, update_normalizer=False)
         dist = self.actor.get_dist(tensordict)
         action = dist.rsample()
         log_prob = dist.log_prob(action)
@@ -1193,9 +662,6 @@ class FastSAC(PPOBase):
             return q_values.min(dim=1).values
         return q_values.mean(dim=1)
 
-    def _get_current_iter(self) -> int:
-        return int(getattr(self.env, "current_iter", 0))
-
     def get_next_saved_keys(self) -> tuple[str, ...]:
         return (OBS_KEY, CMD_KEY, OBS_PRIV_KEY)
 
@@ -1206,72 +672,91 @@ class FastSAC(PPOBase):
         del stage
         return None
 
-    def _reward_total(self, tensordict: TensorDictBase) -> torch.Tensor:
-        reward = tensordict[REWARD_KEY]
-        if reward.shape[-1] != 1:
-            reward = reward.sum(-1, keepdim=True)
-        return reward.squeeze(-1)
+    def _append_rollout_to_replay(self, tensordict: TensorDictBase) -> None:
+        def append_transition(transition: TensorDictBase) -> None:
+            if self.enable_value_probe:
+                value_keys: list[Union[str, tuple[str, str]]] = [
+                    OBS_KEY,
+                    CMD_KEY,
+                    OBS_PRIV_KEY,
+                    REWARD_KEY,
+                    DONE_KEY,
+                    TERM_KEY,
+                    ("next", OBS_KEY),
+                    ("next", CMD_KEY),
+                    ("next", OBS_PRIV_KEY),
+                    "is_init",
+                ]
+                self.value_trace.append(
+                    transition.select(*value_keys, strict=False).detach().cpu()
+                )
 
-    def _collect_replay_data(self, tensordict: TensorDictBase) -> TensorDictBase:
-        keys: list[Union[str, tuple[str, str]]] = [
-            OBS_KEY,
-            CMD_KEY,
-            OBS_PRIV_KEY,
-            ACTION_KEY,
-            DONE_KEY,
-            ("next", "done"),
-            ("next", "terminated"),
-            ("next", "truncated"),
-            ("next", "discount"),
-            REWARD_KEY,
-        ]
-        if "is_init" in tensordict.keys(True, True):
-            keys.append("is_init")
-        replay_td = tensordict.select(*keys, strict=False)
-        next_td = tensordict["next"]
-        for key in (OBS_KEY, CMD_KEY, OBS_PRIV_KEY):
-            replay_td.set((BOOTSTRAP_KEY, key), next_td[key])
-        env_id = torch.arange(self.num_envs, device=replay_td.device)
-        replay_td.set(ENV_ID_KEY, env_id)
-        return replay_td
+            replay_keys: list[Union[str, tuple[str, str]]] = [
+                OBS_KEY,
+                CMD_KEY,
+                OBS_PRIV_KEY,
+                ACTION_KEY,
+                "loc",
+                DONE_KEY,
+                ("next", OBS_KEY),
+                ("next", CMD_KEY),
+                ("next", OBS_PRIV_KEY),
+                ("next", "done"),
+                ("next", "terminated"),
+                ("next", "truncated"),
+                ("next", "discount"),
+                REWARD_KEY,
+                "is_init",
+            ]
+            replay_td = transition.select(*replay_keys, strict=False)
+            if "loc" not in replay_td.keys(True, True):
+                replay_td.set("loc", torch.zeros_like(replay_td[ACTION_KEY]))
+            next_td = transition["next"]
+            for key in (OBS_KEY, CMD_KEY, OBS_PRIV_KEY):
+                replay_td.set((BOOTSTRAP_KEY, key), next_td[key])
+            replay_td.set(
+                ENV_ID_KEY,
+                torch.arange(self.num_envs, device=replay_td.device),
+            )
 
-    def _collect_value_probe_data(self, tensordict: TensorDictBase) -> TensorDictBase:
-        keys: list[Union[str, tuple[str, str]]] = [
-            OBS_KEY,
-            CMD_KEY,
-            OBS_PRIV_KEY,
-            REWARD_KEY,
-            DONE_KEY,
-            TERM_KEY,
-            ("next", OBS_KEY),
-            ("next", CMD_KEY),
-            ("next", OBS_PRIV_KEY),
-        ]
-        if "is_init" in tensordict.keys(True, True):
-            keys.append("is_init")
-        return tensordict.select(*keys, strict=False).detach()
-
-    def observe(self, tensordict: TensorDictBase) -> None:
-        if self.enable_value_probe:
-            self.value_trace.append(self._collect_value_probe_data(tensordict).cpu())
-        replay_td = self._collect_replay_data(tensordict)
-        if self.use_custom_replay_buffer:
+            if self.use_custom_replay_buffer:
+                self.replay_buffer.extend(replay_td.cpu())
+                return
+            if self.use_slice_replay:
+                replay_td = replay_td.unsqueeze(0)
+            else:
+                replay_td = replay_td.reshape(-1)
             self.replay_buffer.extend(replay_td.cpu())
+
+        if tensordict.batch_dims < 2:
+            append_transition(tensordict)
             return
-        if self.use_slice_replay:
-            replay_td = replay_td.unsqueeze(0)
-        else:
-            replay_td = replay_td.reshape(-1)
-        self.replay_buffer.extend(replay_td.cpu())
+
+        batch_size = tuple(tensordict.batch_size)
+        if int(batch_size[0]) == self.num_envs:
+            for step_idx in range(int(batch_size[1])):
+                append_transition(tensordict[:, step_idx])
+            return
+
+        if int(batch_size[1]) == self.num_envs:
+            for step_idx in range(int(batch_size[0])):
+                append_transition(tensordict[step_idx])
+            return
+
+        raise ValueError(
+            "Expected rollout data with batch size [num_envs, T], [T, num_envs], "
+            f"or [num_envs], got {batch_size} for num_envs={self.num_envs}."
+        )
 
     def _compute_n_step_target_inputs(
         self,
         tensordict: TensorDictBase,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        timing = self.cfg.debug_timing
-        timing_data: dict[str, float] = {}
         batch_size, n_step = tensordict.batch_size
-        rewards = self._reward_total(tensordict)
+        rewards = tensordict[REWARD_KEY]
+        if rewards.shape[-1] != 1:
+            rewards = rewards.sum(-1, keepdim=True)
+        rewards = rewards.squeeze(-1)
         dones = tensordict[DONE_KEY].bool().squeeze(-1)
         terminated = tensordict[TERM_KEY].bool().squeeze(-1)
 
@@ -1280,44 +765,27 @@ class FastSAC(PPOBase):
             bootstrap = tensordict[N_STEP_BOOTSTRAP_KEY].reshape(-1)
             bootstrap_discount = tensordict[N_STEP_DISCOUNT_KEY].reshape(-1)
             bootstrap_td = tensordict[BOOTSTRAP_KEY].reshape(-1).copy()
-            self._sync_if_timing()
-            t0 = time.perf_counter()
             self._sample_actor(bootstrap_td)
-            self._sync_if_timing()
-            if timing:
-                timing_data["critic_target_actor_ms"] = (time.perf_counter() - t0) * 1000.0
             next_log_probs = bootstrap_td[f"{ACTION_KEY}_log_prob"]
             adjusted_rewards = adjusted_rewards + torch.where(
                 bootstrap.bool(),
                 -bootstrap_discount * self.log_alpha.exp().detach() * next_log_probs,
                 torch.zeros_like(adjusted_rewards),
             )
-            self._prepare_critic_input(bootstrap_td)
-            self._sync_if_timing()
-            t0 = time.perf_counter()
             self.qnet_target(bootstrap_td)
-            self._sync_if_timing()
-            if timing:
-                timing_data["critic_target_qnet_ms"] = (time.perf_counter() - t0) * 1000.0
             return (
                 adjusted_rewards,
                 bootstrap,
                 bootstrap_discount,
                 bootstrap_td[Q_LOGITS_KEY],
                 next_log_probs.reshape(-1),
-                timing_data,
             )
 
         bootstrap_td_flat = tensordict[BOOTSTRAP_KEY].reshape(-1)
         next_log_probs = None
         if self.cfg.n_step_entropy_mode == "all":
             bootstrap_td_all = bootstrap_td_flat.copy()
-            self._sync_if_timing()
-            t0 = time.perf_counter()
             self._sample_actor(bootstrap_td_all)
-            self._sync_if_timing()
-            if timing:
-                timing_data["critic_target_actor_ms"] = (time.perf_counter() - t0) * 1000.0
             next_log_probs = bootstrap_td_all[f"{ACTION_KEY}_log_prob"].reshape(
                 batch_size,
                 n_step,
@@ -1331,8 +799,6 @@ class FastSAC(PPOBase):
         active = torch.ones(batch_size, device=self.device, dtype=torch.bool)
         alpha = self.log_alpha.exp().detach()
 
-        self._sync_if_timing()
-        t0 = time.perf_counter()
         for step_idx in range(n_step):
             step_active = active
             if not step_active.any():
@@ -1381,35 +847,17 @@ class FastSAC(PPOBase):
 
         batch_idx = torch.arange(batch_size, device=self.device)
         bootstrap_flat_idx = batch_idx * n_step + bootstrap_idx
-        self._sync_if_timing()
-        if timing:
-            timing_data["critic_target_accumulate_ms"] = (time.perf_counter() - t0) * 1000.0
-        t0 = time.perf_counter()
         bootstrap_td = bootstrap_td_flat[bootstrap_flat_idx].copy()
-        self._sync_if_timing()
-        if timing:
-            timing_data["critic_target_select_ms"] = (time.perf_counter() - t0) * 1000.0
         if next_log_probs is None:
-            self._sync_if_timing()
-            t0 = time.perf_counter()
             self._sample_actor(bootstrap_td)
-            self._sync_if_timing()
-            if timing:
-                timing_data["critic_target_actor_ms"] = (time.perf_counter() - t0) * 1000.0
             bootstrap_log_probs = bootstrap_td[f"{ACTION_KEY}_log_prob"]
             adjusted_rewards = adjusted_rewards + torch.where(
                 bootstrap.bool(),
                 -bootstrap_discount * alpha * bootstrap_log_probs,
                 torch.zeros_like(adjusted_rewards),
             )
-            self._prepare_critic_input(bootstrap_td)
             next_log_probs = bootstrap_log_probs
-        self._sync_if_timing()
-        t0 = time.perf_counter()
         self.qnet_target(bootstrap_td)
-        self._sync_if_timing()
-        if timing:
-            timing_data["critic_target_qnet_ms"] = (time.perf_counter() - t0) * 1000.0
         bootstrap_q_logits = bootstrap_td[Q_LOGITS_KEY]
         return (
             adjusted_rewards,
@@ -1417,25 +865,23 @@ class FastSAC(PPOBase):
             bootstrap_discount,
             bootstrap_q_logits,
             next_log_probs.reshape(-1),
-            timing_data,
         )
 
-    def _update_critic(
+    def train_critic(
         self,
         tensordict: TensorDictBase,
-        mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         critic_td = tensordict[:, 0].copy()
-        rewards = self._reward_total(tensordict)
-        timing = self.cfg.debug_timing
-        timing_data: dict[str, float] = {}
+        rewards = tensordict[REWARD_KEY]
+        if rewards.shape[-1] != 1:
+            rewards = rewards.sum(-1, keepdim=True)
+        rewards = rewards.squeeze(-1)
 
         with torch.no_grad():
-            adjusted_rewards, bootstrap, bootstrap_discount, bootstrap_q_logits, next_log_probs, timing_data = (
+            adjusted_rewards, bootstrap, bootstrap_discount, bootstrap_q_logits, next_log_probs = (
                 self._compute_n_step_target_inputs(tensordict)
             )
-            self._sync_if_timing()
-            t0 = time.perf_counter()
             target_distributions = project_distributional_q(
                 bootstrap_q_logits,
                 adjusted_rewards,
@@ -1443,54 +889,52 @@ class FastSAC(PPOBase):
                 bootstrap_discount,
                 self.q_support,
             )
-            self._sync_if_timing()
-            if timing:
-                timing_data["critic_projection_ms"] = (time.perf_counter() - t0) * 1000.0
             target_values = distributional_q_value(target_distributions, self.q_support)
             target_distributions, target_values = self._reduce_target_distributions(
                 target_distributions,
                 target_values,
             )
 
-        self._sync_if_timing()
-        t0 = time.perf_counter()
-        self._prepare_critic_input(critic_td)
         self.qnet(critic_td)
-        self._sync_if_timing()
-        if timing:
-            timing_data["critic_online_qnet_ms"] = (time.perf_counter() - t0) * 1000.0
         q_outputs = critic_td[Q_LOGITS_KEY]
         critic_log_probs = F.log_softmax(q_outputs, dim=-1).clamp(min=-30.0)
         critic_losses = -torch.sum(target_distributions * critic_log_probs, dim=-1)
         q_loss = _masked_mean(critic_losses, mask)
 
         first_rewards = rewards[:, 0]
-        q_probs = F.softmax(q_outputs.detach(), dim=-1)
-        q_values = distributional_q_value(q_probs, self.q_support)
+        q_values = distributional_q_value(
+            F.softmax(q_outputs.detach(), dim=-1),
+            self.q_support,
+        )
         q_stats_values = self._critic_stats_values(q_values)
         target_stats_values = self._critic_stats_values(target_values)
-        reward_mean = _masked_mean(first_rewards.detach(), mask)
-        reward_max = first_rewards.detach().max()
-        reward_min = first_rewards.detach().min()
-        target_q_max = target_values.detach().max()
-        target_q_min = target_values.detach().min()
-        target_clamp_hi = (target_values.detach() >= (self.cfg.v_max - 1e-4)).float().mean()
-        target_clamp_lo = (target_values.detach() <= (self.cfg.v_min + 1e-4)).float().mean()
         info = {
-            "reward/mean": reward_mean.detach(),
-            "reward/max": reward_max.detach(),
-            "reward/min": reward_min.detach(),
-            "critic/target_q_max": target_q_max.detach(),
-            "critic/target_q_min": target_q_min.detach(),
-            "critic/target_vmax_frac": target_clamp_hi.detach(),
-            "critic/target_vmin_frac": target_clamp_lo.detach(),
+            "reward/mean": _masked_mean(first_rewards.detach(), mask).detach(),
+            "reward/max": first_rewards.detach().max(),
+            "reward/min": first_rewards.detach().min(),
+            "critic/neg_rew_ratio": _masked_mean(
+                (first_rewards.detach() <= 0.0).float(),
+                mask,
+            ).detach(),
+            "critic/q_value": _masked_mean(q_values.mean(dim=1).detach(), mask).detach(),
+            "critic/q_max": q_values.detach().max(),
+            "critic/q_std": q_values.detach().std(dim=1).mean(),
+            "critic/valid_fraction": _valid_fraction(mask, device=self.device),
+            "critic/target_q_max": target_values.detach().max(),
+            "critic/target_q_min": target_values.detach().min(),
+            "critic/target_vmax_frac": (
+                target_values.detach() >= (self.cfg.v_max - 1e-4)
+            ).float().mean(),
+            "critic/target_vmin_frac": (
+                target_values.detach() <= (self.cfg.v_min + 1e-4)
+            ).float().mean(),
         }
         info.update(_prefix_stats("critic/q", q_stats_values, mask))
+        info.pop("critic/q_mean", None)
         info.update(_prefix_stats("critic/target_q", target_stats_values, mask))
+        info["critic/q_loss"] = q_loss.detach()
 
         self.q_optimizer.zero_grad(set_to_none=True)
-        self._sync_if_timing()
-        t0 = time.perf_counter()
         q_loss.backward()
         if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
             self._all_reduce_grads(self.qnet)
@@ -1502,56 +946,79 @@ class FastSAC(PPOBase):
         else:
             q_grad_norm = torch.zeros((), device=self.device)
         self.q_optimizer.step()
-        self._sync_if_timing()
-        if timing:
-            timing_data["critic_backward_step_ms"] = (time.perf_counter() - t0) * 1000.0
-            for key, value in timing_data.items():
-                info[f"debug_timing/{key}"] = torch.tensor(value, device=self.device)
+        with torch.no_grad():
+            for target_param, param in zip(self.qnet_target.parameters(), self.qnet.parameters()):
+                target_param.data.mul_(1.0 - self.cfg.tau).add_(param.data, alpha=self.cfg.tau)
+        info["critic/grad_norm"] = q_grad_norm.detach()
+        info["_next_log_probs"] = next_log_probs.detach()
 
-        return (
-            q_loss.detach(),
-            q_grad_norm.detach(),
-            target_stats_values.detach(),
-            next_log_probs.detach(),
-            info,
-        )
+        return info
 
-    def _update_actor(
+    def train_actor(
         self,
         tensordict: TensorDictBase,
-        mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         actor_td = tensordict.copy()
+        replay_loc = tensordict.get("loc", None)
         actor_td = self._sample_actor(actor_td)
-        self._prepare_critic_input(actor_td)
-        self.qnet(actor_td)
-        q_probs = F.softmax(actor_td[Q_LOGITS_KEY], dim=-1)
-        q_values = distributional_q_value(q_probs, self.q_support)
+        with hold_out_net(self.qnet):
+            self.qnet(actor_td)
+        q_values = distributional_q_value(
+            F.softmax(actor_td[Q_LOGITS_KEY], dim=-1),
+            self.q_support,
+        )
         q_value = self._reduce_actor_q_values(q_values)
         log_probs = actor_td[f"{ACTION_KEY}_log_prob"]
         action = actor_td[ACTION_KEY]
-        clamped_action = action.clamp(
-            self.action_min + 1.0e-6,
-            self.action_max - 1.0e-6,
-        )
         action_span = (self.action_max - self.action_min).clamp_min(1.0e-6)
         edge_margin = action_span * float(self.cfg.action_bound_epsilon_ratio)
-        near_low = (action - self.action_min) <= edge_margin
-        near_high = (self.action_max - action) <= edge_margin
         actor_loss = _masked_mean(
             self.log_alpha.exp().detach() * log_probs - q_value,
             mask,
         )
+        actor_entropy = _masked_mean((-log_probs).detach(), mask)
+        loc = actor_td["loc"]
+        if replay_loc is None:
+            replay_loc = torch.zeros_like(loc)
         action_std = actor_td["scale"].mean(dim=-1)
-        diagnostics = {
-            "actor/q_value": _masked_mean(q_value.detach(), mask),
-            "policy/log_prob_mean": _masked_mean(log_probs.detach(), mask),
-            "policy/log_prob_min": log_probs.detach().min(),
-            "policy/log_prob_max": log_probs.detach().max(),
-            "policy/action_clamp_frac": (
-                (clamped_action - action).abs() > 1.0e-7
+        action_center = 0.5 * (self.action_max + self.action_min)
+        action_half_span = 0.5 * action_span
+        tanh_grad = 1.0 - (
+            (action.detach() - action_center) / action_half_span
+        ).clamp(-1.0, 1.0).square()
+        mean_action = action_center + action_half_span * torch.tanh(loc.detach())
+        mean_saturation = (
+            ((mean_action - self.action_min) <= edge_margin)
+            | ((self.action_max - mean_action) <= edge_margin)
+        ).float()
+        info = {
+            "actor/loss": actor_loss.detach(),
+            "actor/entropy": actor_entropy.detach(),
+            "actor/action_std": _masked_mean(action_std.detach(), mask),
+            "actor/mean_change": _masked_mean(
+                (loc.detach() - replay_loc.detach()).abs().mean(dim=-1),
+                mask,
+            ),
+            "actor/valid_fraction": _valid_fraction(mask, device=self.device),
+            "actor/action_saturation": (
+                ((action - self.action_min) <= edge_margin)
+                | ((self.action_max - action) <= edge_margin)
             ).float().mean(),
-            "policy/action_bound_frac": (near_low | near_high).float().mean(),
+            "actor/mean_saturation": mean_saturation.mean(),
+            "actor/max_saturation": mean_saturation.mean(dim=0).max(),
+            "actor/tanh_grad": tanh_grad.mean(),
+            "actor/tanh_grad_min": tanh_grad.min(),
+            "policy/action_clamp_frac": (
+                (
+                    action.clamp(
+                        self.action_min + 1.0e-6,
+                        self.action_max - 1.0e-6,
+                    )
+                    - action
+                ).abs()
+                > 1.0e-7
+            ).float().mean(),
         }
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -1566,34 +1033,10 @@ class FastSAC(PPOBase):
             actor_grad_norm = torch.zeros((), device=self.device)
         self.actor_optimizer.step()
 
-        return (
-            actor_loss.detach(),
-            (-log_probs).detach(),
-            action_std.detach(),
-            actor_grad_norm.detach(),
-            diagnostics,
-        )
+        info["actor/grad_norm"] = actor_grad_norm.detach()
+        return info
 
-    def _update_alpha(self, next_log_probs: torch.Tensor) -> torch.Tensor:
-        if self.fixed_alpha:
-            return torch.zeros((), device=self.device)
-        alpha_loss = -(
-            self.log_alpha.exp() * (next_log_probs.detach() + self.target_entropy)
-        ).mean()
-        assert self.alpha_optimizer is not None
-        self.alpha_optimizer.zero_grad(set_to_none=True)
-        alpha_loss.backward()
-        if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
-            self._all_reduce_param_grad(self.log_alpha)
-        self.alpha_optimizer.step()
-        return alpha_loss.detach()
-
-    def _soft_update_target(self) -> None:
-        with torch.no_grad():
-            for target_param, param in zip(self.qnet_target.parameters(), self.qnet.parameters()):
-                target_param.data.mul_(1.0 - self.cfg.tau).add_(param.data, alpha=self.cfg.tau)
-
-    def _train_value_probe(self) -> dict[str, torch.Tensor]:
+    def train_v(self) -> dict[str, torch.Tensor]:
         if (
             not self.enable_value_probe
             or self.value_probe is None
@@ -1603,16 +1046,18 @@ class FastSAC(PPOBase):
             return {}
 
         batch = torch.stack(list(self.value_trace), dim=0).to(self.device)
-        critic_obs_tn = self._cat_obs(batch, self.critic_obs_keys)
-        next_critic_obs_tn = self._cat_obs(batch["next"], self.critic_obs_keys)
-        critic_obs_tn = self.normalize_critic_obs(critic_obs_tn, update=False)
-        next_critic_obs_tn = self.normalize_critic_obs(next_critic_obs_tn, update=False)
-        T, N = critic_obs_tn.shape[:2]
-        flat = T * N
-        values_tn = self.value_probe(critic_obs_tn.reshape(flat, -1)).reshape(T, N, 1)
-        next_values_tn = self.value_probe(next_critic_obs_tn.reshape(flat, -1)).reshape(T, N, 1)
+        with VecNorm.freeze():
+            self.vecnorm(batch)
+            self.vecnorm(batch["next"])
+        self.value_probe(batch)
+        self.value_probe(batch["next"])
+        values_tn = batch[VALUE_PROBE_KEY]
+        next_values_tn = batch["next", VALUE_PROBE_KEY]
 
-        rewards_nt = self._reward_total(batch).transpose(0, 1).unsqueeze(-1)
+        rewards = batch[REWARD_KEY]
+        if rewards.shape[-1] != 1:
+            rewards = rewards.sum(-1, keepdim=True)
+        rewards_nt = rewards.squeeze(-1).transpose(0, 1).unsqueeze(-1)
         terms_nt = batch[TERM_KEY].transpose(0, 1).float()
         dones_nt = batch[DONE_KEY].transpose(0, 1).float()
         values_nt = values_tn.transpose(0, 1)
@@ -1624,10 +1069,7 @@ class FastSAC(PPOBase):
             values_nt,
             next_values_nt,
         )
-        if "is_init" in batch.keys(True, True):
-            valid_mask = (~batch["is_init"].transpose(0, 1).bool()).squeeze(-1)
-        else:
-            valid_mask = torch.ones_like(rewards_nt[..., 0], dtype=torch.bool)
+        valid_mask = (~batch["is_init"].transpose(0, 1).bool()).squeeze(-1)
         value_errors = (values_nt - returns_nt).square().squeeze(-1)
         value_loss = _masked_mean(value_errors, valid_mask)
 
@@ -1646,140 +1088,42 @@ class FastSAC(PPOBase):
 
         with torch.no_grad():
             probe_td = batch.reshape(-1).copy()
-            self._prepare_batch_inputs(probe_td, update_normalizers=False)
+            self.value_probe(probe_td)
             probe_td = self._sample_actor(probe_td)
-            self._prepare_critic_input(probe_td)
             self.qnet(probe_td)
-            q_probs = F.softmax(probe_td[Q_LOGITS_KEY], dim=-1)
-            q_values = distributional_q_value(q_probs, self.q_support)
-            q_pi = self._reduce_actor_q_values(q_values)
-            critic_obs_flat = probe_td[CRITIC_OBS_KEY]
-            value_pred = self.value_probe(critic_obs_flat).squeeze(-1)
-            if "is_init" in probe_td.keys(True, True):
-                flat_mask = ~probe_td["is_init"].bool().squeeze(-1)
-            else:
-                flat_mask = None
-            value_info = {
-                "value/loss": value_loss.detach(),
+            q_pi = self._reduce_actor_q_values(
+                distributional_q_value(
+                    F.softmax(probe_td[Q_LOGITS_KEY], dim=-1),
+                    self.q_support,
+                )
+            )
+            value_pred = probe_td[VALUE_PROBE_KEY].squeeze(-1)
+            flat_mask = ~probe_td["is_init"].bool().squeeze(-1)
+            return {
+                "critic/v_loss": value_loss.detach(),
                 "value/grad_norm": value_grad_norm.detach(),
-                "value/pred_mean": _masked_mean(value_pred.detach(), flat_mask),
+                "critic/v_value": _masked_mean(value_pred.detach(), flat_mask),
                 "value/return_mean": _masked_mean(returns_nt.detach().squeeze(-1), valid_mask),
                 "value/q_pi_mean": _masked_mean(q_pi.detach(), flat_mask),
                 "value/q_pi_gap": _masked_mean((q_pi - value_pred).detach(), flat_mask),
             }
-        return value_info
 
-    def _update_step(self, tensordict: TensorDictBase) -> dict[str, torch.Tensor]:
-        timing = self.cfg.debug_timing
-        timing_data: dict[str, float] = {}
-        self._sync_if_timing()
-        t0 = time.perf_counter()
-        tensordict = tensordict.copy()
-        self._prepare_batch_inputs(
-            tensordict,
-            update_normalizers=self.update_obs_normalization,
-        )
-        self._sync_if_timing()
-        if timing:
-            timing_data["vecnorm_ms"] = (time.perf_counter() - t0) * 1000.0
-
-        critic_mask = None
-        actor_mask = None
-        if "is_init" in tensordict.keys(True, True):
-            valid = ~tensordict["is_init"].squeeze(-1)
-            critic_valid = valid[:, 0]
-            critic_mask = critic_valid if critic_valid.any() else None
-            if self.cfg.actor_update_scope == "first":
-                actor_valid = critic_valid
-            else:
-                actor_valid = valid.reshape(-1)
-            actor_mask = actor_valid if actor_valid.any() else None
-
-        self._sync_if_timing()
-        t0 = time.perf_counter()
-        q_loss, q_grad_norm, target_values, next_log_probs, critic_diag = self._update_critic(
-            tensordict,
-            critic_mask,
-        )
-        self._sync_if_timing()
-        if timing:
-            timing_data["critic_ms"] = (time.perf_counter() - t0) * 1000.0
-
-        actor_updated = self.gradient_step % self.cfg.policy_frequency == 0
-        self._sync_if_timing()
-        t0 = time.perf_counter()
-        if actor_updated:
-            if self.cfg.actor_update_scope == "first":
-                actor_td = tensordict[:, 0]
-            else:
-                actor_td = tensordict.reshape(-1)
-            actor_loss, entropy, action_std, actor_grad_norm, actor_diag = self._update_actor(
-                actor_td,
-                actor_mask,
-            )
-        else:
-            actor_loss = torch.zeros((), device=self.device)
-            entropy = torch.zeros_like(actor_loss)
-            action_std = torch.zeros_like(actor_loss)
-            actor_grad_norm = torch.zeros_like(actor_loss)
-            actor_diag = {
-                "actor/q_value": torch.zeros((), device=self.device),
-                "policy/log_prob_mean": torch.zeros((), device=self.device),
-                "policy/log_prob_min": torch.zeros((), device=self.device),
-                "policy/log_prob_max": torch.zeros((), device=self.device),
-            }
-        self._sync_if_timing()
-        if timing:
-            timing_data["actor_ms"] = (time.perf_counter() - t0) * 1000.0
-
-        self._sync_if_timing()
-        t0 = time.perf_counter()
-        alpha_loss = self._update_alpha(next_log_probs)
-        self._soft_update_target()
-        self._sync_if_timing()
-        if timing:
-            timing_data["alpha_target_ms"] = (time.perf_counter() - t0) * 1000.0
-
-        value_metrics: dict[str, torch.Tensor] = {}
-        if self.enable_value_probe and self.gradient_step % self.cfg.value_probe_update_every == 0:
-            for _ in range(self.cfg.value_probe_inner):
-                value_metrics = self._train_value_probe()
-        self.gradient_step += 1
-
-        metrics = {
-            "critic/loss": q_loss.detach(),
-            "critic/grad_norm": q_grad_norm.detach(),
-            "critic/target_q_mean": target_values.mean().detach(),
-            "actor/loss": actor_loss.detach(),
-            "actor/entropy": entropy.mean().detach(),
-            "actor/action_std": action_std.mean().detach(),
-            "actor/grad_norm": actor_grad_norm.detach(),
-            "actor/updated": torch.tensor(float(actor_updated), device=self.device),
-            "alpha/loss": alpha_loss.detach(),
-            "alpha/value": self.log_alpha.exp().detach(),
-        }
-        metrics.update(critic_diag)
-        metrics.update(actor_diag)
-        metrics.update(value_metrics)
-        if timing:
-            for key, value in timing_data.items():
-                metrics[f"debug_timing/{key}"] = torch.tensor(value, device=self.device)
-        return metrics
-
-    def update(self) -> dict[str, float]:
-        timing = self.cfg.debug_timing
-        update_start = time.perf_counter()
+    def train_op(self, tensordict: TensorDictBase) -> dict[str, float]:
+        self._append_rollout_to_replay(tensordict.exclude("stats"))
         self.num_updates += 1
-        info: dict[str, float] = {
+        info: dict[str, float | torch.Tensor] = {
             "rb_size": float(len(self.replay_buffer)),
-            "alpha/value": self.log_alpha.exp().item(),
+            "actor/alpha": self.log_alpha.exp().item(),
         }
         if len(self.replay_buffer) < self.min_replay_sample_transitions:
-            return info
+            return dict(sorted(info.items()))
 
-        metric_lists: dict[str, list[torch.Tensor]] = defaultdict(list)
-        for _ in range(self.cfg.updates_per_step):
-            t_sample = time.perf_counter()
+        def sample_batch(*, normalize_bootstrap: bool) -> tuple[
+            TensorDictBase,
+            torch.Tensor,
+            TensorDictBase,
+            torch.Tensor,
+        ]:
             batch = self.replay_buffer.sample()
             if self.use_custom_replay_buffer:
                 pass
@@ -1790,67 +1134,87 @@ class FastSAC(PPOBase):
                 )
             else:
                 batch = batch.unsqueeze(1)
-            t_to_device = time.perf_counter()
             if not self.replay_samples_on_device:
                 batch = batch.to(self.device)
-            self._sync_if_timing()
-            t_update = time.perf_counter()
-            step_metrics = self._update_step(batch)
-            self._sync_if_timing()
-            t_done = time.perf_counter()
-            if timing:
-                step_metrics["debug_timing/sample_ms"] = torch.tensor(
-                    (t_to_device - t_sample) * 1000.0,
-                    device=self.device,
-                )
-                step_metrics["debug_timing/to_device_ms"] = torch.tensor(
-                    (t_update - t_to_device) * 1000.0,
-                    device=self.device,
-                )
-                step_metrics["debug_timing/update_step_ms"] = torch.tensor(
-                    (t_done - t_update) * 1000.0,
-                    device=self.device,
-                )
-            for key, value in step_metrics.items():
-                metric_lists[key].append(value.detach())
 
-        self._sync_vecnorms()
-        for key, values in metric_lists.items():
-            info[key] = torch.stack(values).float().mean().item()
+            batch = batch.copy()
+            freeze_vecnorm = VecNorm.freeze() if self.cfg.freeze_vecnorm else nullcontext()
+            with freeze_vecnorm:
+                self.vecnorm(batch)
+                if normalize_bootstrap:
+                    self.vecnorm(batch[BOOTSTRAP_KEY])
+
+            valid = ~batch["is_init"].squeeze(-1)
+            critic_mask = valid[:, 0]
+            if self.cfg.actor_update_scope == "first":
+                actor_td = batch[:, 0]
+                actor_mask = critic_mask
+            else:
+                actor_td = batch.reshape(-1)
+                actor_mask = valid.reshape(-1)
+            return batch, critic_mask, actor_td, actor_mask
+
+        for _ in range(self.cfg.train_every * self.cfg.utd_ratio):
+            batch, critic_mask, actor_td, actor_mask = sample_batch(
+                normalize_bootstrap=True
+            )
+            critic_info = self.train_critic(batch, critic_mask)
+            next_log_probs = critic_info.pop("_next_log_probs")
+            info.update(critic_info)
+
+            if self.gradient_step % self.cfg.policy_frequency == 0:
+                info.update(self.train_actor(actor_td, actor_mask))
+
+            if self.fixed_alpha:
+                alpha_loss = torch.zeros((), device=self.device)
+            else:
+                assert self.alpha_optimizer is not None
+                assert self.target_entropy is not None
+                alpha_loss = -(
+                    self.log_alpha.exp()
+                    * (next_log_probs.detach() + self.target_entropy)
+                ).mean()
+                self.alpha_optimizer.zero_grad(set_to_none=True)
+                alpha_loss.backward()
+                if aa.is_distributed() and self.cfg.grad_sync_mode == "manual":
+                    self._all_reduce_param_grad(self.log_alpha)
+                self.alpha_optimizer.step()
+                alpha_loss = alpha_loss.detach()
+
+            info["alpha/loss"] = alpha_loss.detach()
+            info["actor/alpha"] = self.log_alpha.exp().detach()
+            if (
+                self.enable_value_probe
+                and self.gradient_step % self.cfg.value_probe_update_every == 0
+            ):
+                for _ in range(self.cfg.value_probe_inner):
+                    info.update(self.train_v())
+            self.gradient_step += 1
+
         info["rb_size"] = float(len(self.replay_buffer))
         info["gradient_step"] = float(self.gradient_step)
-        if timing and self.gradient_step % self.cfg.debug_timing_interval == 0:
-            debug_items = {
-                key.removeprefix("debug_timing/"): value
-                for key, value in info.items()
-                if key.startswith("debug_timing/")
-            }
-            debug_items["update_total_ms"] = (time.perf_counter() - update_start) * 1000.0
-            ordered = " ".join(f"{key}={value:.2f}" for key, value in sorted(debug_items.items()))
-            print(
-                f"[FastSAC timing] step={self.gradient_step} "
-                f"n_step={self.cfg.n_step} batch={self.cfg.replay_batch_size} {ordered}",
-                flush=True,
-            )
-        return info
+        for key, value in list(info.items()):
+            if key.startswith("_"):
+                del info[key]
+            elif torch.is_tensor(value):
+                info[key] = value.detach().float().mean().item()
+            else:
+                info[key] = float(value)
+        return dict(sorted(info.items()))
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         del critic
-        rollout_policy = FastSACRolloutPolicy(self)
+        rollout_policy = RolloutPolicy(self)
         if mode == "train":
             return WarmupUniformRolloutPolicy(self, rollout_policy)
         return rollout_policy
 
-    def train_op(self, tensordict: TensorDictBase) -> dict[str, float]:
-        self.observe(tensordict.exclude("stats"))
-        return self.update()
-
     def compute_value(self, tensordict: TensorDictBase) -> TensorDictBase:
         work_td = tensordict.copy()
         with torch.no_grad():
-            self._prepare_batch_inputs(work_td, update_normalizers=False)
+            with VecNorm.freeze():
+                self.vecnorm(work_td)
             work_td = self._sample_actor(work_td)
-            self._prepare_critic_input(work_td)
             self.qnet(work_td)
             q_probs = F.softmax(work_td[Q_LOGITS_KEY], dim=-1)
             q_values = distributional_q_value(q_probs, self.q_support)
@@ -1864,7 +1228,7 @@ class FastSAC(PPOBase):
             state_dict[name] = module.state_dict()
         state_dict["gradient_step"] = self.gradient_step
         state_dict["num_updates"] = self.num_updates
-        state_dict["last_iter"] = self._get_current_iter()
+        state_dict["last_iter"] = int(getattr(self.env, "current_iter", 0))
         state_dict["log_alpha"] = self.log_alpha.detach().clone()
         state_dict["q_support"] = self.q_support.detach().clone()
         return state_dict

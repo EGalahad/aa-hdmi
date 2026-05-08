@@ -41,11 +41,12 @@ def main(cfg: DictConfig):
         f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}"
     )
 
-    from active_adaptation.helpers import make_env_policy, evaluate
+    from active_adaptation.helpers import make_env_policy
     from active_adaptation.utils.helpers import EpisodeStats
 
     env, policy = make_env_policy(cfg)
     policy: PPOBase
+    requires_rollout_value = bool(getattr(policy, "requires_rollout_value", True))
 
     frames_per_batch = env.num_envs * cfg.algo.train_every
     total_iters = cfg.get("total_iters", None)
@@ -201,17 +202,18 @@ def main(cfg: DictConfig):
                         td["next"] = td["next"].select(*next_saved_keys, strict=False)
                         data_buf[:, step] = td
 
-                    policy.critic(data_buf)
-                    values = data_buf["state_value"]
-                    last_value = policy.compute_value(carry.copy())["state_value"]
-                    next_values = torch.cat(
-                        [values[:, 1:], last_value.unsqueeze(1)], dim=1
-                    )
-                    data_buf["next", "state_value"] = torch.where(
-                        data_buf["next", "done"],
-                        values,
-                        next_values,
-                    )
+                    if requires_rollout_value:
+                        policy.critic(data_buf)
+                        values = data_buf["state_value"]
+                        last_value = policy.compute_value(carry.copy())["state_value"]
+                        next_values = torch.cat(
+                            [values[:, 1:], last_value.unsqueeze(1)], dim=1
+                        )
+                        data_buf["next", "state_value"] = torch.where(
+                            data_buf["next", "done"],
+                            values,
+                            next_values,
+                        )
 
             rollout_time = rollout_timer.last_time
 

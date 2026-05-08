@@ -103,3 +103,112 @@ def resolve_action_bounds(
     action_min = torch.tensor(min_values, device=device, dtype=torch.float32)
     action_max = torch.tensor(max_values, device=device, dtype=torch.float32)
     return action_min, action_max
+
+
+def resolve_fast_sac_action_bounds(
+    cfg,
+    env,
+    joint_names: Sequence[str],
+    action_dim: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cfg.action_space_mode != "holosoma":
+        return resolve_action_bounds(cfg.action_bounds, joint_names, device)
+
+    manager = getattr(env, "action_manager", None)
+    if manager is None:
+        raise RuntimeError("Holosoma action scaling requires env.action_manager.")
+
+    env_action_scale = _compute_holosoma_env_action_scale(
+        manager,
+        float(cfg.holosoma_action_scale),
+        device,
+    )
+    if env_action_scale.numel() != action_dim:
+        raise ValueError(
+            f"FastSAC env action scale has {env_action_scale.numel()} entries, "
+            f"expected action_dim={action_dim}."
+        )
+
+    manager.action_scaling = env_action_scale.to(manager.device)
+    if cfg.holosoma_use_actor_boundary:
+        actor_low, actor_high = _compute_action_bounds_from_limits(
+            manager,
+            env_action_scale,
+            device,
+        )
+        actor_scale = 0.5 * (actor_high - actor_low)
+        actor_bias = 0.5 * (actor_high + actor_low)
+        print(
+            "[Info] FastSAC Holosoma action scaling: "
+            f"env_scale_min={env_action_scale.min().item():.4f}, "
+            f"env_scale_max={env_action_scale.max().item():.4f}, "
+            f"actor_low_min={actor_low.min().item():.4f}, "
+            f"actor_high_max={actor_high.max().item():.4f}, "
+            f"actor_scale_min={actor_scale.min().item():.4f}, "
+            f"actor_scale_max={actor_scale.max().item():.4f}, "
+            f"actor_bias_absmax={actor_bias.abs().max().item():.4f}",
+            flush=True,
+        )
+        return actor_low, actor_high
+
+    print(
+        "[Info] FastSAC Holosoma action scaling: "
+        f"env_scale_min={env_action_scale.min().item():.4f}, "
+        f"env_scale_max={env_action_scale.max().item():.4f}, "
+        "actor_boundary_mode=fixed_unit",
+        flush=True,
+    )
+    return -torch.ones_like(env_action_scale), torch.ones_like(env_action_scale)
+
+
+def _compute_holosoma_env_action_scale(
+    manager,
+    holosoma_action_scale: float,
+    device: torch.device | str,
+) -> torch.Tensor:
+    asset = manager.asset
+    actuator_names = list(asset.actuator_names)
+    ctrl_ids = torch.as_tensor(
+        asset.indexing.ctrl_ids,
+        device=device,
+        dtype=torch.long,
+    )
+    if len(actuator_names) != int(ctrl_ids.numel()):
+        raise RuntimeError(
+            f"Expected one actuator name per control id, got {len(actuator_names)} names "
+            f"and {int(ctrl_ids.numel())} control ids."
+        )
+    name_to_ctrl_id = {name: ctrl_ids[i] for i, name in enumerate(actuator_names)}
+    missing = [name for name in manager.joint_names if name not in name_to_ctrl_id]
+    if missing:
+        raise RuntimeError(
+            f"Cannot compute Holosoma action scale; missing actuators for joints: {missing}"
+        )
+
+    selected_ctrl_ids = torch.stack([name_to_ctrl_id[name] for name in manager.joint_names])
+    force_range = manager.env.sim.get_default_field("actuator_forcerange").to(device)
+    gainprm = manager.env.sim.get_default_field("actuator_gainprm").to(device)
+    effort_limit = force_range[selected_ctrl_ids].abs().max(dim=-1).values
+    stiffness = gainprm[selected_ctrl_ids, 0].abs().clamp_min(1.0e-6)
+    return (holosoma_action_scale * effort_limit / stiffness).clamp_min(1.0e-6)
+
+
+def _compute_action_bounds_from_limits(
+    manager,
+    env_action_scale: torch.Tensor,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not hasattr(manager.asset.data, "joint_pos_limits"):
+        raise RuntimeError(
+            "FastSAC Holosoma action boundary requires asset.data.joint_pos_limits."
+        )
+
+    limits = manager.asset.data.joint_pos_limits[0, manager.joint_ids].to(device)
+    default_pos = manager.default_joint_pos[0, manager.joint_ids].to(device)
+    lower = limits[..., 0]
+    upper = limits[..., 1]
+    scale = env_action_scale.abs().clamp_min(1.0e-6)
+    actor_low = (lower - default_pos) / scale
+    actor_high = (upper - default_pos) / scale
+    return actor_low, actor_high
