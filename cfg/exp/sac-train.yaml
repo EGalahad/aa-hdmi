@@ -1,16 +1,23 @@
 # @package _global_
 
 defaults:
-  - override /algo: fast_sac
-  - override /task/command/future_steps: long
-  - override /task/observation/command: root_joint
+  # - /task/observation/policy: full
+  - /algo/sac/module: large
+  - override /algo: sac
+  - override /task/command/future_steps: short
 
 total_iters: 10000
 checkpoint_interval: 2000
 upload_interval: 2000
 
+algo:
+  gamma: 0.94
+  buffer_size: 512
+  buffer_device: "cuda"
+
 task:
   num_envs: 4096
+
   reward:
     loco:
       action_rate_l2:

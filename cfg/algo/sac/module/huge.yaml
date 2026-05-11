@@ -1,0 +1,4 @@
+# @package algo
+
+actor_hidden_dims: [768, 768, 768]
+critic_hidden_dims: [1024, 1024, 1024]
