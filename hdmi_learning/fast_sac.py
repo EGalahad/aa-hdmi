@@ -149,12 +149,12 @@ class FastSACConfig:
     _target_: str = f"{__package__}.fast_sac.FastSAC"
 
     name: str = "fast_sac"
-    train_every: int = 16
+    train_every: int = 2
     # Effective replay capacity = buffer_size * num_envs.
-    buffer_size: int = 1024
+    buffer_size: int = 256
     replay_batch_size: int = 4096
     # Effective transition warmup = warm_up_steps * num_envs.
-    warm_up_steps: int = 256
+    warm_up_steps: int = 8
     utd_ratio: int = 4
     policy_frequency: int = 2
 
@@ -909,9 +909,6 @@ class FastSAC(PPOBase):
         q_stats_values = self._critic_stats_values(q_values)
         target_stats_values = self._critic_stats_values(target_values)
         info = {
-            "reward/mean": _masked_mean(first_rewards.detach(), mask).detach(),
-            "reward/max": first_rewards.detach().max(),
-            "reward/min": first_rewards.detach().min(),
             "critic/neg_rew_ratio": _masked_mean(
                 (first_rewards.detach() <= 0.0).float(),
                 mask,
@@ -1116,6 +1113,9 @@ class FastSAC(PPOBase):
             "actor/alpha": self.log_alpha.exp().item(),
         }
         if len(self.replay_buffer) < self.min_replay_sample_transitions:
+            if aa.is_distributed() and self.cfg.vecnorm:
+                for vecnorm in self.vecnorms.values():
+                    vecnorm.synchronize(mode="broadcast")
             return dict(sorted(info.items()))
 
         def sample_batch(*, normalize_bootstrap: bool) -> tuple[
@@ -1193,6 +1193,9 @@ class FastSAC(PPOBase):
 
         info["rb_size"] = float(len(self.replay_buffer))
         info["gradient_step"] = float(self.gradient_step)
+        if aa.is_distributed() and self.cfg.vecnorm:
+            for vecnorm in self.vecnorms.values():
+                vecnorm.synchronize(mode="broadcast")
         for key, value in list(info.items()):
             if key.startswith("_"):
                 del info[key]

@@ -82,6 +82,11 @@ class RolloutPolicy(TensorDictModuleBase):
 
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         policy = self._policy
+        actor_td = tensordict.copy()
         with VecNorm.freeze():
-            policy.vecnorm(tensordict)
-        return policy.actor(tensordict)
+            policy.vecnorm(actor_td)
+        policy.actor(actor_td)
+        for key in (ACTION_KEY, "loc", "scale", f"{ACTION_KEY}_log_prob"):
+            if key in actor_td.keys(True, True):
+                tensordict.set(key, actor_td[key])
+        return tensordict

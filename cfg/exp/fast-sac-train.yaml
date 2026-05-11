@@ -2,10 +2,22 @@
 
 defaults:
   - override /algo: fast_sac
+  - override /task/command/future_steps: long
+  - override /task/observation/command: root_joint
 
 total_iters: 10000
 checkpoint_interval: 2000
 upload_interval: 2000
 
 task:
-  num_envs: 2048
+  num_envs: 4096
+  reward:
+    loco:
+      action_rate_l2:
+        weight: 0.01
+      feet_air_time:
+        weight: 2.0
+
+  termination:
+    root_pos_error:
+      is_timeout: false
