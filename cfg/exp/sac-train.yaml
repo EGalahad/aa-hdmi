@@ -1,10 +1,8 @@
 # @package _global_
 
 defaults:
-  # - /task/observation/policy: full
   - /algo/sac/module: large
   - override /algo: sac
-  - override /task/command/future_steps: short
 
 total_iters: 10000
 checkpoint_interval: 2000
@@ -14,6 +12,11 @@ algo:
   gamma: 0.94
   buffer_size: 512
   buffer_device: "cuda"
+  use_correlated: false
+  actor_loc_reg_scale: 16.0
+  actor_loc_reg_power: 4.0
+  critic_batch_size: 4096
+  actor_batch_size: 4096
 
 task:
   num_envs: 4096
@@ -22,9 +25,3 @@ task:
     loco:
       action_rate_l2:
         weight: 0.01
-      feet_air_time:
-        weight: 2.0
-
-  # termination:
-  #   root_pos_error:
-  #     is_timeout: false

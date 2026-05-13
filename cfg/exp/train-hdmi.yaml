@@ -11,5 +11,5 @@ algo:
   freeze_vecnorm: false
   entropy_coef_start: 0.012
   entropy_coef_end: 0.001
-  entropy_decay_start: 3500
-  entropy_decay_end: 4000
+  entropy_decay_start: 3400
+  entropy_decay_end: 3600
