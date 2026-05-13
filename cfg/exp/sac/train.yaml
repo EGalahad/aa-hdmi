@@ -19,7 +19,7 @@ algo:
   actor_batch_size: 4096
 
 task:
-  num_envs: 4096
+  num_envs: 2048
 
   reward:
     loco:

@@ -2,8 +2,8 @@
 
 defaults:
   - override /algo: fast_sac
-  - override /task/command/future_steps: long
-  - override /task/observation/command: root_joint
+  - override /task/command/future_steps: short
+  # - override /task/observation/command: root_joint
 
 total_iters: 10000
 checkpoint_interval: 2000

@@ -3,13 +3,13 @@
 stages:
   - name: train
     overrides:
-      - +exp=train
+      - +exp=ppo_roa/train
     load_checkpoint_from_previous: false
   - name: adapt
     overrides:
-      - +exp=adapt
+      - +exp=ppo_roa/adapt
     load_checkpoint_from_previous: true
   - name: finetune
     overrides:
-      - +exp=finetune
+      - +exp=ppo_roa/finetune
     load_checkpoint_from_previous: true

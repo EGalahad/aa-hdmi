@@ -207,7 +207,7 @@ reward:
 
   loco:
     action_rate_l2:     {weight: 0.1, enabled: true}
-    joint_vel_l2:       {weight: 5.0e-4, joint_names: .*}
+    joint_vel_l2:       {weight: 1.0e-4, joint_names: .*}
     joint_pos_limits:  
       _target_: hdmi.joint_pos_limits
       weight: 10.0

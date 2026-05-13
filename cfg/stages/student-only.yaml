@@ -3,7 +3,7 @@
 stages:
   - name: student
     overrides:
-      - +exp=finetune
+      - +exp=ppo_roa/finetune
       - total_iters=5000
       - algo.freeze_vecnorm=false
       - algo.entropy_coef_start=0.012

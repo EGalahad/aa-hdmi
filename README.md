@@ -52,43 +52,44 @@ export HF_TOKEN=<your_huggingface_token>
 
 ## Train
 
-Run the new single-stage HDMI PPO:
+Run single-stage PPO:
 
 ```bash
-uv --project venv/mjlab run torchrun --nproc_per_node=8 projects/hdmi/scripts/train.py \
-  task=lafan_100style_real +exp=train-hdmi backend=mjlab
+bash scripts/launch_ddp.sh 0,1,2,3,4,5,6,7 projects/hdmi/scripts/train.py venv/mjlab \
+  task=lafan_100style_real +exp=ppo/train backend=mjlab
 ```
 
-Run the sequential ROA training pipeline:
+Run SAC:
+
+```bash
+bash scripts/launch_ddp.sh 0,1,2,3,4,5,6,7 projects/hdmi/scripts/train.py venv/mjlab \
+  task=lafan_100style_real +exp=sac/train backend=mjlab
+```
+
+Run sequential PPO:
 
 ```bash
 uv --project venv/mjlab run projects/hdmi/scripts/train_sequential.py \
   nproc_per_node=8 task=lafan_100style_real stages=normal backend=mjlab
 ```
 
-Run fast sac training:
-
-```bash
-uv --project venv/mjlab run projects/hdmi/scripts/train.py \
-  task=lafan-single +exp=fast-sac-train backend=mjlab algo.vecnorm=false
-```
-
 To play checkpoints:
 
 ```bash
 uv --project venv/mjlab run projects/hdmi/scripts/play.py \
-  task=lafan task/command/future_steps=long \
-  algo=ppo_roa_finetune backend=mjlab \
-  checkpoint_path=run:elijahgalahad/hdmi/runs/a03f770b_lafan_100style_finetune
+  task=lafan +exp=ppo/train backend=mjlab \
+  checkpoint_path=run:elijahgalahad/hdmi/runs/kr0vxm4n \
+  task.num_envs=4 task.termination.root_pos_error.enabled=false
 
 uv --project venv/mjlab run projects/hdmi/scripts/play.py \
-  task=lafan \
-  +exp=train-hdmi backend=mjlab \
-  checkpoint_path=run:elijahgalahad/hdmi/runs/kr0vxm4n
+  task=lafan +exp=sac/train backend=mjlab \
+  checkpoint_path=run:elijahgalahad/hdmi/runs/5jzn40za \
+  task.num_envs=4 task.termination.root_pos_error.enabled=false
 
 uv --project venv/mjlab run projects/hdmi/scripts/play.py \
-  task=lafan-single +exp=fast-sac-train backend=mjlab algo.vecnorm=false \
-  checkpoint_path=run:elijahgalahad/hdmi/runs/ffjg0e9k task.num_envs=4
+  task=lafan +exp=ppo_roa/finetune backend=mjlab \
+  checkpoint_path=run:elijahgalahad/hdmi/runs/a03f770b_lafan_100style_finetune \
+  task.num_envs=4 task.termination.root_pos_error.enabled=false
 ```
 
 ## Troubleshooting
