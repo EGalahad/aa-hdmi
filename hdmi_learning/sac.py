@@ -24,6 +24,7 @@ from torchrl.objectives import hold_out_net
 
 import active_adaptation as aa
 from active_adaptation.learning.modules import (
+    AmpSafeRMSNorm,
     ConditionalBlock,
     IndependentNormal,
     MLP,
@@ -248,14 +249,14 @@ class TwinQNetwork(nn.Module):
             critic_input_dim,
             hidden_dims,
             1,
-            norm_cls=nn.RMSNorm,
+            norm_cls=AmpSafeRMSNorm,
             activation=activation,
         )
         self.critic_2 = _same_width_residual_stack(
             critic_input_dim,
             hidden_dims,
             1,
-            norm_cls=nn.RMSNorm,
+            norm_cls=AmpSafeRMSNorm,
             activation=activation,
         )
         self.reset_parameters()
@@ -316,7 +317,7 @@ class TwinDistributionalQNetwork(nn.Module):
                     critic_input_dim,
                     hidden_dims,
                     num_atoms,
-                    norm_cls=nn.RMSNorm,
+                    norm_cls=AmpSafeRMSNorm,
                     activation=activation,
                 )
 
