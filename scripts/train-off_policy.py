@@ -1,7 +1,7 @@
 import datetime
 import logging
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from pathlib import Path
 
 import hydra
@@ -40,7 +40,7 @@ def main(cfg: DictConfig):
 
     env, policy = make_env_policy(cfg)
 
-    frames_per_iter = env.num_envs * cfg.algo.collect_steps
+    frames_per_iter = env.num_envs * cfg.algo.train_every
     total_iters = cfg.get("total_iters", None)
     if total_iters is None:
         total_frames = cfg.get("total_frames", -1) // aa.get_world_size()
@@ -49,7 +49,7 @@ def main(cfg: DictConfig):
 
     checkpoint_interval = cfg.checkpoint_interval
     upload_interval = cfg.upload_interval
-    log_interval = (cfg.task.max_episode_length // cfg.algo.collect_steps) + 1
+    log_interval = (cfg.task.max_episode_length // cfg.algo.train_every) + 1
     logging.info(f"Log interval: {log_interval} steps")
 
     stats_keys = [
@@ -152,12 +152,12 @@ def main(cfg: DictConfig):
         iter_start = time.perf_counter()
         rollout_time = 0.0
         training_time = 0.0
-        metric_lists: dict[str, list[float]] = defaultdict(list)
+        rollout_data = []
 
         with set_exploration_type(ExplorationType.RANDOM):
             if hasattr(env, "set_progress"):
                 env.set_progress(start_iter + iter_idx)
-            for _ in range(cfg.algo.collect_steps):
+            for _ in range(cfg.algo.train_every):
                 rollout_start = time.perf_counter()
                 with torch.inference_mode():
                     carry = rollout_policy(carry)
@@ -166,15 +166,11 @@ def main(cfg: DictConfig):
 
                 episode_stats.add(td)
                 td["next"] = td["next"].select(*next_saved_keys, strict=False)
+                rollout_data.append(td)
 
-                train_start = time.perf_counter()
-                policy.observe(td)
-                step_info = policy.update()
-                training_time += time.perf_counter() - train_start
-
-                for key, value in step_info.items():
-                    if isinstance(value, (float, int)):
-                        metric_lists[key].append(float(value))
+            train_start = time.perf_counter()
+            step_info = policy.train_op(torch.stack(rollout_data, dim=1))
+            training_time += time.perf_counter() - train_start
 
         env_frames += frames_per_iter
 
@@ -184,9 +180,7 @@ def main(cfg: DictConfig):
                 log_key = "train/" + ("/".join(key) if isinstance(key, tuple) else key)
                 info[log_key] = torch.mean(value.float()).item()
 
-        for key, values in metric_lists.items():
-            if values:
-                info[key] = sum(values) / len(values)
+        info.update(step_info)
 
         info.update(env.extra)
         info.update(env.stats_ema)

@@ -9,10 +9,14 @@ checkpoint_interval: 2000
 upload_interval: 2000
 
 algo:
+  _target_: hdmi_learning.sac.SAC
   gamma: 0.94
   buffer_size: 512
   buffer_device: "cuda"
   use_correlated: false
+  normalize_reward: true
+  normalized_G_max: 5.0
+  use_normalized_q_support: true
   actor_loc_reg_scale: 16.0
   actor_loc_reg_power: 4.0
   critic_batch_size: 4096

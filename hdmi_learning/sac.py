@@ -143,6 +143,10 @@ class SACConfig:
     normalize_reward: bool = False
     normalized_G_max: float = 5.0
     reward_norm_epsilon: float = 1e-8
+    use_normalized_q_support: bool = True
+    critic_v_min: float = -1.0
+    critic_v_max: float = 9.0
+    critic_v_step: float = 0.05
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, OBS_PRIV_KEY)
 
@@ -176,6 +180,19 @@ class SACConfig:
         if self.target_entropy_decay_end < self.target_entropy_decay_start:
             raise ValueError(
                 "target_entropy_decay_end must be >= target_entropy_decay_start."
+            )
+        if self.normalized_G_max <= 0:
+            raise ValueError(
+                f"normalized_G_max must be > 0, got {self.normalized_G_max}."
+            )
+        if self.critic_v_max <= self.critic_v_min:
+            raise ValueError(
+                "critic_v_max must be greater than critic_v_min, got "
+                f"{self.critic_v_min} >= {self.critic_v_max}."
+            )
+        if self.critic_v_step <= 0:
+            raise ValueError(
+                f"critic_v_step must be > 0, got {self.critic_v_step}."
             )
 
 
@@ -493,13 +510,14 @@ class SAC(TensorDictModuleBase):
             self.vecnorm_obs = nn.Identity()
 
         if self.cfg.distributional:
-            if self.cfg.normalize_reward:
-                v_min = -0.5 # we will not have negative values, but it is a good idea to have a small margin
+            if self.cfg.normalize_reward and self.cfg.use_normalized_q_support:
+                v_min = -float(self.cfg.normalized_G_max)
                 v_max = float(self.cfg.normalized_G_max)
                 num_atoms = 101
             else:
-                v_min, v_max = -1.0, 9.0
-                num_atoms = int((v_max - v_min) / 0.05) + 1
+                v_min = float(self.cfg.critic_v_min)
+                v_max = float(self.cfg.critic_v_max)
+                num_atoms = int((v_max - v_min) / float(self.cfg.critic_v_step)) + 1
             self.register_buffer(
                 "q_support",
                 torch.linspace(v_min, v_max, num_atoms, device=device),
@@ -950,13 +968,15 @@ class SAC(TensorDictModuleBase):
 
     def train_critic(self, batch: TensorDict, diagnostics: bool = False):
         self.Q.train()
-        reward = batch[REWARD_KEY]
+        raw_reward = batch[REWARD_KEY]
+        reward = raw_reward
         if self.reward_normalizer is not None:
             reward = self.reward_normalizer.normalize_rewards(reward)
 
         batch = batch.copy()
         next_batch = batch["next"].copy()
         discount = batch["next", "discount"]
+        target_edge_info: dict[str, float] = {}
 
         with self._autocast():
             with torch.no_grad():
@@ -999,6 +1019,14 @@ class SAC(TensorDictModuleBase):
                         ),
                         selected,
                     ]
+                    if diagnostics:
+                        q_target_detached = q_target.detach().float()
+                        target_edge_info = {
+                            "critic/target_vmin_frac": q_target_detached[..., 0].mean().item(),
+                            "critic/target_vmax_frac": q_target_detached[..., -1].mean().item(),
+                            "critic/q_support_min": self.q_support[0].detach().item(),
+                            "critic/q_support_max": self.q_support[-1].detach().item(),
+                        }
                 else:
                     entropy_bonus = -alpha * lp
                     if entropy_bonus.shape != reward.shape:
@@ -1050,6 +1078,20 @@ class SAC(TensorDictModuleBase):
                     "critic/grad_norm": critic_grad_norm.item(),
                 }
             )
+            infos.update(target_edge_info)
+            if self.reward_normalizer is not None:
+                raw_reward_detached = raw_reward.detach().float()
+                reward_detached = reward.detach().float()
+                infos.update(
+                    {
+                        "reward/raw_mean": raw_reward_detached.mean().item(),
+                        "reward/raw_std": raw_reward_detached.std().item(),
+                        "reward/normalized_mean": reward_detached.mean().item(),
+                        "reward/normalized_std": reward_detached.std().item(),
+                        "reward/G_r_max": self.reward_normalizer.G_r_max.detach().mean().item(),
+                        "reward/G_var": self.reward_normalizer.G_rms.var.detach().mean().item(),
+                    }
+                )
 
         # Optional: use expectile regression to estimate the value
         if self.V is not None:
