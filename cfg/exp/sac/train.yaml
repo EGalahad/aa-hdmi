@@ -4,13 +4,13 @@ defaults:
   - /algo/sac/module: large
   - override /algo: sac
 
-total_iters: 10000
-checkpoint_interval: 2000
-upload_interval: 2000
+total_iters: 5000
+checkpoint_interval: 1000
+upload_interval: 1000
 
 algo:
-  gamma: 0.94
-  buffer_size: 512
+  gamma: 0.95
+  buffer_size: 256
   buffer_device: "cuda"
   use_correlated: false
   actor_loc_reg_scale: 16.0
@@ -19,9 +19,4 @@ algo:
   actor_batch_size: 4096
 
 task:
-  num_envs: 2048
-
-  reward:
-    loco:
-      action_rate_l2:
-        weight: 0.01
+  num_envs: 4096

@@ -3,7 +3,7 @@ defaults:
   - tracking-base
   - _self_
 
-name: lafan_100style
+name: lafan_100style_real
 
 command:
   motion_cfgs:

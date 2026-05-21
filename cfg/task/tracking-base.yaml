@@ -230,7 +230,7 @@ reward:
 
     feet_air_time:
       _target_: hdmi.feet_air_time
-      weight: 8.0
+      weight: 4.0
       enabled: true
       body_names: [left_ankle_roll_link, right_ankle_roll_link]
       body2_names: [left_toe_link, right_toe_link]
@@ -307,10 +307,10 @@ randomization:
   motor_params_implicit:
     stiffness_range:
       ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
-      ".*(waist|hip|knee|ankle).*": [0.6, 1.4]
+      ".*(waist|hip|knee|ankle).*": [0.8, 1.2]
     damping_range:
       ".*(shoulder|elbow|wrist).*": [0.9, 1.1]
-      ".*(waist|hip|knee|ankle).*": [0.6, 1.4]
+      ".*(waist|hip|knee|ankle).*": [0.8, 1.2]
     armature_range:
       .*: [0.75, 1.25]
     friction_range:

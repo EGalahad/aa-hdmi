@@ -540,6 +540,8 @@ class RobotTracking(Command, namespace="hdmi"):
             rewind_mask=rewind_mask,
             rewind_steps=rewind_steps,
         )
+        if not self.env.training:
+            sampled_motion.start_t.fill_(0)
         self.motion_ids[env_ids] = sampled_motion.motion_id
         self.motion_len[env_ids] = sampled_motion.motion_len
         self.t[env_ids] = sampled_motion.start_t

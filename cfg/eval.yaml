@@ -1,0 +1,30 @@
+hydra:
+  run:
+    dir: ./outputs/eval/${now:%Y-%m-%d}/${now:%H-%M-%S}-${task.name}-${algo.name}
+  job:
+    chdir: true
+
+headless: true
+backend: mjlab
+device: cuda
+
+app:
+  headless: ${..headless}
+  enable_cameras: false
+
+seed: 42
+checkpoint_path: null
+camera_follow: true
+
+eval_steps: 1000
+eval_output: eval_rollout.pt
+eval_summary_output: eval_summary.json
+
+defaults:
+  - task: lafan_100style_real
+  - algo: hdmi_ppo
+  - override /task/command/future_steps: short
+  - _self_
+
+task:
+  num_envs: 512

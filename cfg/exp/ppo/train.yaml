@@ -1,6 +1,7 @@
 # @package _global_
 
 defaults:
+  - /algo/ppo/module: large
   - override /algo: hdmi_ppo
 
 total_iters: 4000
@@ -11,5 +12,8 @@ algo:
   freeze_vecnorm: false
   entropy_coef_start: 0.012
   entropy_coef_end: 0.001
-  entropy_decay_start: 3400
-  entropy_decay_end: 3600
+  entropy_decay_start: 2750
+  entropy_decay_end: 3000
+
+task:
+  num_envs: 8192

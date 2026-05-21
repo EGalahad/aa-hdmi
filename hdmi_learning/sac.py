@@ -53,6 +53,7 @@ from .offpolicy.critic import (
 from .sac_offpolicy.reward_normalization import RewardNormalizer
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.utils.dormancy import DormancyTracker
+from .common import MeanAction, ObsOODDetector
 
 cs = ConfigStore.instance()
 
@@ -122,7 +123,7 @@ class SACConfig:
     target_entropy_sigma: float | None = None
     target_entropy_sigma_start: float | None = 0.4
     target_entropy_sigma_end: float | None = 0.25
-    target_entropy_decay_start: int = 2000
+    target_entropy_decay_start: int = 3000
     target_entropy_decay_end: int = 4000
 
     tau_actor: float = 0.1 # a relatively large value for faster convergence
@@ -808,6 +809,19 @@ class SAC(TensorDictModuleBase):
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         """Train: optional AR(1) pre-tanh rollout noise; eval/deploy: deterministic squash of the Gaussian mean."""
+        if mode == "deploy":
+            in_keys = [key for key in self.actor_obs_keys if key in self.vecnorms]
+            vecnorm = Seq(
+                *(Mod(self.vecnorms[key], [key], [key]) for key in in_keys)
+            ).to(self.device)
+            rollout_policy = Seq(
+                vecnorm,
+                ObsOODDetector(in_keys, sigma=5.0),
+                self._unwrap_module(self.actor),
+                MeanAction(),
+                selected_out_keys=[ACTION_KEY],
+            )
+            return rollout_policy
 
         def policy(tensordict: TensorDict):
             work_td = tensordict.copy()
