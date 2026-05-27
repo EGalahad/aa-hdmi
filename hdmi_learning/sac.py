@@ -136,6 +136,7 @@ class SACConfig:
     gae_lambda: float = 0.95
 
     debug: bool = False
+    clip_neg_reward: bool = True
     vecnorm: bool = True
     grad_sync_mode: str | None = "ddp"
     # FP16 AMP (CUDA only); GradScaler for critic, V head, standalone train_v, and actor (alpha stays fp32).
@@ -868,7 +869,8 @@ class SAC(TensorDictModuleBase):
         else:
             reward = reward.sum(-1, keepdim=True)
             neg_rew_ratio = (reward <= 0.).float().mean().item()
-            reward = reward.clamp_min(0.)
+            if self.cfg.clip_neg_reward:
+                reward = reward.clamp_min(0.)
         td[REWARD_KEY] = reward
 
         bs = td.batch_size

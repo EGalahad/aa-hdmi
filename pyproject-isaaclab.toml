@@ -17,3 +17,8 @@ url = "https://pypi.nvidia.com/"
 
 [tool.uv]
 package = false
+override-dependencies = [
+    "torch==2.10.*",
+    "torchvision==0.25.*",
+    "torchaudio==2.10.*",
+]
